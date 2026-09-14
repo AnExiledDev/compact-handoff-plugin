@@ -1,0 +1,4 @@
+{
+  "description": "Compaction as a subagent handoff, with the measurements that decide whether it can be one",
+  "modules": ["module.js"]
+}

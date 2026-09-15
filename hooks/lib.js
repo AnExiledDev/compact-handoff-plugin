@@ -648,7 +648,14 @@ export const renderCommitments = (findings) => {
  * A wrong number here is silent: it mis-states every cost row and the row still
  * looks like a measurement. Re-read the page before changing PRICES_TAKEN, and
  * change them together.
+ *
+ * Cache reads are priced here and never charged. On a subscription a cache
+ * read costs nothing, so `priceUsage` keeps the token count and records what
+ * the reads would have cost at list as `cacheReadWaivedUsd`, and leaves them
+ * out of `usd`. Operator, 2026-09-15: "Cache reads are FREE for subscriptions."
  */
+export const COST_BASIS = "subscription: cache reads free";
+
 export const PRICES_TAKEN = "2026-09-14";
 
 export const PRICES_SOURCE = "https://platform.claude.com/docs/en/about-claude/pricing";
@@ -719,13 +726,11 @@ export const priceUsage = (usage, model) => {
     }
 
     const usd =
-        (tokens.input * price.input +
-            tokens.output * price.output +
-            tokens.cacheRead * price.cacheRead +
-            tokens.cacheWrite * price.cacheWrite) /
+        (tokens.input * price.input + tokens.output * price.output + tokens.cacheWrite * price.cacheWrite) /
         1_000_000;
+    const cacheReadWaivedUsd = (tokens.cacheRead * price.cacheRead) / 1_000_000;
 
-    return { usd, reason: null, tokens, priced: price.name };
+    return { usd, reason: null, tokens, priced: price.name, cacheReadWaivedUsd };
 };
 
 /**
@@ -760,6 +765,8 @@ export const costOf = ({ forkUsage, forkModel, commitmentsUsd, commitmentsBasis 
             commitmentsUsd: round6(commitments),
             commitmentsBasis: commitmentsBasis ?? (commitments === 0 ? "none" : "measured"),
             totalUsd: round6(fork.usd + commitments),
+            cacheReadWaivedUsd: round6(fork.cacheReadWaivedUsd),
+            basis: COST_BASIS,
             forkUsage: fork.tokens,
             model: forkModel ?? null,
             priced: fork.priced,

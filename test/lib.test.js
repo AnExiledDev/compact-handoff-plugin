@@ -445,9 +445,17 @@ describe("cost", () => {
         };
         const priced = priceUsage(usage, "claude-opus-5");
 
-        // 1997*5 + 1581*25 + 54703*0.5 + 75*6.25, all per MTok.
-        assert.ok(Math.abs(priced.usd - 0.0770) < 0.0005, `got ${priced.usd}`);
+        // 1997*5 + 1581*25 + 75*6.25, all per MTok; the 54703 cache reads are free.
+        assert.ok(Math.abs(priced.usd - 0.0500) < 0.0005, `got ${priced.usd}`);
         assert.equal(priced.reason, null);
+    });
+
+    it("stores the cache reads and what they would have cost at list, without charging them", () => {
+        const priced = priceUsage({ input_tokens: 0, cache_read_input_tokens: 1_000_000 }, "claude-opus-5");
+
+        assert.equal(priced.usd, 0);
+        assert.equal(priced.tokens.cacheRead, 1_000_000);
+        assert.equal(priced.cacheReadWaivedUsd, 0.5);
     });
 
     it("refuses to price an unknown model rather than calling it free", () => {
@@ -473,6 +481,21 @@ describe("cost", () => {
         assert.equal(cost.commitmentsUsd, 0.09);
         assert.equal(cost.totalUsd, 5.09);
         assert.equal(cost.pricesTaken, "2026-09-14");
+        assert.equal(cost.cacheReadWaivedUsd, 0);
+        assert.equal(cost.basis, "subscription: cache reads free");
+    });
+
+    it("keeps the fork's cache reads out of the total and says how much was waived", () => {
+        const { cost } = costOf({
+            forkUsage: { input_tokens: 1_000_000, cache_read_input_tokens: 2_000_000 },
+            forkModel: "claude-opus-5",
+            commitmentsUsd: 0,
+        });
+
+        assert.equal(cost.forkUsd, 5);
+        assert.equal(cost.totalUsd, 5);
+        assert.equal(cost.forkUsage.cacheRead, 2_000_000);
+        assert.equal(cost.cacheReadWaivedUsd, 1);
     });
 
     it("reports an unknown cost as null with a reason, never as zero", () => {

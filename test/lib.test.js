@@ -33,6 +33,8 @@ import {
     subagentRanThisTurn,
     summarisePrs,
     targetOf,
+    windowReading,
+    withoutScratchpad,
     toolIndex,
     workDone,
 } from "../hooks/lib.js";
@@ -844,6 +846,131 @@ describe("the handoff ceiling", () => {
 
         assert.equal(out.chars, 200_000);
         assert.equal(out.decider, "fraction");
+    });
+});
+
+describe("one window occupancy reading", () => {
+    const context = { tokens: 60_000, window: 200_000, percent: 30 };
+
+    it("calls a window with no handoff in it a fresh one", () => {
+        const row = windowReading({ at: "now", session: "s", turn: 1, context, messages: 4, handoff: null });
+
+        assert.equal(row.phase, "fresh");
+        assert.equal(row.compaction, 0);
+        assert.equal(row.percent, 30);
+        assert.equal(row.first, true);
+        assert.equal(row.handoffTokens, null);
+        assert.equal(row.handoffPercent, null);
+    });
+
+    it("says how much of a post-compact window the handoff itself is", () => {
+        const row = windowReading({
+            at: "now",
+            session: "s",
+            turn: 3,
+            context,
+            messages: 9,
+            handoff: { n: 6, chars: 24_000 },
+        });
+
+        assert.equal(row.phase, "post-compact");
+        assert.equal(row.compaction, 6);
+        assert.equal(row.handoffTokens, 6000);
+        assert.equal(row.handoffPercent, 3);
+        assert.equal(row.first, false);
+    });
+
+    it("reports a percent to one decimal rather than the engine's rounding", () => {
+        const row = windowReading({
+            at: "now",
+            session: "s",
+            turn: 1,
+            context: { tokens: 12_345, window: 200_000, percent: 6 },
+            messages: 2,
+            handoff: null,
+        });
+
+        assert.equal(row.percent, 6.2);
+    });
+
+    it("falls back to the engine's own percent when there is no window to divide by", () => {
+        const row = windowReading({
+            at: "now",
+            session: "s",
+            turn: 1,
+            context: { percent: 41 },
+            messages: 2,
+            handoff: null,
+        });
+
+        assert.equal(row.tokens, null);
+        assert.equal(row.window, null);
+        assert.equal(row.percent, 41);
+    });
+
+    it("reads nothing at all rather than throwing when usage is unavailable", () => {
+        const row = windowReading({ at: "now", session: "s", turn: 1, context: null, messages: 2, handoff: null });
+
+        assert.equal(row.percent, null);
+        assert.equal(row.phase, "fresh");
+    });
+});
+
+describe("the summariser's scratchpad", () => {
+    it("drops the analysis block and unwraps the summary", () => {
+        const dropped = withoutScratchpad(
+            "<analysis>\nLet me work through this.\nWait, no.\n</analysis>\n\n<summary>\n1. Primary Request\n</summary>",
+        );
+
+        assert.equal(dropped.text, "1. Primary Request");
+        assert.equal(dropped.analysisChars, 37);
+        assert.equal(dropped.unwrapped, true);
+    });
+
+    it("keeps a reply that has neither tag exactly as it came", () => {
+        const dropped = withoutScratchpad("1. Primary Request\n\n2. Key Technical Concepts");
+
+        assert.equal(dropped.text, "1. Primary Request\n\n2. Key Technical Concepts");
+        assert.equal(dropped.analysisChars, 0);
+        assert.equal(dropped.unwrapped, false);
+    });
+
+    it("keeps what a model wrote after the closing summary tag", () => {
+        const dropped = withoutScratchpad("<summary>\n9. Next Step\n</summary>\n\n10. Work ledger\n");
+
+        assert.equal(dropped.text, "9. Next Step\n\n10. Work ledger");
+    });
+
+    it("drops every analysis block when the model writes more than one", () => {
+        const dropped = withoutScratchpad("<analysis>one</analysis>\nA\n<analysis>two</analysis>\nB");
+
+        assert.equal(dropped.text, "A\nB");
+        assert.equal(dropped.analysisChars, 6);
+    });
+
+    /**
+     * A reply cut off inside the scratchpad has no summary to keep. Dropping to
+     * the end of the text would hand the next window nothing, so an unclosed
+     * block with no summary after it is left alone and the row says so.
+     */
+    it("leaves an unclosed analysis alone rather than dropping the whole reply", () => {
+        const dropped = withoutScratchpad("<analysis>\nLet me work through this and then the reply was cut");
+
+        assert.equal(dropped.text, "<analysis>\nLet me work through this and then the reply was cut");
+        assert.equal(dropped.analysisChars, 0);
+    });
+
+    it("drops an unclosed analysis when a summary follows it anyway", () => {
+        const dropped = withoutScratchpad("<analysis>\nthinking\n\n<summary>\n1. Primary Request\n</summary>");
+
+        assert.equal(dropped.text, "1. Primary Request");
+        assert.ok(dropped.analysisChars > 0, `got ${dropped.analysisChars}`);
+    });
+
+    it("keeps a preamble written before the analysis", () => {
+        const dropped = withoutScratchpad("Here is the summary.\n<analysis>x</analysis>\n<summary>1.</summary>");
+
+        assert.equal(dropped.text, "Here is the summary.\n1.");
     });
 });
 

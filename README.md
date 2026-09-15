@@ -22,6 +22,18 @@ Six parts. Only the first is a model summarising a conversation.
    the whole trick: a model with nothing to write under *Rejected by the user*
    has to decide that heading is empty rather than never think about rejections
    at all. Rejected-approach carry went from 11.1% to 61.1% on that alone.
+   The fork is also asked to reason in `<analysis>` tags before it writes, and
+   **since 0.4.2 that block is dropped before the handoff is assembled**. It is
+   still asked for, because the arm that reasons first is the one the bench
+   picked and Round 3 measured that taking work away from this model backfires;
+   it is thrown away afterwards instead. Across the 31 handoffs stored on the
+   machine it was written on, it ran 14% of the summary's characters on average
+   and 46% at its worst, and it is deliberation rather than findings: it plans
+   the summary, and it corrects itself mid-paragraph, which the next window has
+   no way to read as discarded. The `<summary>` wrapper tags go with it.
+   `analysisChars` on the row says how much was dropped. A block the model never
+   closed is left alone unless a summary follows it, because a reply cut off
+   inside the scratchpad has nothing else in it.
 2. **The tool ledger**, read off the messages, not recalled: files written,
    every shell command in order, and the ones whose output reads as a failure.
    **Nothing here is an exit code**, because the transcript does not store one,
@@ -91,6 +103,7 @@ root is a worktree somebody may delete. `COMPACT_HANDOFF_DATA_DIR` moves it.
 ```
 ~/.claude/compact-handoff/
   index.jsonl                        every compaction on this box, one line each
+  window.jsonl                       one occupancy reading per turn, every session
   sessions/<sessionId>/
     NNN-<iso>.md                     the handoff that was handed up
     NNN-<iso>.summary.md             just the model's part of it
@@ -129,6 +142,35 @@ One row per `handoff_lookup`, `handoff_search` or `handoff_list` call: `at`,
 `sessionId`, `tool`, `args`, `chars`, `lines` and `approxTokens`. The token
 figure is characters over four, the same estimate the size guard uses, not a
 tokenizer; the name says so. `handoff_status` sums them under `lookups`.
+
+### What carrying a handoff costs to read
+
+A compaction row says what a handoff cost to *write*. `window.jsonl` says what
+it costs to *carry*, and it is the only file here written by sessions that never
+compact at all:
+
+```
+~/.claude/compact-handoff/window.jsonl
+```
+
+One row per completed turn, whatever the session: `at`, `session`, `turn`,
+`first`, `phase` (`fresh` or `post-compact`), `compaction`, `tokens`, `window`,
+`percent`, `messages`, `handoffChars`, `handoffTokens`, `handoffPercent`.
+Nothing is sampled and nothing is conditional, because the comparison only works
+if both arms are there.
+
+The reading that matters is `first: true`. On a `fresh` session that is the
+floor every window pays before any work happens: system prompt, `CLAUDE.md` and
+`AGENTS.md`, the tool declarations, the first message. On a `post-compact`
+session it is that same floor plus the handoff and its restored files. The
+difference between the two is the handoff's real price, and `handoffPercent` is
+the handoff's own share of the window, so the two together separate what this
+plugin costs from what the rules files cost. Added in 0.4.2 at the operator's
+direction: *"This tells us how much context is our compaction summary vs claude
+rules and similar."*
+
+`percent` is computed to one decimal from `tokens / window`; the engine's own
+whole-number figure is the fallback when a reading carries no window.
 
 ### Reading one row
 

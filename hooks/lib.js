@@ -308,6 +308,96 @@ export const renderLedger = (rows) => {
 export const approxTokens = (text) => Math.ceil(text.length / 4);
 
 /**
+ * How full the window is on one turn, and how much of that is the handoff.
+ *
+ * The question this answers cannot be answered from a compaction row alone: a
+ * compaction row says what the handoff cost to write, not what carrying it
+ * costs to read. Turn 1 of a session with no handoff in it is the floor - the
+ * system prompt, the rules files, the tool declarations and the first message,
+ * everything a window pays before any work happens - and turn 1 of a
+ * post-compact window is that same floor plus the handoff and its restored
+ * files. Logging both, per turn, is what makes the difference measurable
+ * instead of argued. Operator, 2026-09-15: "This tells us how much context is
+ * our compaction summary vs claude rules and similar."
+ *
+ * `percent` is computed here to one decimal rather than taken from the engine,
+ * which reports whole numbers; the engine's own figure is the fallback for a
+ * reading that carries no window to divide by.
+ */
+export const windowReading = ({ at, session, turn, context, messages, handoff }) => {
+    const tokens = context?.tokens ?? null;
+    const window = context?.window ?? null;
+    const share = (of) => (of === null || window === null || window === 0 ? null : Math.round((of / window) * 1000) / 10);
+    // The same four-characters-a-token estimate `approxTokens` uses, over a
+    // count rather than the text itself.
+    const handoffTokens = handoff === null ? null : Math.ceil(handoff.chars / 4);
+
+    return {
+        at,
+        session,
+        turn,
+        first: turn === 1,
+        phase: handoff === null ? "fresh" : "post-compact",
+        compaction: handoff?.n ?? 0,
+        tokens,
+        window,
+        percent: share(tokens) ?? context?.percent ?? null,
+        messages,
+        handoffChars: handoff?.chars ?? null,
+        handoffTokens,
+        handoffPercent: share(handoffTokens),
+    };
+};
+
+/** A whole scratchpad, the common case: the model closed the tag. */
+const CLOSED_ANALYSIS = /<analysis>([\s\S]*?)<\/analysis>[ \t]*\n?/gu;
+
+/** The tags the summary itself is wrapped in, which carry nothing. */
+const SUMMARY_TAGS = /[ \t]*<\/?summary>[ \t]*\n?/gu;
+
+/**
+ * The summary without the thinking that produced it.
+ *
+ * The fork is asked to reason in <analysis> tags before it writes, because the
+ * arm that reasons first is the one the bench picked, and Round 3 showed that
+ * taking work away from that model backfires. So the block is still asked for
+ * and still written; it is dropped here instead, after the model has had the
+ * benefit of writing it. Across the 31 handoffs stored on this box it was 14%
+ * of the summary text on average and 46% at its worst, and it is first-person
+ * deliberation rather than findings: it plans the summary, and it argues with
+ * itself and corrects mid-paragraph, which the next window reads as prose.
+ * Operator, 2026-09-15: "I think analysis just bloats it without much value
+ * add."
+ *
+ * Two shapes are deliberate. A block the model never closed is left alone
+ * unless a summary follows it, because a reply cut off inside the scratchpad
+ * has nothing else in it and dropping to the end would hand the next window an
+ * empty handoff. And anything outside the tags is kept, wherever it sits: a
+ * preamble before the analysis and a section written after </summary> are both
+ * content, and only the tags themselves are noise.
+ */
+export const withoutScratchpad = (text) => {
+    let analysisChars = 0;
+    let out = text.replace(CLOSED_ANALYSIS, (_whole, body) => {
+        analysisChars += body.length;
+
+        return "";
+    });
+
+    const open = out.indexOf("<analysis>");
+    const summary = out.indexOf("<summary>");
+
+    if (open !== -1 && summary > open) {
+        analysisChars += summary - open;
+        out = `${out.slice(0, open)}${out.slice(summary)}`;
+    }
+
+    const unwrapped = SUMMARY_TAGS.test(out);
+
+    return { text: out.replace(SUMMARY_TAGS, "").trim(), analysisChars, unwrapped };
+};
+
+/**
  * One line of the lookup log: which tool read what back, for which session, and
  * what it cost the window. Logged so a session can be charged for its history
  * reads the way it is charged for its compactions.

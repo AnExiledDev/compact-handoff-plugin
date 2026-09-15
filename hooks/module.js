@@ -141,7 +141,7 @@ Before providing your final summary, wrap your analysis in <analysis> tags to or
      - file edits
    - Errors that you ran into and how you fixed them
    - Pay special attention to specific user feedback that you received, especially if the user told you to do something differently.
-   - Note any security-relevant instructions or constraints the user stated (e.g., sensitive files or data to avoid, operations that must not be performed, credential or secret handling rules). These MUST be preserved verbatim in the summary so they continue to apply after compaction.
+   - Note any security-relevant instructions or constraints the user stated in conversation (e.g., sensitive files or data to avoid, operations that must not be performed, credential or secret handling rules). These MUST be preserved verbatim in the summary so they continue to apply after compaction. Rules that came from a CLAUDE.md or AGENTS.md file rather than from the user are re-injected on their own and are not yours to restate; carry the user's own words, not the project's files.
 2. Double-check for technical accuracy and completeness, addressing each required element thoroughly.
 
 Your summary should include the following sections:
@@ -267,6 +267,8 @@ import {
     subagentRanThisTurn,
     summarisePrs,
     toolIndex,
+    windowReading,
+    withoutScratchpad,
 } from "./lib.js";
 
 export const register = (on) => {
@@ -476,6 +478,7 @@ export const register = (on) => {
         await promotePending($);
         await maybeRefresh($, armed?.refresh === true);
         await watchPost($);
+        await watchWindow($, e);
 
         return next(e);
     });
@@ -595,6 +598,7 @@ export const register = (on) => {
         record.messagesOut = replacement.length;
         record.restore = restored.restore;
         record.summaryChars = handoff.text.length;
+        record.analysisChars = handoff.analysisChars ?? 0;
         record.handoffChars = assembled.text.length;
         record.handoffCharsBefore = guarded.charsBefore;
         record.handoffCharsAfter = guarded.charsAfter;
@@ -776,12 +780,20 @@ const forkHandoff = async ($, e, record) => {
     }
 
     const parsed = parseRestoreRequests(reply.text.trim());
+    const kept = withoutScratchpad(parsed.summary);
 
-    if (parsed.summary === "") {
+    if (kept.text === "") {
         return { outcome: "empty", detail: "the fork answered nothing" };
     }
 
-    return { outcome: "handoff", text: parsed.summary, requests: parsed.requests, usage: reply.usage, detail: "" };
+    return {
+        outcome: "handoff",
+        text: kept.text,
+        analysisChars: kept.analysisChars,
+        requests: parsed.requests,
+        usage: reply.usage,
+        detail: "",
+    };
 };
 
 /**
@@ -2146,6 +2158,42 @@ const armMonitor = async ($, record, before, from) => {
  * The file is rewritten every turn rather than at the end, so a session that
  * ends or compacts again mid-watch still leaves the turns it did observe.
  */
+/** One occupancy reading per turn, across every session, fresh or resumed. */
+const WINDOW_LOG = "window.jsonl";
+
+/** How many turns this session has completed, so turn 1 can be read as a floor. */
+const TURNS_KEY = "compact-handoff:turns";
+
+/**
+ * What carrying the handoff actually costs, logged every turn of every session.
+ *
+ * Cheap enough to do unconditionally: one usage read, one scan of the messages
+ * already in hand, one appended line of a few hundred bytes. It runs whether or
+ * not the session has ever compacted, because the fresh-session readings are
+ * the baseline the post-compact ones are measured against, and a session that
+ * never compacts is where that baseline is cleanest. Every step is wrapped, so
+ * a missing reading costs a row and nothing else.
+ */
+const watchWindow = async ($, e) => {
+    const turn = ((await safely($, () => $.store.get(TURNS_KEY))) ?? 0) + 1;
+
+    await safely($, () => $.store.set(TURNS_KEY, turn));
+
+    const usage = await safely($, () => $.session.usage());
+    const prior = priorHandoffIn(e.messages);
+    const row = windowReading({
+        at: new Date().toISOString(),
+        session: await safely($, () => $.session.id()),
+        turn,
+        context: usage?.context ?? null,
+        messages: e.messages.length,
+        handoff:
+            prior === null ? null : { n: prior.lineage.n, chars: (e.messages[prior.index].text ?? "").length },
+    });
+
+    await safely($, async () => appendLine($, `${await dataDir($)}/${WINDOW_LOG}`, JSON.stringify(row)));
+};
+
 const watchPost = async ($) => {
     const monitor = await $.store.get(MONITOR_KEY);
 

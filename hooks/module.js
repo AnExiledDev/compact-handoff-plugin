@@ -53,6 +53,9 @@ const PENDING_KEY = "pending";
 /** The handoff on disk: when it landed and how long the transcript was then. */
 const READY_KEY = "ready";
 
+/** When this session last forked for a handoff, wall clock ms, for the fork's context row. */
+const LAST_FORK_KEY = "lastForkAt";
+
 /**
  * The A/B bench. A variant is a file rather than a tool argument so the
  * instruction never enters the transcript: every arm is then asked over a
@@ -242,8 +245,11 @@ import {
     applySizeGuard,
     assistantTurns,
     commitmentsFrom,
+    commitmentsOutcome,
     costOf,
     costOfNothing,
+    estimatedUsage,
+    handoffCeiling,
     fallbackReasonFor,
     isPinnable,
     ledgerRows,
@@ -253,10 +259,12 @@ import {
     pinSkipCounts,
     priorHandoffIn,
     sectionOf,
+    priceUsage,
     renderCommitments,
     lookupRecord,
     renderLedger,
     replacementFor,
+    subagentRanThisTurn,
     summarisePrs,
     toolIndex,
 } from "./lib.js";
@@ -536,7 +544,7 @@ export const register = (on) => {
             // nothing written in advance and it can honour the instructions a
             // `/compact <instructions>` carries. The handoff on disk is only
             // what stands when the fork has no warm transcript to read.
-            handoff = await forkHandoff($, e);
+            handoff = await forkHandoff($, e, record);
 
             if (handoff.outcome !== "handoff") {
                 record.forkOutcome = handoff.outcome;
@@ -569,14 +577,17 @@ export const register = (on) => {
         // or gathered rather than recalled, and each one is allowed to fail: a
         // summary on its own is still the arm that scored 67.3%.
         const assembled = await assembledHandoff($, e, handoff.text, context);
+        const maxHandoff = await handoffCeilingFor($);
         const guarded = applySizeGuard(replacementFor(e.messages, assembled.text), {
-            maxChars: await maxHandoffChars($),
+            maxChars: maxHandoff.chars,
             pointerFor: ({ index, chars }) => trimPointer(record, index, chars),
         });
 
+        record.maxHandoff = maxHandoff;
+
         const restored = await restoreFiles($, e, handoff.requests ?? [], {
             depth: record.depth ?? 0,
-            totalChars: Math.max(0, (await maxHandoffChars($)) - guarded.charsAfter),
+            totalChars: Math.max(0, maxHandoff.chars - guarded.charsAfter),
         });
         // The handoff first, then the files it asked for, then the pinned turns.
         const replacement = [guarded.messages[0], ...restored.messages, ...guarded.messages.slice(1)];
@@ -593,7 +604,10 @@ export const register = (on) => {
         record.elapsedMs = $.clock.now() - startedAt;
         record.aborted = next.signal.aborted;
 
-        priceRun(record, { commitmentsUsd: assembled.notes.commitmentsCostUsd });
+        priceRun(record, {
+            commitmentsUsd: assembled.notes.commitmentsCostUsd,
+            commitmentsBasis: assembled.notes.commitmentsCostBasis,
+        });
 
         const artifacts = {
             handoff: assembled.text,
@@ -748,10 +762,13 @@ const capOf = (value, fallback) => {
  * Null means no warm transcript (a cold session, or a headless one), which is
  * what the handoff on disk is kept for.
  */
-const forkHandoff = async ($, e) => {
+const forkHandoff = async ($, e, record) => {
     const asked = typeof e.instructions === "string" && e.instructions.trim() !== ""
         ? `${FORK_PROMPT}\n\nThe person asked for this compaction with these instructions, and they outrank everything above: ${e.instructions.trim()}`
         : FORK_PROMPT;
+
+    record.forkContext = await forkContext($, e);
+
     const reply = await $.model.fork({ prompt: asked });
 
     if (reply === null) {
@@ -765,6 +782,27 @@ const forkHandoff = async ($, e) => {
     }
 
     return { outcome: "handoff", text: parsed.summary, requests: parsed.requests, usage: reply.usage, detail: "" };
+};
+
+/**
+ * What the session looked like the instant before it forked, logged and nothing
+ * else. Every reading is allowed to fail on its own: a missing row here must
+ * never cost the fork.
+ */
+const forkContext = async ($, e) => {
+    const now = Date.now();
+    const usage = await safely($, () => $.session.usage());
+    const lastForkAt = await safely($, () => $.store.get(LAST_FORK_KEY));
+
+    await safely($, () => $.store.set(LAST_FORK_KEY, now));
+
+    return {
+        context: usage?.context ?? null,
+        model: await safely($, () => $.session.model()),
+        messages: e.messages.length,
+        msSinceLastFork: typeof lastForkAt === "number" ? now - lastForkAt : null,
+        subagentRanThisTurn: subagentRanThisTurn(e.messages),
+    };
 };
 
 /**
@@ -867,6 +905,9 @@ const PARTS_MS = 130_000;
 
 /** The model the commitments pass runs on, measured at $0.14 a compaction. */
 const COMMITMENT_MODEL = "claude-sonnet-5";
+
+/** The most the commitments reply may run to; the engine's own ceiling for `$.model.complete`. */
+const COMMITMENT_MAX_TOKENS = 8192;
 
 /**
  * The whole handoff: what the model wrote, then what nothing had to remember.
@@ -1039,9 +1080,17 @@ const readCommand = async ($, argv) => {
  * are most of the bytes and answer a different question - what the code said,
  * rather than whether the assistant went back and did the thing.
  *
- * It runs inside the hook because `$.process.run` is a host op and a host op's
- * time in flight does not count against the ten second dispatch budget:
- * `sleep 30` measured `elapsedMs 30018, aborted: false`.
+ * It is one `$.model.complete` call: the engine's own completion API, in
+ * process, with no session, no settings and no hooks around it. Until 0.3.0 it
+ * was a `claude -p` subprocess, and everything that call had to do to run as
+ * nobody is kept below under "A4" because the trap it describes is still real
+ * for anyone spawning the CLI.
+ *
+ * The cost is an ESTIMATE. `$.model.complete` returns the text alone and
+ * drops the usage the API sent back, and nothing it spends reaches
+ * `$.session.usage().cost`, so the number recorded is the prompt and reply at
+ * four characters a token, priced at the model's own rate with no cache terms,
+ * and it is labelled as such on the row. It is never recorded as 0.
  */
 const commitmentsSection = async ($, messages, notes) => {
     const turns = assistantTurns(messages);
@@ -1050,36 +1099,38 @@ const commitmentsSection = async ($, messages, notes) => {
         return "";
     }
 
-    const home = (await $.env.get("HOME")) ?? "/";
     // A function replacement, because `$&` and friends in a transcript would
     // otherwise be read as replacement patterns and silently mangle the prompt.
     const prompt = COMMITMENT_PROMPT
         .replace("{turns}", () => turns)
         .replace("{index}", () => toolIndex(messages));
 
-    const configDir = await ambientConfigDir($);
-
-    notes.commitmentsConfigDir = configDir;
-    notes.commitmentsConfigIsolated = true;
-    notes.commitmentsSettingSources = "none";
-
-    const ran = await $.process.run(
-        ["claude", "-p", "--model", COMMITMENT_MODEL, "--output-format", "json",
-            "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
-            "--setting-sources", ""],
-        { stdin: prompt, cwd: home, timeoutMs: COMMITMENTS_MS, env: { CLAUDE_CONFIG_DIR: configDir } },
-    );
-
-    if (ran.exitCode !== 0) {
-        throw new Error(`claude -p exited ${ran.exitCode}: ${ran.stderr.slice(-200)}`);
-    }
-
-    const payload = JSON.parse(ran.stdout);
-
-    notes.commitmentsCostUsd = payload.total_cost_usd ?? null;
+    notes.commitmentsVia = "model.complete";
+    notes.commitmentsModel = COMMITMENT_MODEL;
     notes.commitmentsPromptChars = prompt.length;
 
-    return renderCommitments(commitmentsFrom(payload.result ?? ""));
+    const reply = await withTimeout(
+        $,
+        $.model.complete({ model: COMMITMENT_MODEL, prompt, maxTokens: COMMITMENT_MAX_TOKENS }),
+        COMMITMENTS_MS,
+        "commitments",
+    );
+    const text = typeof reply === "string" ? reply : "";
+    const priced = priceUsage(estimatedUsage(prompt.length, text.length), COMMITMENT_MODEL);
+
+    notes.commitmentsReplyChars = text.length;
+    notes.commitmentsTokensEstimated = priced.tokens ?? null;
+    notes.commitmentsCostUsd = priced.usd;
+    notes.commitmentsCostBasis = priced.usd === null ? `unpriced: ${priced.reason}` : "estimate: chars/4, no cache";
+
+    // `$.model.complete` stops at its output cap without saying so; the row says.
+    const outcome = commitmentsOutcome(text, COMMITMENT_MAX_TOKENS);
+
+    notes.commitmentsRows = outcome.rows;
+    notes.commitmentsHitCap = outcome.hitCap;
+    notes.commitmentsHitCapReason = outcome.hitCapReason;
+
+    return renderCommitments(commitmentsFrom(text));
 };
 
 /**
@@ -1937,9 +1988,6 @@ const runLines = async ($, sessionId) => {
 /** What one session may spend on handoffs before the engine gets its compactions back. */
 const DEFAULT_MAX_USD = 10;
 
-/** The handoff ceiling used when the context window cannot be read. */
-const DEFAULT_MAX_CHARS = 400_000;
-
 const budgetCeiling = async ($) => {
     const raw = Number.parseFloat((await $.env.get("COMPACT_HANDOFF_MAX_USD_PER_SESSION")) ?? "");
 
@@ -1958,11 +2006,12 @@ const spentThisSession = async ($) => {
 };
 
 /** Prices the run in place. An unpriceable run records `null` and why, never 0. */
-const priceRun = (record, { commitmentsUsd }) => {
+const priceRun = (record, { commitmentsUsd, commitmentsBasis }) => {
     const priced = costOf({
         forkUsage: record.usage,
         forkModel: record.model,
         commitmentsUsd: typeof commitmentsUsd === "number" ? commitmentsUsd : 0,
+        commitmentsBasis: typeof commitmentsBasis === "string" ? commitmentsBasis : undefined,
     });
 
     record.cost = priced.cost;
@@ -1973,23 +2022,23 @@ const priceRun = (record, { commitmentsUsd }) => {
 };
 
 /**
- * How large a handoff may be before the largest pinned turns become pointers.
+ * How large a handoff may be before the largest pinned turns become pointers,
+ * with the row that says how the number was arrived at.
  *
  * A handoff is read at the top of a fresh window, so its ceiling belongs to the
- * window rather than to a number somebody liked: a quarter of it, at the usual
- * four characters per token, which works out at one character per token of
- * window. The summary is never a candidate, at any size.
+ * window rather than to a number somebody liked: a quarter of it, at four
+ * characters per token, and never more than the cap, so a million-token window
+ * does not hand a quarter of a million tokens up. The summary is never a
+ * candidate, at any size. Each `$.env.get` takes a literal name, because the
+ * static scan reads them.
  */
-const maxHandoffChars = async ($) => {
-    const raw = Number.parseInt((await $.env.get("COMPACT_HANDOFF_MAX_CHARS")) ?? "", 10);
-
-    if (Number.isFinite(raw) && raw > 0) {
-        return raw;
-    }
-
+const handoffCeilingFor = async ($) => {
+    const override = Number.parseInt((await $.env.get("COMPACT_HANDOFF_MAX_CHARS")) ?? "", 10);
+    const fraction = Number.parseFloat((await $.env.get("COMPACT_HANDOFF_MAX_FRACTION")) ?? "");
+    const capTokens = Number.parseInt((await $.env.get("COMPACT_HANDOFF_MAX_TOKENS")) ?? "", 10);
     const window = (await safely($, () => $.session.usage()))?.context?.window;
 
-    return typeof window === "number" && window > 0 ? window : DEFAULT_MAX_CHARS;
+    return handoffCeiling({ window, override, fraction, capTokens });
 };
 
 /** What replaces a pinned turn too large to carry: where the whole of it is. */
@@ -2115,10 +2164,15 @@ const watchPost = async ($) => {
 };
 
 /* ------------------------------------------------------------------ *
- * A4: the commitments pass runs as nobody.
+ * A4: the commitments pass runs as nobody. History since 0.4.0.
  * ------------------------------------------------------------------ */
 
 /*
+ * Since 0.4.0 the commitments pass is a `$.model.complete` call, which is an
+ * API request the engine makes in process: no session, no settings layers,
+ * no hooks. Everything below describes the `claude -p` subprocess it replaced
+ * and is kept because the trap is real for anyone who spawns the CLI.
+ *
  * `claude -p` is a full session and loads settings like any other, so every
  * `UserPromptSubmit` hook on the box fires on the commitments prompt. That is
  * measured, not feared: this machine's intent ledger holds ten of these prompts
@@ -2167,10 +2221,6 @@ const isDev = async ($) => isOn(await $.env.get("COMPACT_HANDOFF_DEV"));
 
 /** Whether a subagent's own compaction is handled here rather than passed through. */
 const handlesSubagents = async ($) => isOn(await $.env.get("COMPACT_HANDOFF_SUBAGENTS"));
-
-/** The config directory this session itself is running under. */
-const ambientConfigDir = async ($) =>
-    ((await $.env.get("CLAUDE_CONFIG_DIR")) ?? "").trim() || `${(await $.env.get("HOME")) ?? ""}/.claude`;
 
 /** The plugin's own version, off the manifest the runtime loaded it from. */
 const pluginVersion = async ($) => {

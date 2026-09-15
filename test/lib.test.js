@@ -5,9 +5,12 @@ import {
     applySizeGuard,
     assistantTurns,
     commitmentsFrom,
+    commitmentsOutcome,
     costOf,
     costOfNothing,
+    estimatedUsage,
     fallbackReasonFor,
+    handoffCeiling,
     isPinnable,
     ledgerRows,
     lineageLine,
@@ -27,6 +30,7 @@ import {
     lookupRecord,
     replacementFor,
     sectionOf,
+    subagentRanThisTurn,
     summarisePrs,
     targetOf,
     toolIndex,
@@ -681,5 +685,181 @@ describe("a run that made no model call", () => {
 
     it("is not the same shape as an unpriceable run, which stays null", () => {
         assert.equal(costOf({ forkUsage: null, forkModel: "x", commitmentsUsd: 0 }).cost, null);
+    });
+});
+
+describe("the commitments pass is priced off an estimate", () => {
+    it("counts four characters a token, rounded up, with no cache", () => {
+        assert.deepEqual(estimatedUsage(10, 0), { input_tokens: 3, output_tokens: 0 });
+        assert.deepEqual(estimatedUsage(12_569, 1_000), { input_tokens: 3143, output_tokens: 250 });
+    });
+
+    it("prices the estimate at the model's own rate through priceUsage", () => {
+        const priced = priceUsage(estimatedUsage(4_000_000, 1_000_000), "claude-sonnet-5");
+
+        assert.equal(priced.usd, 1_000_000 * 2 / 1_000_000 + 250_000 * 10 / 1_000_000);
+        assert.equal(priced.priced, "Sonnet 5");
+    });
+
+    it("carries the basis of the commitments number into the cost row", () => {
+        const { cost } = costOf({
+            forkUsage: { input_tokens: 1000 },
+            forkModel: "claude-opus-5",
+            commitmentsUsd: 0.01,
+            commitmentsBasis: "estimate: chars/4, no cache",
+        });
+
+        assert.equal(cost.commitmentsUsd, 0.01);
+        assert.equal(cost.commitmentsBasis, "estimate: chars/4, no cache");
+    });
+
+    it("says none when no commitments pass ran, never an unlabelled zero", () => {
+        const { cost } = costOf({ forkUsage: { input_tokens: 1000 }, forkModel: "claude-opus-5", commitmentsUsd: 0 });
+
+        assert.equal(cost.commitmentsUsd, 0);
+        assert.equal(cost.commitmentsBasis, "none");
+    });
+});
+
+describe("whether a subagent ran this turn", () => {
+    it("sees an Agent call after the last typed turn", () => {
+        const messages = [
+            userTurn("earlier"),
+            assistantTurn("", [use270("Agent", { prompt: "x" })]),
+            userTurn("now"),
+            assistantTurn("", [use270("Agent", { prompt: "y" })]),
+        ];
+
+        assert.equal(subagentRanThisTurn(messages), true);
+    });
+
+    it("ignores an Agent call from a previous turn", () => {
+        const messages = [
+            userTurn("earlier"),
+            assistantTurn("", [use270("Task", { prompt: "x" })]),
+            userTurn("now"),
+            assistantTurn("", [use270("Read", { file_path: "a" })]),
+        ];
+
+        assert.equal(subagentRanThisTurn(messages), false);
+    });
+
+    it("does not count a tool result carrier as the start of a turn", () => {
+        const messages = [
+            userTurn("now"),
+            assistantTurn("", [use270("Agent", { prompt: "x" })]),
+            toolResultTurn(),
+            assistantTurn("done"),
+        ];
+
+        assert.equal(subagentRanThisTurn(messages), true);
+    });
+
+    it("is false on an empty transcript", () => {
+        assert.equal(subagentRanThisTurn([]), false);
+    });
+});
+
+describe("the handoff ceiling", () => {
+    it("is a quarter of a 200k window, in characters", () => {
+        const out = handoffCeiling({ window: 200_000 });
+
+        assert.equal(out.chars, 200_000);
+        assert.equal(out.decider, "fraction");
+        assert.equal(out.fraction, 0.25);
+        assert.equal(out.capTokens, 150_000);
+        assert.equal(out.window, 200_000);
+    });
+
+    it("caps a 1M window at 150k tokens", () => {
+        const out = handoffCeiling({ window: 1_000_000 });
+
+        assert.equal(out.chars, 600_000);
+        assert.equal(out.decider, "cap");
+    });
+
+    it("clamps the tokens setting at 200k", () => {
+        const out = handoffCeiling({ window: 1_000_000, capTokens: 500_000 });
+
+        assert.equal(out.capTokens, 200_000);
+        assert.equal(out.chars, 800_000);
+    });
+
+    it("honours a smaller fraction", () => {
+        const out = handoffCeiling({ window: 200_000, fraction: 0.1 });
+
+        assert.equal(out.chars, 80_000);
+    });
+
+    it("falls back to the default when the window is unknown", () => {
+        const out = handoffCeiling({ window: null });
+
+        assert.equal(out.chars, 400_000);
+        assert.equal(out.window, null);
+        assert.equal(out.decider, "default: window unknown");
+    });
+
+    it("lets a hand-set override win, unclamped, and flags the overrun", () => {
+        const out = handoffCeiling({ window: 200_000, override: 1_000_000 });
+
+        assert.equal(out.chars, 1_000_000);
+        assert.equal(out.decider, "override");
+        assert.equal(out.overSafeCapChars, 200_000);
+        assert.equal(out.overSafeCapTokens, 50_000);
+    });
+
+    it("does not flag an override inside the safe cap", () => {
+        const out = handoffCeiling({ window: 200_000, override: 300_000 });
+
+        assert.equal(out.chars, 300_000);
+        assert.equal(out.decider, "override");
+        assert.equal("overSafeCapChars" in out, false);
+    });
+
+    it("ignores unusable settings", () => {
+        const out = handoffCeiling({ window: 200_000, fraction: Number.NaN, capTokens: -1, override: 0 });
+
+        assert.equal(out.chars, 200_000);
+        assert.equal(out.decider, "fraction");
+    });
+});
+
+describe("the commitments reply against its output cap", () => {
+    const row = (n) => `UNKEPT | T${n} | "quote ${n}" | note ${n}`;
+
+    it("counts the rows and reports no cap on a short, well-formed reply", () => {
+        const out = commitmentsOutcome([row(1), row(2)].join("\n"), 8192);
+
+        assert.equal(out.rows, 2);
+        assert.equal(out.hitCap, false);
+        assert.equal(out.hitCapReason, null);
+    });
+
+    it("reports the cap when the reply runs near the ceiling", () => {
+        const text = Array.from({ length: 2000 }, (_, i) => row(i)).join("\n");
+        const out = commitmentsOutcome(text, 8192);
+
+        assert.equal(out.hitCap, true);
+        assert.equal(out.hitCapReason, "length");
+    });
+
+    it("reports the cap when the final row is cut mid-shape", () => {
+        const out = commitmentsOutcome([row(1), 'CORRECTED | T7 | "cut off he'].join("\n"), 8192);
+
+        assert.equal(out.rows, 1);
+        assert.equal(out.hitCap, true);
+        assert.equal(out.hitCapReason, "truncated row");
+    });
+
+    it("does not mistake a trailing prose line for a truncated row", () => {
+        const out = commitmentsOutcome([row(1), "That is everything."].join("\n"), 8192);
+
+        assert.equal(out.hitCap, false);
+    });
+
+    it("is quiet on an empty reply", () => {
+        const out = commitmentsOutcome("", 8192);
+
+        assert.deepEqual(out, { rows: 0, hitCap: false, hitCapReason: null });
     });
 });

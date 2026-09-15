@@ -395,6 +395,31 @@ export const outcomeOf = (use) => {
  */
 export const nameOf = (use) => use.name ?? use.tool ?? "?";
 
+/** The tools that run a subagent, under either name the engine has used. */
+const SUBAGENT_TOOLS = new Set(["Agent", "Task"]);
+
+/**
+ * Whether a subagent ran since the last turn a person typed.
+ *
+ * Logged next to the fork's context because a subagent's own transcript is
+ * something the fork may or may not see, and a compaction landing right after
+ * one is the case worth being able to tell apart later.
+ */
+export const subagentRanThisTurn = (messages) => {
+    let start = 0;
+
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+        if (isPinnable(messages[index])) {
+            start = index;
+            break;
+        }
+    }
+
+    return messages
+        .slice(start)
+        .some((message) => (message.toolUses ?? []).some((use) => SUBAGENT_TOOLS.has(nameOf(use))));
+};
+
 /** What a call was aimed at, from whichever of its arguments names a target. */
 export const targetOf = (use) => {
     const input = use.input ?? {};
@@ -458,6 +483,69 @@ export const toolIndex = (messages) => {
     });
 
     return rows.join("\n");
+};
+
+/** The most a handoff may be, in tokens, whatever the window: past this the next window is mostly handoff. */
+export const SAFE_CAP_TOKENS = 200_000;
+export const DEFAULT_CAP_TOKENS = 150_000;
+export const DEFAULT_FRACTION = 0.25;
+export const DEFAULT_MAX_CHARS = 400_000;
+const CHARS_PER_TOKEN = 4;
+
+const usable = (value) => typeof value === "number" && Number.isFinite(value) && value > 0;
+
+/**
+ * How large a handoff may be, and why: min(fraction × window, capTokens) × 4
+ * characters. A hand-set override wins outright and is never clamped, because
+ * setting it was a deliberate act; the row says by how much it passed the safe
+ * cap instead. The cap setting is a default, so it is clamped.
+ */
+export const handoffCeiling = ({ window, override, fraction, capTokens } = {}) => {
+    const knownWindow = usable(window) ? window : null;
+
+    if (usable(override)) {
+        const over = override - SAFE_CAP_TOKENS * CHARS_PER_TOKEN;
+        const overrun = over > 0
+            ? { overSafeCapChars: over, overSafeCapTokens: Math.ceil(over / CHARS_PER_TOKEN) }
+            : {};
+
+        return { window: knownWindow, fraction: null, capTokens: null, chars: override, decider: "override", ...overrun };
+    }
+
+    const usedFraction = usable(fraction) && fraction <= 1 ? fraction : DEFAULT_FRACTION;
+    const usedCap = Math.min(usable(capTokens) ? capTokens : DEFAULT_CAP_TOKENS, SAFE_CAP_TOKENS);
+    const base = { window: knownWindow, fraction: usedFraction, capTokens: usedCap };
+
+    if (knownWindow === null) {
+        const chars = Math.min(DEFAULT_MAX_CHARS, usedCap * CHARS_PER_TOKEN);
+
+        return { ...base, chars, decider: "default: window unknown" };
+    }
+
+    const fromWindow = Math.floor(knownWindow * usedFraction);
+    const tokens = Math.min(fromWindow, usedCap);
+
+    return { ...base, chars: tokens * CHARS_PER_TOKEN, decider: tokens === fromWindow ? "fraction" : "cap" };
+};
+
+/** A row the pass started and did not finish: it names a kind, and stops before the shape closes. */
+const ROW_OPENING = /^\s*(UNKEPT|CORRECTED|UNANSWERED)\s*\|/iu;
+
+/**
+ * Whether the commitments reply stopped at its output cap, and how many rows
+ * came back. Near the ceiling in length, or a final row cut mid-shape, both
+ * count; a trailing line of prose does not.
+ */
+export const commitmentsOutcome = (reply, maxTokens) => {
+    const text = reply ?? "";
+    const rows = commitmentsFrom(text).length;
+    const lines = text.split("\n").map((line) => line.trim()).filter((line) => line !== "");
+    const last = lines.at(-1) ?? "";
+    const nearCeiling = text.length >= maxTokens * CHARS_PER_TOKEN * 0.9;
+    const truncatedRow = ROW_OPENING.test(last) && !COMMITMENT_ROW.test(last);
+    const hitCapReason = nearCeiling ? "length" : truncatedRow ? "truncated row" : null;
+
+    return { rows, hitCap: hitCapReason !== null, hitCapReason };
 };
 
 /** The rows the pass emitted, in the order it emitted them. */
@@ -640,8 +728,21 @@ export const priceUsage = (usage, model) => {
     return { usd, reason: null, tokens, priced: price.name };
 };
 
+/**
+ * A usage record made from character counts, at four characters a token.
+ *
+ * `$.model.complete` returns text alone and drops the usage the API sent back,
+ * so the commitments pass can only be estimated. The estimate is labelled as
+ * one wherever it is recorded, and it has no cache terms because nothing here
+ * can know whether the prompt was served from cache.
+ */
+export const estimatedUsage = (promptChars, replyChars) => ({
+    input_tokens: Math.ceil(promptChars / 4),
+    output_tokens: Math.ceil(replyChars / 4),
+});
+
 /** The whole cost of one compaction, with every part it is made of. */
-export const costOf = ({ forkUsage, forkModel, commitmentsUsd }) => {
+export const costOf = ({ forkUsage, forkModel, commitmentsUsd, commitmentsBasis }) => {
     const fork = priceUsage(forkUsage, forkModel);
 
     if (fork.usd === null) {
@@ -657,6 +758,7 @@ export const costOf = ({ forkUsage, forkModel, commitmentsUsd }) => {
         cost: {
             forkUsd: round6(fork.usd),
             commitmentsUsd: round6(commitments),
+            commitmentsBasis: commitmentsBasis ?? (commitments === 0 ? "none" : "measured"),
             totalUsd: round6(fork.usd + commitments),
             forkUsage: fork.tokens,
             model: forkModel ?? null,

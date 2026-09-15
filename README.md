@@ -139,7 +139,10 @@ that matter for that second case:
 |---|---|---|
 | `disposition` | always | `replaced`, `rehearsed`, `fellBack`, `passedThrough`, `overBudget`, `abortedFallback` |
 | `fallbackReason` | every disposition but `replaced` | one line naming why, e.g. `noHandoff: no handoff has been written yet (fork cold: the fork found no warm main-thread transcript)` |
-| `cost` | always | `{forkUsd, commitmentsUsd, totalUsd, forkUsage, model, priced, pricesTaken}`, or `null` |
+| `cost` | always | `{forkUsd, commitmentsUsd, commitmentsBasis, totalUsd, forkUsage, model, priced, pricesTaken}`, or `null`. `commitmentsBasis` is `estimate: chars/4, no cache` since 0.4.0, `none` when no commitments pass ran, `measured` on rows from 0.3.0 and earlier |
+| `maxHandoff` | every `replaced` and `rehearsed` row | the handoff ceiling the size guard used and how it was arrived at: `{window, fraction, capTokens, chars, decider}`, where `decider` is `fraction`, `cap`, `default: window unknown` or `override`; an override past the safe cap adds `overSafeCapChars` and `overSafeCapTokens` saying by how much |
+| `forkContext` | every row that forked | what the session looked like the instant before `$.model.fork`: `{context, model, messages, msSinceLastFork, subagentRanThisTurn}`, where `context` is the whole `$.session.usage().context` object (`tokens`, `window`, `percent`) and `msSinceLastFork` is `null` on a session's first fork |
+| `parts` | every `replaced` and `rehearsed` row | per-part sizes and timings; for the commitments pass, `commitmentsVia`, `commitmentsModel`, `commitmentsPromptChars`, `commitmentsReplyChars`, `commitmentsTokensEstimated`, `commitmentsCostUsd`, `commitmentsCostBasis`, and since 0.4.0 `commitmentsRows` (how many rows came back) with `commitmentsHitCap` and `commitmentsHitCapReason` (`length` or `truncated row`) saying whether the reply stopped at the 8192-token output cap |
 | `costUnknownReason` | when `cost` is `null` | why it could not be priced. A run is never priced at 0 because its usage was missing |
 | `costNote` | when nothing was spent | `no model call was made`. A pass-through and a refusal over budget cost a real zero, which is not the same as unknown |
 | `overCeiling` | always | the size guard could not fit the replacement, because the handoff itself is larger than the ceiling and is never trimmed |
@@ -193,7 +196,9 @@ only the numbers the README quotes.
 | `COMPACT_HANDOFF_LIVE` | off | Off, it rehearses and the engine still compacts. On, it answers the event and the engine's summariser never runs. |
 | `COMPACT_HANDOFF_DATA_DIR` | `~/.claude/compact-handoff` | Where handoffs, rows and transcripts are kept. |
 | `COMPACT_HANDOFF_MODEL` | the session's | The model the commitments pass runs on. An alias (`haiku`) or a full id. |
-| `COMPACT_HANDOFF_MAX_CHARS` | one character per token of context window, else `400000` | How large a handoff may get before the largest pinned turns become pointers. A quarter of the window at four characters a token, which is the same number. The summary is never trimmed, at any size. |
+| `COMPACT_HANDOFF_MAX_CHARS` | unset | An absolute ceiling in characters that overrides the two settings below. Never clamped, because setting it is a deliberate act; past 800000 characters (the 200k-token safe cap) the row records `overSafeCapChars` and `overSafeCapTokens` rather than refusing. The summary is never trimmed, at any size. |
+| `COMPACT_HANDOFF_MAX_FRACTION` | `0.25` | The share of the context window a handoff may take, at four characters a token. Values outside (0, 1] fall back to the default. |
+| `COMPACT_HANDOFF_MAX_TOKENS` | `150000` | The most a handoff may be in tokens whatever the window, so a million-token window does not hand a quarter of a million up. Clamped to `200000`. The ceiling is min(fraction × window, this) × 4 characters, and `400000` characters when the window cannot be read. |
 | `COMPACT_HANDOFF_RESTORE_FILES` | `5` | How many files the summariser may have restored after the handoff. |
 | `COMPACT_HANDOFF_RESTORE_FILE_CHARS` | `20000` | The most of one restored file that comes back; the rest is clipped with a note saying how much. |
 | `COMPACT_HANDOFF_RESTORE_TOTAL_CHARS` | `100000` | The most all restored files may add together, and never more than the ceiling above leaves free after the handoff. |
@@ -284,7 +289,17 @@ is the first known limit below rather than an untested path.
 
 ### The commitments pass runs as nobody, and that is measured
 
-The commitments appendix is a `claude -p` call, which is a full session and
+Since 0.4.0 the commitments appendix is one `$.model.complete` call: an API
+request the engine makes in process, with no session, no settings layers and
+no hooks around it, so nothing below can happen to it. The price of that is
+the cost. `$.model.complete` hands back the reply text and drops the usage the
+API returned, and what it spends never reaches `$.session.usage().cost`, so the
+row carries an estimate - prompt and reply at four characters a token, priced
+at the model's own rate, no cache terms - labelled `commitmentsCostBasis:
+"estimate: chars/4, no cache"`. It is never recorded as 0. The history that
+follows is kept because the trap is still real for anyone who spawns the CLI.
+
+Until 0.3.0 the commitments appendix was a `claude -p` call, which is a full session and
 loads settings like any other, so every `UserPromptSubmit` hook on the machine
 fires on a prompt nobody typed. On this box that meant the operator's intent
 ledger recorded ten commitments prompts as sentences they had typed at a
@@ -355,11 +370,21 @@ so the ambient config dir authenticates the call with nothing copied at all.
   nothing warns you. Anyone copying this pattern should use
   `--setting-sources ""` rather than a config dir, or at minimum spawn with a
   `cwd` that has no `.claude/` above it.
-- **The commitments pass needs an engine that knows `--setting-sources`.**
-  Present in 2.1.270. An engine without it rejects the flag, the call exits
-  non-zero, and the commitments appendix is dropped with the reason in the row;
-  the other three parts are unaffected. That is the right failure: the
-  alternative is running the prompt through whatever hooks the machine has.
+- **The commitments cost is an estimate, not a measurement.** `$.model.complete`
+  returns text only and its spend is invisible to `$.session.usage()`, so
+  `cost.commitmentsUsd` is characters over four at the model's list price with
+  no cache terms, and `cost.commitmentsBasis` says so on every row. Rows from
+  0.3.0 and earlier carry the `claude -p` figure the CLI reported and read
+  `measured`. Summing a day's rows mixes the two; the basis field is how you
+  tell them apart.
+- **The commitments reply is capped at 8192 output tokens, and that is a
+  behaviour change from `claude -p`.** `$.model.complete` takes a `maxTokens`
+  of at most 8192 and stops there without saying so, where the CLI would run
+  on. A session with more unkept commitments than fit loses the tail. It does
+  not lose it silently: `parts.commitmentsHitCap` is `true` on that row with
+  `commitmentsHitCapReason` naming why (`length`, or `truncated row` when the
+  last line opens a row and never closes it) and `commitmentsRows` says how
+  many came back.
 - **The declarations are a version behind the engine.**
   `types/claude-code.d.ts` out of 2.1.269 declares a tool use as
   `{id, name, input}`; 2.1.270 hands a `session.compact` hook

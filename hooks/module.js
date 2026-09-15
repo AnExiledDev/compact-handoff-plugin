@@ -237,6 +237,7 @@ import {
     priorHandoffIn,
     sectionOf,
     renderCommitments,
+    lookupRecord,
     renderLedger,
     replacementFor,
     summarisePrs,
@@ -421,16 +422,16 @@ export const register = (on) => {
         return { result: JSON.stringify(await readRuns($, e), null, 2) };
     });
 
-    on("tool.call", { tool: "mcp__compact-handoff__handoff_list" }, async ($) => {
-        return { result: JSON.stringify(await listHandoffs($), null, 2) };
+    on("tool.call", { tool: "mcp__compact-handoff__handoff_list" }, async ($, e) => {
+        return { result: await logged($, "handoff_list", e, JSON.stringify(await listHandoffs($), null, 2)) };
     });
 
     on("tool.call", { tool: "mcp__compact-handoff__handoff_lookup" }, async ($, e) => {
-        return { result: await lookupHandoff($, e) };
+        return { result: await logged($, "handoff_lookup", e, await lookupHandoff($, e)) };
     });
 
     on("tool.call", { tool: "mcp__compact-handoff__handoff_search" }, async ($, e) => {
-        return { result: await searchHandoffs($, e) };
+        return { result: await logged($, "handoff_search", e, await searchHandoffs($, e)) };
     });
 
     on("tool.call", { tool: "mcp__compact-handoff__handoff_feedback" }, async ($, e) => {
@@ -574,7 +575,6 @@ export const register = (on) => {
             summary: handoff.text,
             transcript: renderTranscript(e.messages),
             rows: assembled.rows,
-            ledgerEarlier: context.earlier,
         };
 
         if (!(await isLive($))) {
@@ -741,9 +741,9 @@ const COMMITMENT_MODEL = "claude-sonnet-5";
  * `gh` does not delay the commitments call. Anything that fails is dropped and
  * named in `notes`, which the caller writes into the run log.
  *
- * `context` carries the lineage line and whatever earlier compactions this
- * conversation has already been through, so the ledger accumulates instead of
- * being re-summarised out of its own prose.
+ * `context` carries the lineage line and the note naming the earlier
+ * compactions of this conversation. Only this compaction's ledger is rendered;
+ * the earlier ones stay on disk behind `handoff_lookup`.
  */
 const assembledHandoff = async ($, e, summary, context) => {
     const startedAt = $.clock.now();
@@ -751,7 +751,7 @@ const assembledHandoff = async ($, e, summary, context) => {
     const rows = ledgerRows(e.messages);
 
     const [ledger, state, commitments] = await Promise.all([
-        attempt($, notes, "ledger", () => renderLedger(rows, context.earlier)),
+        attempt($, notes, "ledger", () => renderLedger(rows)),
         attempt($, notes, "state", () => liveState($)),
         attempt($, notes, "commitments", () => commitmentsSection($, e.messages, notes)),
     ]);
@@ -1401,10 +1401,37 @@ const readRuns = async ($, e) => {
         spentUsd: Number((await spentThisSession($)).toFixed(4)),
         ceilingUsd: await budgetCeiling($),
         handoff: await handoffState($),
+        lookups: await lookupTotals($),
         last: rows[rows.length - 1] ?? null,
         runs: rows.slice(-limit),
         diagnostics: (await isDev($)) ? (await diagnosticLines($)).slice(-limit).map(parseRun) : undefined,
     };
+};
+
+/** How much history this session has read back, summed off its own lookup log. */
+const lookupTotals = async ($) => {
+    const id = await safely($, () => $.session.id());
+    const file = `${await runDir($, id, "replaced")}/lookups.jsonl`;
+    const totals = { count: 0, chars: 0, approxTokens: 0, byTool: {} };
+
+    if (!(await $.fs.exists(file))) {
+        return totals;
+    }
+
+    for (const line of (await $.fs.read(file)).split("\n")) {
+        if (line.trim() === "") {
+            continue;
+        }
+
+        const row = parseRun(line);
+
+        totals.count += 1;
+        totals.chars += row.chars ?? 0;
+        totals.approxTokens += row.approxTokens ?? 0;
+        totals.byTool[row.tool] = (totals.byTool[row.tool] ?? 0) + 1;
+    }
+
+    return totals;
 };
 
 /** What the bench tools wrote, read back only when the bench is what is running. */
@@ -1699,7 +1726,7 @@ const storeRun = async ($, record, disposition, artifacts) => {
     await write(".transcript.md", artifacts.transcript);
     await write(".replacement.md", artifacts.replacement);
 
-    const json = { ...record, rows: artifacts.rows ?? [], earlier: artifacts.ledgerEarlier ?? [], feedback: [] };
+    const json = { ...record, rows: artifacts.rows ?? [], feedback: [] };
 
     await $.fs.write(`${dir}/${stem}.json`, `${JSON.stringify(json, null, 2)}\n`);
 
@@ -1814,12 +1841,13 @@ const trimPointer = (record, index, chars) =>
  * ------------------------------------------------------------------ */
 
 /**
- * The lineage line, the note pointing at earlier compactions, and their ledgers.
+ * The lineage line and the note pointing at earlier compactions.
  *
- * A second compaction sees the first handoff as prose in its own transcript. Re-
- * summarising prose loses the exact commands, so the earlier ledger rows are
- * read back out of the stored JSON as data and merged under their own heading,
- * and the prose is left to the model.
+ * Only the newest handoff travels in the window. Everything an earlier
+ * compaction wrote is on disk, and the note says which ones exist and how to
+ * read them, so the next session pays for history only when it asks for it.
+ * (Operator, 2026-09-15: "we should just send ONE summary, the last summary,
+ * with note about pulling older summaries for review.")
  */
 const lineageContext = async ($, e, record) => {
     const prior = priorHandoffIn(e.messages);
@@ -1831,38 +1859,60 @@ const lineageContext = async ($, e, record) => {
     const lineage = lineageLine({ session: record.sessionId ?? "unknown", n, prev: record.prev });
 
     if (prior === null) {
-        return { lineage, earlierNote: "", earlier: [] };
+        return { lineage, earlierNote: "" };
     }
 
-    const earlier = await earlierRuns($, record.sessionId, prior.lineage.n);
+    const earlier = await earlierPasses($, record.sessionId, prior.lineage.n);
+    const listed = earlier.map((pass) => `${pass.n} at ${pass.at}`).join(", ") || String(prior.lineage.n);
     const note =
-        `Earlier compactions of this same session: ${earlier.map((pass) => `${pass.n} at ${pass.at}`).join(", ") || prior.lineage.n}. ` +
-        "Their full handoffs, summaries and pre-compaction transcripts are on disk; read them with handoff_lookup.";
+        `Earlier compactions of this same session: ${listed}. ` +
+        "Only this handoff is in context. Their handoffs, summaries, tool ledgers and pre-compaction " +
+        "transcripts are on disk: read one with handoff_lookup (n=<compaction>, section=summary|ledger|transcript) " +
+        "or grep all of them with handoff_search. Every such read is logged with its size against this session.";
 
-    return { lineage, earlierNote: note, earlier };
+    return { lineage, earlierNote: note };
 };
 
-/** Every earlier compaction's ledger rows, read as data rather than as prose. */
-const earlierRuns = async ($, sessionId, upTo) => {
+/** Which earlier compactions exist, newest first, off the run log alone. */
+const earlierPasses = async ($, sessionId, upTo) => {
     const passes = [];
 
     for (const line of await runLines($, sessionId)) {
         const row = parseRun(line);
 
-        if (typeof row.depth !== "number" || row.depth > upTo || row.files?.[".json"] === undefined) {
-            continue;
-        }
-
-        try {
-            const stored = JSON.parse(await $.fs.read(row.files[".json"]));
-
-            passes.push({ n: stored.depth, at: stored.at, rows: stored.rows ?? [] });
-        } catch {
-            // A pass whose file is gone is one heading missing, not a failed compaction.
+        if (typeof row.depth === "number" && row.depth <= upTo && row.disposition === "replaced") {
+            passes.push({ n: row.depth, at: row.at });
         }
     }
 
     return passes.sort((left, right) => right.n - left.n);
+};
+
+/* ------------------------------------------------------------------ *
+ * History reads, charged to the session that made them.
+ * ------------------------------------------------------------------ */
+
+/**
+ * Appends one row per history read to the session's `lookups.jsonl` and the
+ * box-wide one, then hands the text back unchanged. What a session pulls out
+ * of storage is context it pays for, so it is logged the way a compaction is.
+ */
+const logged = async ($, tool, args, text) => {
+    const sessionId = await safely($, () => $.session.id());
+    const { limit, offset, n, section, pattern } = args ?? {};
+    const record = lookupRecord({
+        at: new Date().toISOString(),
+        sessionId,
+        tool,
+        args: { n, section, offset, limit, pattern },
+        text,
+    });
+    const line = JSON.stringify(record);
+
+    await safely($, () => appendLine($, `${await runDir($, sessionId, "replaced")}/lookups.jsonl`, line));
+    await safely($, () => appendLine($, `${await dataDir($)}/lookups.jsonl`, line));
+
+    return text;
 };
 
 /* ------------------------------------------------------------------ *

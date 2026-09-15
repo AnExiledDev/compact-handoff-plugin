@@ -25,7 +25,10 @@ Five parts. Only the first is a model summarising a conversation.
 2. **The tool ledger**, read off the messages, not recalled: files written,
    every shell command in order, and the ones whose output reads as a failure.
    **Nothing here is an exit code**, because the transcript does not store one,
-   so "no error flag" does not mean "succeeded".
+   so "no error flag" does not mean "succeeded". Only the rows since the last
+   compaction. Until 0.2.0 every earlier compaction's rows were merged in too,
+   and by the tenth compaction of one session that was 65k of an 82k-character
+   handoff, a quarter of a 200k window spent re-reading history every turn.
 3. **Session state**, read live from `git` and `gh` as the handoff is written:
    branch, working tree, uncommitted files, open PRs, the last five commits, the
    session's model, and any agents still running. It describes the moment of
@@ -74,6 +77,7 @@ root is a worktree somebody may delete. `COMPACT_HANDOFF_DATA_DIR` moves it.
     NNN-<iso>.json                   the row, the ledger, feedback, lineage
     NNN-<iso>.post.json              what the session did in its next ten turns
     runs.jsonl                       this session's compactions, append-only
+    lookups.jsonl                    every history read this session made, with its size
     diagnostics.jsonl                probes, forced compactions, A/B arms
   rehearsals/<sessionId>/            the same, for runs that did not go live
 ```
@@ -89,9 +93,21 @@ Each handoff's first line is a machine-readable lineage marker:
 <!-- compact-handoff: session=<id> n=003 prev=002 -->
 ```
 
-A later compaction reads it, records `depth`, prepends an "Earlier compactions"
-note, and merges the previous ledger rows **from the stored JSON rather than
-from the prose**, so a lineage cannot drift by being re-summarised.
+A later compaction reads it, records `depth`, and prepends an "Earlier
+compactions" note naming every earlier pass and how to read it back. **Only the
+newest handoff travels in the window.** Everything an earlier compaction wrote
+stays on disk behind `handoff_lookup` and `handoff_search`, so history costs
+context only when a session asks for it, and every such read is logged:
+
+```
+~/.claude/compact-handoff/lookups.jsonl            every history read on this box
+~/.claude/compact-handoff/sessions/<id>/lookups.jsonl   this session's reads
+```
+
+One row per `handoff_lookup`, `handoff_search` or `handoff_list` call: `at`,
+`sessionId`, `tool`, `args`, `chars`, `lines` and `approxTokens`. The token
+figure is characters over four, the same estimate the size guard uses, not a
+tokenizer; the name says so. `handoff_status` sums them under `lookups`.
 
 ### Reading one row
 
@@ -116,7 +132,7 @@ Six, served as loopback MCP:
 
 | tool | what it does |
 | --- | --- |
-| `handoff_status` | What would happen if this conversation compacted right now: live or rehearsing, where the data is, how many compactions this session has had, what the last one did, what this session has spent. |
+| `handoff_status` | What would happen if this conversation compacted right now: live or rehearsing, where the data is, how many compactions this session has had, what the last one did, what this session has spent, and how much history it has read back (`lookups`). |
 | `handoff_list` | Every compaction this session has been through, oldest first, with cost, size and files. |
 | `handoff_lookup` | Read a stored compaction back. `section` takes `summary`, `ledger`, `state`, `commitments` or `transcript`; long sections page. |
 | `handoff_search` | Grep every stored handoff and pre-compaction transcript of this session. This is how to find what a handoff did not carry up. |

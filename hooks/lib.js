@@ -284,39 +284,43 @@ export const ledgerRows = (messages) => {
 };
 
 /**
- * The ledger as the next session reads it, this compaction's rows first and
- * every earlier compaction's rows merged in under their own heading.
+ * The ledger as the next session reads it: this compaction's rows and nothing
+ * older.
  *
- * `earlier` is `[{ n, at, rows }]`, read out of the stored JSON of previous
- * compactions rather than out of their prose, so a third compaction still knows
- * the exact command the first one ran.
+ * Until 0.2.0 every earlier compaction's rows were merged in under their own
+ * heading, and by the tenth compaction of one session the ledger was 65k of an
+ * 82k-character handoff (measured 2026-09-15). The earlier rows are still on
+ * disk in each compaction's own JSON; `handoff_lookup` reads them back, and
+ * the note above the summary says so.
  */
-export const renderLedger = (rows, earlier = []) => {
-    if (rows.length === 0 && earlier.length === 0) {
+export const renderLedger = (rows) => {
+    if (rows.length === 0) {
         return "";
     }
 
-    const out = ["## Tool ledger", ""];
-
-    if (rows.length === 0) {
-        out.push("No tool calls since the last compaction.", "");
-    } else {
-        out.push(...ledgerBody(rows));
-    }
-
-    for (const pass of earlier) {
-        out.push(`### Before compaction ${pass.n}${pass.at === undefined ? "" : ` (${pass.at})`}`, "");
-
-        if ((pass.rows ?? []).length === 0) {
-            out.push("No tool calls recorded.", "");
-            continue;
-        }
-
-        out.push(...ledgerBody(pass.rows, 4));
-    }
-
-    return out.join("\n").trimEnd();
+    return ["## Tool ledger", "", ...ledgerBody(rows)].join("\n").trimEnd();
 };
+
+/**
+ * Four characters per token is the estimate the size guard already uses. It is
+ * not a tokenizer, and the field is named for what it is.
+ */
+export const approxTokens = (text) => Math.ceil(text.length / 4);
+
+/**
+ * One line of the lookup log: which tool read what back, for which session, and
+ * what it cost the window. Logged so a session can be charged for its history
+ * reads the way it is charged for its compactions.
+ */
+export const lookupRecord = ({ at, sessionId, tool, args, text }) => ({
+    at,
+    sessionId: sessionId ?? "unknown",
+    tool,
+    args: args ?? {},
+    chars: text.length,
+    lines: text === "" ? 0 : text.split("\n").length,
+    approxTokens: approxTokens(text),
+});
 
 /** The three subsections a set of rows renders to, at the given heading depth. */
 const ledgerBody = (rows, depth = 3) => {

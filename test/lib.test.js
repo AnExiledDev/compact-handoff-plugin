@@ -23,6 +23,8 @@ import {
     priorHandoffIn,
     renderCommitments,
     renderLedger,
+    approxTokens,
+    lookupRecord,
     replacementFor,
     sectionOf,
     summarisePrs,
@@ -290,25 +292,58 @@ describe("lineage", () => {
     });
 });
 
-describe("the ledger accumulates instead of eroding", () => {
-    it("renders earlier compactions under their own heading", () => {
+describe("the ledger carries only this compaction's rows", () => {
+    it("never renders an earlier compaction, however many are passed", () => {
         const rows = ledgerRows(mixedConversation(use270));
-        const text = renderLedger(rows, [{ n: 1, at: "2026-09-14T07:00:00Z", rows: rows.slice(0, 2) }]);
+        const text = renderLedger(rows, [{ n: 1, at: "2026-09-14T07:00:00Z", rows }]);
 
-        assert.match(text, /### Before compaction 1 \(2026-09-14T07:00:00Z\)/u);
-        assert.match(text, /#### Files written/u);
+        assert.doesNotMatch(text, /Before compaction/u);
+        assert.match(text, /### Files written/u);
     });
 
-    it("still renders the earlier pass when this stretch ran no tools", () => {
-        const text = renderLedger([], [{ n: 1, rows: ledgerRows(mixedConversation(use270)) }]);
+    it("does not grow with depth", () => {
+        const rows = ledgerRows(mixedConversation(use270));
+        const first = renderLedger(rows);
+        const tenth = renderLedger(rows, Array.from({ length: 9 }, (_, n) => ({ n: n + 1, rows })));
 
-        assert.match(text, /No tool calls since the last compaction\./u);
-        assert.match(text, /### Before compaction 1/u);
+        assert.equal(tenth.length, first.length);
     });
 
-    it("is empty when there is nothing at all to say", () => {
-        assert.equal(renderLedger([], []), "");
+    it("is empty when this stretch ran no tools", () => {
+        assert.equal(renderLedger([]), "");
         assert.equal(renderLedger(ledgerRows([])), "");
+    });
+});
+
+describe("a history read is logged against its session", () => {
+    it("records the tool, the arguments and what the text costs the window", () => {
+        const row = lookupRecord({
+            at: "2026-09-15T03:40:00.000Z",
+            sessionId: "abc",
+            tool: "handoff_lookup",
+            args: { n: 3, section: "summary" },
+            text: "one\ntwo\nthree",
+        });
+
+        assert.deepEqual(row, {
+            at: "2026-09-15T03:40:00.000Z",
+            sessionId: "abc",
+            tool: "handoff_lookup",
+            args: { n: 3, section: "summary" },
+            chars: 13,
+            lines: 3,
+            approxTokens: 4,
+        });
+    });
+
+    it("names an unknown session rather than dropping the row", () => {
+        assert.equal(lookupRecord({ at: "t", sessionId: null, tool: "handoff_search", text: "" }).sessionId, "unknown");
+        assert.equal(lookupRecord({ at: "t", sessionId: null, tool: "handoff_search", text: "" }).lines, 0);
+    });
+
+    it("estimates four characters per token and says so in the field name", () => {
+        assert.equal(approxTokens("x".repeat(4000)), 1000);
+        assert.equal(approxTokens("x".repeat(4001)), 1001);
     });
 });
 

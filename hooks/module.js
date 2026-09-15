@@ -1909,8 +1909,8 @@ const logged = async ($, tool, args, text) => {
     });
     const line = JSON.stringify(record);
 
-    await safely($, () => appendLine($, `${await runDir($, sessionId, "replaced")}/lookups.jsonl`, line));
-    await safely($, () => appendLine($, `${await dataDir($)}/lookups.jsonl`, line));
+    await safely($, async () => appendLine($, `${await runDir($, sessionId, "replaced")}/lookups.jsonl`, line));
+    await safely($, async () => appendLine($, `${await dataDir($)}/lookups.jsonl`, line));
 
     return text;
 };

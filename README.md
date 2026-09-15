@@ -14,7 +14,7 @@ still be searched for afterwards.
 
 ## What a compaction hands up
 
-Five parts. Only the first is a model summarising a conversation.
+Six parts. Only the first is a model summarising a conversation.
 
 1. **The summary**, written by a fork of the session itself. The fork is asked
    with Claude Code's own summariser instruction plus a Work ledger section
@@ -42,6 +42,27 @@ Five parts. Only the first is a model summarising a conversation.
 5. **Every user turn, verbatim**, pinned by the engine's own `handle` rather
    than re-typed, so the words survive word for word instead of being rebuilt
    from a paraphrase.
+6. **The files the next window should have open**, chosen by the summariser
+   (0.3.0). Claude Code's own compaction re-attaches up to five of the most
+   recently read files, and that path never runs when a hook answers the
+   event, so until 0.3.0 a handoff came back with none. Now the fork ends its
+   summary with a `<restore-files>` block naming up to five files, each by
+   absolute path with `all` or a line range and a reason. The code only
+   refuses: a path the session never read or wrote, a `CLAUDE.md` or
+   `AGENTS.md` (the engine re-emits those itself), a duplicate, anything past
+   the cap. When nothing usable was named, the most recently touched files go
+   instead and the row says `source: "recency"`. Each file is re-read through
+   the real Read tool, so a file edited mid-session comes back current; a read
+   that is denied, errors or takes over 20 seconds falls back to the text of
+   the transcript's last Read of it (`source: "stored"`). Each one is handed up
+   as a real `Read` tool_use and its tool_result, not a narration of one, so
+   the next window treats it exactly as a file it read. Per file 20,000
+   characters, 100,000 in all, both clipped rather than dropped past the file
+   cap and dropped past the total, and never past the size guard's ceiling.
+   Every cap is a setting below, and `record.restore` carries what would be
+   needed to move one: source, requested, restored, every rejection and why,
+   and per file the lines, chars, approximate tokens, clipped chars and
+   milliseconds. `handoff_status` sums them under `restores`.
 
 Parts 2 to 4 are gathered concurrently and every one of them may fail. A part
 that throws, times out or comes back empty is left out and named in the row; the
@@ -122,6 +143,7 @@ that matter for that second case:
 | `costUnknownReason` | when `cost` is `null` | why it could not be priced. A run is never priced at 0 because its usage was missing |
 | `costNote` | when nothing was spent | `no model call was made`. A pass-through and a refusal over budget cost a real zero, which is not the same as unknown |
 | `overCeiling` | always | the size guard could not fit the replacement, because the handoff itself is larger than the ceiling and is never trimmed |
+| `restore` | every `replaced` and `rehearsed` row | `{source, requested, restored, rejected, files, chars, approxTokens, caps, ms}`; `source` is `model`, `recency` or `none`, and each file's `source` is `fresh`, `stored`, `failed` or `dropped` |
 
 `bench/summarise_runs.py` counts fallbacks by reason and unpriced rows by
 reason, so a week of silent declines is a list rather than a number.
@@ -132,7 +154,7 @@ Six, served as loopback MCP:
 
 | tool | what it does |
 | --- | --- |
-| `handoff_status` | What would happen if this conversation compacted right now: live or rehearsing, where the data is, how many compactions this session has had, what the last one did, what this session has spent, and how much history it has read back (`lookups`). |
+| `handoff_status` | What would happen if this conversation compacted right now: live or rehearsing, where the data is, how many compactions this session has had, what the last one did, what this session has spent, how much history it has read back (`lookups`), and what the restores have put back (`restores`). |
 | `handoff_list` | Every compaction this session has been through, oldest first, with cost, size and files. |
 | `handoff_lookup` | Read a stored compaction back. `section` takes `summary`, `ledger`, `state`, `commitments` or `transcript`; long sections page. |
 | `handoff_search` | Grep every stored handoff and pre-compaction transcript of this session. This is how to find what a handoff did not carry up. |
@@ -172,6 +194,9 @@ only the numbers the README quotes.
 | `COMPACT_HANDOFF_DATA_DIR` | `~/.claude/compact-handoff` | Where handoffs, rows and transcripts are kept. |
 | `COMPACT_HANDOFF_MODEL` | the session's | The model the commitments pass runs on. An alias (`haiku`) or a full id. |
 | `COMPACT_HANDOFF_MAX_CHARS` | one character per token of context window, else `400000` | How large a handoff may get before the largest pinned turns become pointers. A quarter of the window at four characters a token, which is the same number. The summary is never trimmed, at any size. |
+| `COMPACT_HANDOFF_RESTORE_FILES` | `5` | How many files the summariser may have restored after the handoff. |
+| `COMPACT_HANDOFF_RESTORE_FILE_CHARS` | `20000` | The most of one restored file that comes back; the rest is clipped with a note saying how much. |
+| `COMPACT_HANDOFF_RESTORE_TOTAL_CHARS` | `100000` | The most all restored files may add together, and never more than the ceiling above leaves free after the handoff. |
 | `COMPACT_HANDOFF_MAX_USD_PER_SESSION` | `10` | Past this, compactions fall back to the engine and record `disposition: "overBudget"`. |
 | `COMPACT_HANDOFF_SUBAGENTS` | off | Off, a subagent's compaction is passed through with a row saying so. On, it is answered like any other. |
 | `COMPACT_HANDOFF_DEV` | off | Registers the four measurement tools. |
@@ -304,6 +329,11 @@ so the ambient config dir authenticates the call with nothing copied at all.
   what the session carries, and the row says exactly why. One completed turn is
   enough to fix it, which is why the automatic path is not itself the problem:
   check 2 above forks warm on a `trigger: auto` compaction at 61 messages.
+- **A restored file is text or nothing.** Images, PDFs and notebooks the
+  session read cannot come back through this path; the row says `failed` with
+  the Read tool's reason. The restored pairs are real tool blocks, so the
+  transcript viewer shows them as Reads the model made right after the
+  handoff, which is what they are.
 - **A subagent's compaction is passed through** unless
   `COMPACT_HANDOFF_SUBAGENTS=1`. It is a different conversation with a different
   owner and nothing here has been graded on one.

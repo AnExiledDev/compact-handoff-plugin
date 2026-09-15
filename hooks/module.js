@@ -219,8 +219,25 @@ When summarizing the conversation focus on typescript code changes and also reme
 When you are using compact - please focus on test output and code changes. Include file reads verbatim.
 </example>
 
-After section 9, add section 10, Work ledger, with every one of these subsections present even when empty: Done and verified (what, and the exact evidence: the command, test or output that proved it). Done but unverified (what, and which check is still owed). Tried and abandoned (what, and why it was dropped, one line each). Not started (asked for and untouched). Rejected by the user (every approach the user turned down, with their words quoted, so it is never proposed again). Session state (current branch, worktree path, open PR numbers, uncommitted changes, background tasks or agents still running with their ids, scheduled wakeups, environment variables or flags set for this work).`;
+After section 9, add section 10, Work ledger, with every one of these subsections present even when empty: Done and verified (what, and the exact evidence: the command, test or output that proved it). Done but unverified (what, and which check is still owed). Tried and abandoned (what, and why it was dropped, one line each). Not started (asked for and untouched). Rejected by the user (every approach the user turned down, with their words quoted, so it is never proposed again). Session state (current branch, worktree path, open PR numbers, uncommitted changes, background tasks or agents still running with their ids, scheduled wakeups, environment variables or flags set for this work).
 
+After the closing </summary> tag, add a <restore-files> block naming up to 5 files the next window should have open before it does anything: the file being edited, the spec or test it is being written against, the file the current step depends on. Only files this conversation actually read or wrote, by absolute path. One file per line, three fields separated by |: the absolute path, then either all or a line range like 120-260, then a one-line reason. Prefer a line range when only part of a large file matters. Do not name CLAUDE.md or AGENTS.md files; they come back on their own. Leave the block empty if nothing qualifies.
+<restore-files>
+/abs/path/to/file.ts | 40-120 | the function being changed
+</restore-files>`;
+
+import {
+    RESTORE_FILE_CHARS,
+    RESTORE_MAX_FILES,
+    RESTORE_TOTAL_CHARS,
+    chooseRestores,
+    clipRestore,
+    fitRestores,
+    parseRestoreRequests,
+    restoreCandidates,
+    restorePair,
+    restoreRow,
+} from "./restore.js";
 import {
     applySizeGuard,
     assistantTurns,
@@ -557,7 +574,15 @@ export const register = (on) => {
             pointerFor: ({ index, chars }) => trimPointer(record, index, chars),
         });
 
-        record.messagesOut = guarded.messages.length;
+        const restored = await restoreFiles($, e, handoff.requests ?? [], {
+            depth: record.depth ?? 0,
+            totalChars: Math.max(0, (await maxHandoffChars($)) - guarded.charsAfter),
+        });
+        // The handoff first, then the files it asked for, then the pinned turns.
+        const replacement = [guarded.messages[0], ...restored.messages, ...guarded.messages.slice(1)];
+
+        record.messagesOut = replacement.length;
+        record.restore = restored.restore;
         record.summaryChars = handoff.text.length;
         record.handoffChars = assembled.text.length;
         record.handoffCharsBefore = guarded.charsBefore;
@@ -578,7 +603,7 @@ export const register = (on) => {
         };
 
         if (!(await isLive($))) {
-            artifacts.replacement = renderTranscript(guarded.messages);
+            artifacts.replacement = renderTranscript(replacement);
 
             await finish($, record, "rehearsed", artifacts);
 
@@ -595,10 +620,119 @@ export const register = (on) => {
         }
 
         await finish($, record, "replaced", artifacts);
-        await armMonitor($, record, e.messages, guarded.messages.length);
+        await armMonitor($, record, e.messages, replacement.length);
 
-        return { messages: guarded.messages };
+        return { messages: replacement };
     });
+};
+
+/** How long one restore read may take before the file is read from the transcript instead. */
+const RESTORE_MS = 20_000;
+
+/**
+ * The files the summariser asked for, read through the real Read tool and
+ * shaped as the tool blocks a live read produces.
+ *
+ * Fresh first: the engine's own restore re-reads from disk, so a file edited
+ * mid-session comes back current, and `$.tool.call` is a host op, so its time
+ * in flight does not count against the dispatch budget. A read that is denied,
+ * errors or runs past `RESTORE_MS` falls back to the text of the last Read in
+ * the transcript, which is stale at worst and absent at best; the row names
+ * which of the three it was. Every cap is an env var, and every number that
+ * would let the caps be tuned is on the row.
+ */
+const restoreFiles = async ($, e, requests, { depth, totalChars }) => {
+    const startedAt = $.clock.now();
+    // Three literal reads rather than one helper: the static scan lists the
+    // variables a module reads, and it can only do that off a literal name.
+    const caps = {
+        maxFiles: capOf(await $.env.get("COMPACT_HANDOFF_RESTORE_FILES"), RESTORE_MAX_FILES),
+        fileChars: capOf(await $.env.get("COMPACT_HANDOFF_RESTORE_FILE_CHARS"), RESTORE_FILE_CHARS),
+        totalChars: Math.min(capOf(await $.env.get("COMPACT_HANDOFF_RESTORE_TOTAL_CHARS"), RESTORE_TOTAL_CHARS), totalChars),
+    };
+    const chosen = chooseRestores({ requests, candidates: restoreCandidates(e.messages), maxFiles: caps.maxFiles });
+    const read = [];
+
+    for (const file of chosen.files) {
+        read.push(await readRestore($, file, caps.fileChars));
+    }
+
+    const fitted = fitRestores(read, caps.totalChars);
+    const messages = fitted
+        .filter((file) => file.text !== null)
+        .flatMap((file, index) => restorePair({ ...file, id: `toolu_handoff_${depth}_${index}` }));
+    const rows = fitted.map(restoreRow);
+
+    return {
+        messages,
+        restore: {
+            source: chosen.source,
+            requested: requests.length,
+            restored: messages.length / 2,
+            rejected: chosen.rejected,
+            files: rows,
+            chars: rows.reduce((total, row) => total + row.chars, 0),
+            approxTokens: rows.reduce((total, row) => total + row.approxTokens, 0),
+            caps,
+            ms: $.clock.now() - startedAt,
+        },
+    };
+};
+
+const readRestore = async ($, file, fileChars) => {
+    const startedAt = $.clock.now();
+    const row = { ...file, text: null, source: "failed", detail: "" };
+
+    try {
+        const fresh = await withTimeout($, freshRead($, file), RESTORE_MS, `restore ${file.path}`);
+
+        if (fresh !== null) {
+            Object.assign(row, { text: fresh, source: "fresh" });
+        } else {
+            row.detail = "the Read tool denied or errored";
+        }
+    } catch (error) {
+        row.detail = String(error).slice(0, 200);
+    }
+
+    if (row.text === null && typeof file.stored === "string") {
+        Object.assign(row, { text: file.stored, source: "stored" });
+    }
+
+    if (row.text !== null) {
+        const clipped = clipRestore(row.text, fileChars);
+
+        row.text = clipped.text;
+        row.clippedChars = clipped.clippedChars;
+    }
+
+    row.ms = $.clock.now() - startedAt;
+
+    return row;
+};
+
+/** The Read tool's own text for the file, or null when it would not read it. */
+const freshRead = async ($, { path, from, to }) => {
+    const input = { tool: "Read", file_path: path };
+
+    if (from !== null && to !== null) {
+        input.offset = from;
+        input.limit = to - from + 1;
+    }
+
+    const answer = await $.tool.call(input);
+
+    if (answer === null || typeof answer !== "object" || typeof answer.deny === "string" || answer.isError === true) {
+        return null;
+    }
+
+    return typeof answer.text === "string" && answer.text !== "" ? answer.text : null;
+};
+
+const capOf = (value, fallback) => {
+    const raw = Number.parseInt(value ?? "", 10);
+
+    return Number.isFinite(raw) && raw > 0 ? raw : fallback;
 };
 
 /**
@@ -624,13 +758,13 @@ const forkHandoff = async ($, e) => {
         return { outcome: "cold", detail: "the fork found no warm main-thread transcript" };
     }
 
-    const text = reply.text.trim();
+    const parsed = parseRestoreRequests(reply.text.trim());
 
-    if (text === "") {
+    if (parsed.summary === "") {
         return { outcome: "empty", detail: "the fork answered nothing" };
     }
 
-    return { outcome: "handoff", text, usage: reply.usage, detail: "" };
+    return { outcome: "handoff", text: parsed.summary, requests: parsed.requests, usage: reply.usage, detail: "" };
 };
 
 /**
@@ -1402,10 +1536,37 @@ const readRuns = async ($, e) => {
         ceilingUsd: await budgetCeiling($),
         handoff: await handoffState($),
         lookups: await lookupTotals($),
+        restores: restoreTotals(rows),
         last: rows[rows.length - 1] ?? null,
         runs: rows.slice(-limit),
         diagnostics: (await isDev($)) ? (await diagnosticLines($)).slice(-limit).map(parseRun) : undefined,
     };
+};
+
+/** What the restores have put back into this session's windows, summed off its rows. */
+const restoreTotals = (rows) => {
+    const totals = { compactions: 0, files: 0, chars: 0, approxTokens: 0, bySource: {}, byFile: {}, rejected: 0 };
+
+    for (const row of rows) {
+        const restore = row.restore;
+
+        if (restore === undefined || restore === null) {
+            continue;
+        }
+
+        totals.compactions += 1;
+        totals.files += restore.restored ?? 0;
+        totals.chars += restore.chars ?? 0;
+        totals.approxTokens += restore.approxTokens ?? 0;
+        totals.rejected += (restore.rejected ?? []).length;
+        totals.bySource[restore.source] = (totals.bySource[restore.source] ?? 0) + 1;
+
+        for (const file of restore.files ?? []) {
+            totals.byFile[file.source] = (totals.byFile[file.source] ?? 0) + 1;
+        }
+    }
+
+    return totals;
 };
 
 /** How much history this session has read back, summed off its own lookup log. */

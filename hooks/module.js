@@ -249,6 +249,7 @@ import {
     costOf,
     costOfNothing,
     estimatedUsage,
+    forkInputOf,
     handoffCeiling,
     fallbackReasonFor,
     isPinnable,
@@ -510,6 +511,11 @@ export const register = (on) => {
             trigger: e.trigger,
             agentId: e.agentId ?? null,
             messagesIn: e.messages.length,
+            // What the fork was charged to read, against what this session
+            // holds; null on every row that never reached a fork. Issue #690:
+            // a fork answering over a transcript that is not this conversation
+            // is invisible in every other field on the row.
+            forkInput: null,
             pinnable: e.messages.filter(isPinnable).length,
             pinnedSkipped: pinSkipCounts(e.messages),
             plugin: await pluginVersion($),
@@ -543,6 +549,12 @@ export const register = (on) => {
             return next(e);
         }
 
+        // Another plugin's work starts here, before anything is awaited, so it
+        // runs beside this plugin's fork over the same pre-compaction
+        // transcript and both read one warm cache. With nobody subscribed this
+        // is one array copy.
+        const seam = dispatchSeam($, e);
+
         const context = await lineageContext($, e, record);
 
         let handoff = { outcome: "threw", detail: "" };
@@ -563,8 +575,11 @@ export const register = (on) => {
             handoff = { outcome: "threw", detail: String(error) };
         }
 
+        record.seam = await seam;
         record.outcome = handoff.outcome;
-        record.usage = handoff.usage ?? null;
+        // A fork that ran and was refused still spent its tokens, so a usage
+        // already on the record outlives the fallback that replaced it.
+        record.usage = handoff.usage ?? record.usage ?? null;
         record.staleMessages = handoff.staleMessages ?? null;
         record.elapsedMs = Date.now() - startedAt;
         record.aborted = next.signal.aborted;
@@ -647,6 +662,160 @@ export const register = (on) => {
 
         return { messages: replacement };
     });
+
+    // The noun another plugin reaches this one through. The fold runs once per
+    // load and before any hook of this plugin, and `built` is `$` as the steps
+    // beneath made it. Nothing may be done with `built` but spread it: at
+    // `engine.create` the static scan refuses the value of `next(e)` passed to
+    // a function, and handing it to `pluginVersion` here is what refused 0.5.0
+    // at load ("the value of next(e) at engine.create is passed as an argument").
+    on("engine.create", async (_$, e, next) => {
+        const built = await next(e);
+
+        return { ...built, compactHandoff: { beforeCompact, version } };
+    });
+};
+
+/* ------------------------------------------------------------------ *
+ * The seam: another plugin's work, run beside this plugin's fork.
+ *
+ * The seam carries strings and nothing else. Revision 1 took a callback, and a
+ * callback cannot cross a plugin boundary here at all: every plugin runs in its
+ * own environment and an interface call's arguments go through `cloneInto`,
+ * which throws `DataCloneError` on a function. So a subscriber names a TOOL it
+ * answers, and this plugin raises that tool through `$.tool.call`, which runs
+ * the subscriber's work in the subscriber's own environment.
+ * ------------------------------------------------------------------ */
+
+/**
+ * The version `$.compactHandoff.version()` answers, and a constant because the
+ * `engine.create` fold may not pass `built` to a function and `$` there is the
+ * empty table, so nothing at the fold can read the manifest. `test/module.test.js`
+ * asserts it against `.claude-plugin/plugin.json` so the two cannot drift.
+ */
+export const PLUGIN_VERSION = "0.6.0";
+
+/** How long one subscriber may run before the compaction goes on without it. */
+const DEFAULT_SEAM_TIMEOUT_MS = 90_000;
+
+/**
+ * Every subscriber, keyed by the tool it answers: subscribing twice is once.
+ *
+ * Exported so a test can start from an empty seam. A subscription lives for the
+ * load and nothing in the runtime ever removes one.
+ */
+export const seamSubscribers = new Map();
+
+/**
+ * Registers the tool this plugin raises when a compaction is about to happen,
+ * beside its own fork. Resolves `{ subscribed: true, tool }`.
+ *
+ * This is the whole public API of `$.compactHandoff` beside `version`, and it
+ * exists because a plugin keyed after this one in `enabledPlugins` never sees
+ * `session.compact` at all: this plugin answers that event without calling
+ * `next`. There is no unsubscribe, and a subscription lives for the load.
+ */
+const beforeCompact = async (options) => {
+    const tool = typeof options?.tool === "string" ? options.tool.trim() : "";
+
+    if (tool === "") {
+        throw new TypeError("compactHandoff.beforeCompact takes { tool }, the full name of the tool to raise");
+    }
+
+    if (seamSubscribers.has(tool)) {
+        return { subscribed: true, tool };
+    }
+
+    const name = typeof options?.name === "string" && options.name.trim() !== "" ? options.name.trim() : tool;
+
+    seamSubscribers.set(tool, { tool, name });
+
+    return { subscribed: true, tool };
+};
+
+/** This plugin's version, for a subscriber that wants to know what it got. */
+const version = async () => PLUGIN_VERSION;
+
+/**
+ * Every subscriber, raised at once and waited for together.
+ *
+ * Nothing a subscriber does can change what this plugin answers the compaction
+ * with: a throw and a deny are row fields, a subscriber still running after the
+ * timeout is left running and its result ignored. The compaction waits for the
+ * slower of this and the fork, which is the price of both reading the same
+ * transcript while its cache is warm.
+ */
+const dispatchSeam = ($, e) => {
+    const waiting = [...seamSubscribers.values()];
+
+    if (waiting.length === 0) {
+        return Promise.resolve({ subscribers: 0 });
+    }
+
+    const started = waiting.map((entry) => ({
+        name: entry.name,
+        tool: entry.tool,
+        startedAt: Date.now(),
+        work: settledCall($, entry.tool, e),
+    }));
+
+    // A host op failing while the seam is collected is a field on the row like
+    // any other reading here, never a compaction this plugin drops.
+    return collectSeam($, started).catch((error) => ({
+        subscribers: started.length,
+        failed: String(error).slice(0, 300),
+    }));
+};
+
+/**
+ * The subscriber's tool, raised now, as a promise that resolves however it ends.
+ *
+ * The raise carries three small values and no transcript. The subscriber reads
+ * the conversation the way this plugin does, with `$.model.fork` over the live
+ * session, which is the same pre-compaction transcript and the same warm cache;
+ * sending the messages through would clone a megabyte to say what a fork reads
+ * for nothing.
+ */
+const settledCall = ($, tool, e) => {
+    const threw = (error) => ({ outcome: "threw", detail: String(error).slice(0, 300) });
+
+    try {
+        return Promise.resolve(
+            $.tool.call({ tool, trigger: e.trigger, messageCount: e.messages.length }),
+        ).then(seamOutcome, threw);
+    } catch (error) {
+        return Promise.resolve(threw(error));
+    }
+};
+
+/** What the raise resolved to, read as an outcome: an answer, or a refusal. */
+const seamOutcome = (answer) => {
+    if (answer !== null && typeof answer === "object" && typeof answer.deny === "string") {
+        return { outcome: "denied", detail: answer.deny.slice(0, 300) };
+    }
+
+    if (answer === null || typeof answer !== "object" || answer.result === undefined) {
+        return { outcome: "ok", detail: "the raise was answered with no result" };
+    }
+
+    return { outcome: "ok" };
+};
+
+const collectSeam = async ($, started) => {
+    const capMs = capOf(await $.env.get("COMPACT_HANDOFF_SEAM_TIMEOUT_MS"), DEFAULT_SEAM_TIMEOUT_MS);
+
+    const results = await Promise.all(
+        started.map(async (entry) => {
+            const ended = await Promise.race([
+                entry.work,
+                $.clock.sleep(capMs).then(() => ({ outcome: "timedOut" })),
+            ]);
+
+            return { name: entry.name, tool: entry.tool, ...ended, elapsedMs: Date.now() - entry.startedAt };
+        }),
+    );
+
+    return { subscribers: started.length, results };
 };
 
 /** How long one restore read may take before the file is read from the transcript instead. */
@@ -770,6 +939,11 @@ const capOf = (value, fallback) => {
  *
  * Null means no warm transcript (a cold session, or a headless one), which is
  * what the handoff on disk is kept for.
+ *
+ * A reply is not proof that the fork read this conversation. Some forks come
+ * back having been charged for a fraction of the session's context (#690), and
+ * the reply reads like any other summary, so `record.forkInput` is compared
+ * against the context and a short one is refused here rather than handed up.
  */
 const forkHandoff = async ($, e, record) => {
     const asked = typeof e.instructions === "string" && e.instructions.trim() !== ""
@@ -782,6 +956,23 @@ const forkHandoff = async ($, e, record) => {
 
     if (reply === null) {
         return { outcome: "cold", detail: "the fork found no warm main-thread transcript" };
+    }
+
+    record.forkInput = forkInputOf(reply.usage, record.forkContext?.context ?? null);
+
+    // A fork charged for a fraction of the context answered over a transcript
+    // that is not this conversation, and a summary of the wrong conversation is
+    // worse than the engine's own. The tokens are spent either way, so the row
+    // keeps the usage and is priced on it.
+    if (record.forkInput.matchesContext === false) {
+        record.usage = reply.usage;
+
+        return {
+            outcome: "mismatch",
+            detail:
+                `the fork was charged for ${record.forkInput.sent} input tokens against a ` +
+                `${record.forkInput.contextTokens} token context, so it did not read this conversation`,
+        };
     }
 
     const parsed = parseRestoreRequests(reply.text.trim());

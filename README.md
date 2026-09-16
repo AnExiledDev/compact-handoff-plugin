@@ -278,44 +278,50 @@ under `~/.claude/plugins/cache/`, and a clone is only what `--plugin-dir` reads.
 ### Why not `~/.claude/skills/`
 
 Claude Code will load a plugin placed at `~/.claude/skills/<name>/`, and until
-0.4.3 this file said to install it that way, as a symlink to a clone. Do not.
-**Where a plugin sits in the hook chain depends on how it was loaded**, and a
-plugin loaded out of the skills directory sits inner.
+0.4.3 this file said to install it that way, as a symlink to a clone. Do not. A
+plugin loaded out of the skills directory was measured sitting inner on the hook
+chain, the skills directory is not a documented way to install anything, and what
+orders two plugins loaded that way was never identified. Renaming did not move
+one: `aa-probe`, which sorts before `compact-handoff`, and `zz-probe`, which
+sorts after, behaved identically. The marketplace install at the top of this
+section is the documented path, it is the same on every machine, and it carries a
+version `claude plugin update` can move.
 
-That matters more for this plugin than for most, because it answers
-`session.compact` with the compacted conversation and never calls `next`.
-Anything beneath it on that event is never dispatched at all. Measured on
-2026-09-16 against engine 2.1.273, over four real compactions: a probe plugin
-loaded with `--plugin-dir` ran outer, its `session.compact` hook fired, and
-`next.trace` named compact-handoff as the single link beneath it. The same probe
-symlinked into `~/.claude/skills/` was never dispatched on `session.compact`,
-while its other hooks ran normally, so it was loaded and only its position had
-changed. Renaming it did not move it: `aa-probe`, which sorts before
-`compact-handoff`, and `zz-probe`, which sorts after, behaved identically. What
-decides the order of two skills-directory plugins is not documented and was not
-identified.
+Where a plugin sits in the chain matters more for this plugin than for most,
+because it answers `session.compact` with the compacted conversation and never
+calls `next`. Whatever sits beneath it on that event is never dispatched at all.
 
-Installing that probe through a marketplace of its own did not move it either.
-Measured on 2026-09-16 against engine 2.1.273, with this plugin and the probe
-both installed the way this page now tells you to install things, a real
-`/compact` was replaced by this plugin and the probe's `session.compact` hook was
-never dispatched. Its `session.start` and `turn.complete` hooks ran in that same
-session, so it was loaded and only its position on the compaction event was
-missing.
+**Within the `user` tier, chain position is the key order under `enabledPlugins`
+in `~/.claude/settings.json`, first key outermost.** Measured on 2026-09-16
+against engine 2.1.273, over two real compactions, with this plugin and a probe
+plugin both installed from marketplaces at user scope. With the probe's key
+placed above `compact-handoff@compact-handoff`, the probe's `session.compact`
+hook was dispatched, its `next.trace` held exactly one link (`compact-handoff`,
+tier `user`, outcome `returned`, 20473.8 ms), its own fork of the pre-compaction
+transcript answered in 1957 ms, and this plugin still wrote
+`disposition: "replaced"`. Moving the probe's entry to the front of
+`~/.claude/plugins/installed_plugins.json` while leaving the settings key where
+it was did nothing at all: the hook was never dispatched, while that same probe's
+`session.start`, `tool.call` and `turn.complete` hooks all ran in that session.
 
-So the skills directory is a scaffolding path whose load order nobody has written
-down, and it silently decides whether your other plugins get to see a compaction.
-A marketplace install is the documented path, it is the same on every machine, it
-carries a version `claude plugin update` can move, and it is what the rest of this
-section tells you to do. None of that is a claim about chain position: nothing
-measured so far lets you choose where a plugin sits, and a second plugin that
-needs to see a compaction still has no supported way to sit above this one. The
-measurement is a private one and its write-up is not in this repository: it is
-`notes/design/memory-plugin-compact-hook-spike.md` in the private
-`AnExiledDev/claude-investigations`.
+**Since 0.4.3 that is the answer for a second plugin that has to see a
+compaction. Its `enabledPlugins` key has to sit above
+`compact-handoff@compact-handoff`, and the only way found to put it there is to
+edit `~/.claude/settings.json` by hand.** `claude plugin install` appends a new
+plugin last in both files, which is why a plugin installed after this one never
+receives `session.compact` at all. Three things are worth knowing before you lean
+on it. No CLI flag for placing a key first was found. Whether a later `claude
+plugin install`, `enable` or `disable`, or a settings write by the TUI, moves a
+hand-placed key back to the end has not been tested, so read the order back after
+any of those. And only a manual `/compact` was exercised, so the `auto`, `plugin`
+and `precompute` triggers are unmeasured, as is a chain of three. Nothing read
+the engine's code for any of this: it is a measured relation between input and
+output on 2.1.273 and it could change in any release.
 
-It is written against the type declarations Claude Code prints about itself
-(`/plugin-types`, build 2.1.269), published alongside
+Both write-ups are private and neither is in this repository.
+
+This plugin is written against the type declarations Claude Code prints about
+itself (`/plugin-types`, build 2.1.269), published alongside
 [cc-changelog-plugin](https://github.com/AnExiledDev/cc-changelog-plugin/tree/main/types).
 The ledger, grading and A/B tooling under `bench/` was measured on one private
 transcript; the checklist and result tables for it are not in this repository,

@@ -286,13 +286,24 @@ changed. Renaming it did not move it: `aa-probe`, which sorts before
 decides the order of two skills-directory plugins is not documented and was not
 identified.
 
+Installing that probe through a marketplace of its own did not move it either.
+Measured on 2026-09-16 against engine 2.1.273, with this plugin and the probe
+both installed the way this page now tells you to install things, a real
+`/compact` was replaced by this plugin and the probe's `session.compact` hook was
+never dispatched. Its `session.start` and `turn.complete` hooks ran in that same
+session, so it was loaded and only its position on the compaction event was
+missing.
+
 So the skills directory is a scaffolding path whose load order nobody has written
 down, and it silently decides whether your other plugins get to see a compaction.
 A marketplace install is the documented path, it is the same on every machine, it
 carries a version `claude plugin update` can move, and it is what the rest of this
-section tells you to do. The measurement is a private one and its write-up is not
-in this repository: it is `notes/design/memory-plugin-compact-hook-spike.md` in
-the private `AnExiledDev/claude-investigations`.
+section tells you to do. None of that is a claim about chain position: nothing
+measured so far lets you choose where a plugin sits, and a second plugin that
+needs to see a compaction still has no supported way to sit above this one. The
+measurement is a private one and its write-up is not in this repository: it is
+`notes/design/memory-plugin-compact-hook-spike.md` in the private
+`AnExiledDev/claude-investigations`.
 
 It is written against the type declarations Claude Code prints about itself
 (`/plugin-types`, build 2.1.269), published alongside

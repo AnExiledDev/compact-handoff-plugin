@@ -467,18 +467,23 @@ export const register = (on) => {
 
     // Everything expensive happens here, between turns, where a dispatch that
     // runs long delays nothing the user is waiting on.
+    //
+    // One step that throws used to cost the four after it and `next(e)` with
+    // them, which is how a single `TypeError` in the watch took the whole
+    // dispatch down on every turn at 2.1.273. Each step is wrapped now, so a
+    // failing one costs its own reading and nothing else.
     on("turn.complete", async ($, e, next) => {
-        const armed = await $.store.get(ARMED_KEY);
+        const armed = await safely($, () => $.store.get(ARMED_KEY));
 
         if (armed !== undefined && armed !== null) {
-            await $.store.delete(ARMED_KEY);
-            await runArmed($, armed, next.signal);
+            await safely($, () => $.store.delete(ARMED_KEY));
+            await safely($, () => runArmed($, armed, next.signal));
         }
 
-        await promotePending($);
-        await maybeRefresh($, armed?.refresh === true);
-        await watchPost($);
-        await watchWindow($, e);
+        await safely($, () => promotePending($));
+        await safely($, () => maybeRefresh($, armed?.refresh === true));
+        await safely($, () => watchPost($));
+        await safely($, () => watchWindow($));
 
         return next(e);
     });
@@ -496,7 +501,7 @@ export const register = (on) => {
     }));
 
     on("session.compact", async ($, e, next) => {
-        const startedAt = $.clock.now();
+        const startedAt = Date.now();
         const record = {
             at: new Date().toISOString(),
             sessionId: await safely($, () => $.session.id()),
@@ -517,7 +522,7 @@ export const register = (on) => {
         // never been graded on.
         if (e.agentId !== null && e.agentId !== undefined && !(await handlesSubagents($))) {
             record.outcome = "subagent";
-            record.elapsedMs = $.clock.now() - startedAt;
+            record.elapsedMs = Date.now() - startedAt;
 
             await finish($, record, "passedThrough");
 
@@ -531,7 +536,7 @@ export const register = (on) => {
             record.outcome = "overBudget";
             record.spentUsd = spent;
             record.ceilingUsd = ceiling;
-            record.elapsedMs = $.clock.now() - startedAt;
+            record.elapsedMs = Date.now() - startedAt;
 
             await finish($, record, "overBudget");
 
@@ -561,7 +566,7 @@ export const register = (on) => {
         record.outcome = handoff.outcome;
         record.usage = handoff.usage ?? null;
         record.staleMessages = handoff.staleMessages ?? null;
-        record.elapsedMs = $.clock.now() - startedAt;
+        record.elapsedMs = Date.now() - startedAt;
         record.aborted = next.signal.aborted;
 
         if (handoff.detail !== "") {
@@ -605,7 +610,7 @@ export const register = (on) => {
         record.trimmedTurns = guarded.trimmedTurns;
         record.overCeiling = guarded.overCeiling;
         record.parts = assembled.notes;
-        record.elapsedMs = $.clock.now() - startedAt;
+        record.elapsedMs = Date.now() - startedAt;
         record.aborted = next.signal.aborted;
 
         priceRun(record, {
@@ -660,7 +665,7 @@ const RESTORE_MS = 20_000;
  * would let the caps be tuned is on the row.
  */
 const restoreFiles = async ($, e, requests, { depth, totalChars }) => {
-    const startedAt = $.clock.now();
+    const startedAt = Date.now();
     // Three literal reads rather than one helper: the static scan lists the
     // variables a module reads, and it can only do that off a literal name.
     const caps = {
@@ -692,13 +697,13 @@ const restoreFiles = async ($, e, requests, { depth, totalChars }) => {
             chars: rows.reduce((total, row) => total + row.chars, 0),
             approxTokens: rows.reduce((total, row) => total + row.approxTokens, 0),
             caps,
-            ms: $.clock.now() - startedAt,
+            ms: Date.now() - startedAt,
         },
     };
 };
 
 const readRestore = async ($, file, fileChars) => {
-    const startedAt = $.clock.now();
+    const startedAt = Date.now();
     const row = { ...file, text: null, source: "failed", detail: "" };
 
     try {
@@ -724,7 +729,7 @@ const readRestore = async ($, file, fileChars) => {
         row.clippedChars = clipped.clippedChars;
     }
 
-    row.ms = $.clock.now() - startedAt;
+    row.ms = Date.now() - startedAt;
 
     return row;
 };
@@ -933,7 +938,7 @@ const COMMITMENT_MAX_TOKENS = 8192;
  * the earlier ones stay on disk behind `handoff_lookup`.
  */
 const assembledHandoff = async ($, e, summary, context) => {
-    const startedAt = $.clock.now();
+    const startedAt = Date.now();
     const notes = {};
     const rows = ledgerRows(e.messages);
 
@@ -947,7 +952,7 @@ const assembledHandoff = async ($, e, summary, context) => {
         (part) => part !== "",
     );
 
-    notes.partsElapsedMs = $.clock.now() - startedAt;
+    notes.partsElapsedMs = Date.now() - startedAt;
 
     return { text: parts.join("\n\n"), notes, rows };
 };
@@ -961,18 +966,18 @@ const assembledHandoff = async ($, e, summary, context) => {
  * worth less than shipping without it, and the note says which one it was.
  */
 const attempt = async ($, notes, name, build) => {
-    const startedAt = $.clock.now();
+    const startedAt = Date.now();
 
     try {
         const text = await withTimeout($, build(), PARTS_MS, name);
 
         notes[name] = text === "" ? "empty" : text.length;
-        notes[`${name}Ms`] = $.clock.now() - startedAt;
+        notes[`${name}Ms`] = Date.now() - startedAt;
 
         return text;
     } catch (error) {
         notes[name] = `failed: ${String(error).slice(0, 200)}`;
-        notes[`${name}Ms`] = $.clock.now() - startedAt;
+        notes[`${name}Ms`] = Date.now() - startedAt;
 
         return "";
     }
@@ -1229,7 +1234,13 @@ const promotePending = async ($) => {
     }
 
     if (!(await $.fs.exists(pending.file))) {
-        if ($.clock.now() - pending.at > ABANDON_AFTER_MS) {
+        const waited = msSince(pending.at);
+
+        // A stamp written before 0.4.3 is a serialised Promise rather than a
+        // number, so its age cannot be read at all. Clearing it is the safe
+        // reading: it wedges `maybeRefresh` for the rest of the session while
+        // it stands, and the file it points at is never coming.
+        if (waited === null || waited > ABANDON_AFTER_MS) {
             await $.store.delete(PENDING_KEY);
         }
 
@@ -1243,7 +1254,7 @@ const promotePending = async ($) => {
     }
 
     await $.fs.write(atRoot($, LATEST), `${text.slice(0, -SENTINEL.length).trim()}\n`);
-    await $.store.set(READY_KEY, { at: $.clock.now(), messages: pending.messages });
+    await $.store.set(READY_KEY, { at: Date.now(), messages: pending.messages });
     await $.store.delete(PENDING_KEY);
 };
 
@@ -1281,11 +1292,20 @@ const isRefreshDue = async ($, messages) => {
         return messages >= MIN_MESSAGES;
     }
 
-    return (
-        messages - ready.messages >= MIN_NEW_MESSAGES &&
-        $.clock.now() - ready.at >= (await refreshMs($))
-    );
+    if (messages - ready.messages < MIN_NEW_MESSAGES) {
+        return false;
+    }
+
+    // An unreadable stamp (pre-0.4.3, a serialised Promise) is no reading of
+    // when the handoff went ready, so the message count decides alone rather
+    // than a comparison against `NaN` that can only ever answer "not due".
+    const age = msSince(ready.at);
+
+    return age === null || age >= (await refreshMs($));
 };
+
+/** How long ago a stored stamp was, or null when it is not a readable one. */
+const msSince = (at) => (typeof at === "number" && Number.isFinite(at) ? Date.now() - at : null);
 
 /**
  * Starts the subagent that writes the next handoff and deliberately does not
@@ -1320,7 +1340,7 @@ const refreshHandoff = async ($, messages) => {
     }
 
     if (record.outcome === "spawned") {
-        await $.store.set(PENDING_KEY, { at: $.clock.now(), file, messages: messages.length });
+        await $.store.set(PENDING_KEY, { at: Date.now(), file, messages: messages.length });
     }
 
     await appendRun($, record);
@@ -1396,7 +1416,7 @@ const clip = (raw) => {
  * terminal to watch still leaves the measurement behind.
  */
 const forceCompact = async ($, instructions) => {
-    const started = $.clock.now();
+    const started = Date.now();
     const record = { at: new Date().toISOString(), trigger: "forced", outcome: "", elapsedMs: 0 };
 
     try {
@@ -1409,7 +1429,7 @@ const forceCompact = async ($, instructions) => {
         record.detail = String(error).slice(0, 2000);
     }
 
-    record.elapsedMs = $.clock.now() - started;
+    record.elapsedMs = Date.now() - started;
 
     await appendRun($, record);
 };
@@ -1420,7 +1440,7 @@ const forceCompact = async ($, instructions) => {
  * subagent that does nothing but sleep, awaited inside a hook.
  */
 const probeSpawn = async ($, seconds, signal) => {
-    const started = $.clock.now();
+    const started = Date.now();
     const answer = atRoot($, `${SCRATCH}/probe-${started}.txt`);
     const record = { at: new Date().toISOString(), trigger: "probe", probeSeconds: seconds };
 
@@ -1432,7 +1452,7 @@ const probeSpawn = async ($, seconds, signal) => {
             model: "haiku",
         });
 
-        record.spawnedInMs = $.clock.now() - started;
+        record.spawnedInMs = Date.now() - started;
         record.spawn = clip(JSON.stringify(spawn));
         record.outcome = await waitForFile($, answer, (seconds + 120) * 1000, signal);
     } catch (error) {
@@ -1440,7 +1460,7 @@ const probeSpawn = async ($, seconds, signal) => {
         record.detail = String(error).slice(0, 2000);
     }
 
-    record.elapsedMs = $.clock.now() - started;
+    record.elapsedMs = Date.now() - started;
     record.aborted = signal.aborted;
 
     await appendRun($, record);
@@ -1452,11 +1472,11 @@ const probeSpawn = async ($, seconds, signal) => {
  * that long and `aborted` means it was cut off.
  */
 const probeWait = async ($, seconds, signal) => {
-    const started = $.clock.now();
+    const started = Date.now();
     const record = { at: new Date().toISOString(), trigger: "wait", probeSeconds: seconds };
 
     record.outcome = await waitForFile($, atRoot($, `${SCRATCH}/never-${started}.txt`), seconds * 1000, signal);
-    record.elapsedMs = $.clock.now() - started;
+    record.elapsedMs = Date.now() - started;
     record.aborted = signal.aborted;
 
     await appendRun($, record);
@@ -1470,7 +1490,7 @@ const probeWait = async ($, seconds, signal) => {
  * hook's own compute, or it is cut off like everything else.
  */
 const probeBudget = async ($, e, signal) => {
-    const started = $.clock.now();
+    const started = Date.now();
     const fork = e.mode === "fork";
     const record = { at: new Date().toISOString(), trigger: fork ? "budget-fork" : "budget-process" };
 
@@ -1496,7 +1516,7 @@ const probeBudget = async ($, e, signal) => {
         record.detail = String(error).slice(0, 2000);
     }
 
-    record.elapsedMs = $.clock.now() - started;
+    record.elapsedMs = Date.now() - started;
     record.aborted = signal.aborted;
 
     await appendRun($, record);
@@ -1515,7 +1535,7 @@ const runVariant = async ($, { label, replicates }, signal) => {
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
 
     for (let n = 1; n <= replicates; n += 1) {
-        const started = $.clock.now();
+        const started = Date.now();
         const record = {
             at: new Date().toISOString(),
             trigger: "ab",
@@ -1544,7 +1564,7 @@ const runVariant = async ($, { label, replicates }, signal) => {
             record.detail = String(error).slice(0, 2000);
         }
 
-        record.elapsedMs = $.clock.now() - started;
+        record.elapsedMs = Date.now() - started;
         record.aborted = signal.aborted;
         // An arm is priced off the same table as a compaction, so the baseline
         // arm and the plugin's own row can be put side by side in one column.
@@ -1561,9 +1581,9 @@ const runVariant = async ($, { label, replicates }, signal) => {
 };
 
 const waitForFile = async ($, file, budgetMs, signal) => {
-    const until = $.clock.now() + budgetMs;
+    const until = Date.now() + budgetMs;
 
-    while ($.clock.now() < until) {
+    while (Date.now() < until) {
         if (signal.aborted) {
             return "aborted";
         }
@@ -2167,28 +2187,37 @@ const TURNS_KEY = "compact-handoff:turns";
 /**
  * What carrying the handoff actually costs, logged every turn of every session.
  *
- * Cheap enough to do unconditionally: one usage read, one scan of the messages
- * already in hand, one appended line of a few hundred bytes. It runs whether or
- * not the session has ever compacted, because the fresh-session readings are
- * the baseline the post-compact ones are measured against, and a session that
- * never compacts is where that baseline is cleanest. Every step is wrapped, so
- * a missing reading costs a row and nothing else.
+ * Cheap enough to do unconditionally: one usage read, one transcript read, one
+ * scan of it and one appended line of a few hundred bytes. Both reads are host
+ * ops rather than local work, and they are paid every turn of every session:
+ * that is the price of the comparison, and it buys a reading the event itself
+ * does not carry. It runs whether or not the session has ever compacted,
+ * because the fresh-session readings are the baseline the post-compact ones
+ * are measured against, and a session that never compacts is where that
+ * baseline is cleanest. Every step is wrapped, so a missing reading costs a
+ * row and nothing else.
  */
-const watchWindow = async ($, e) => {
+const watchWindow = async ($) => {
     const turn = ((await safely($, () => $.store.get(TURNS_KEY))) ?? 0) + 1;
 
     await safely($, () => $.store.set(TURNS_KEY, turn));
 
     const usage = await safely($, () => $.session.usage());
-    const prior = priorHandoffIn(e.messages);
+    // `TurnCompleteInput` carries no transcript: `answer`, `durationMs`,
+    // `aborted`, `turnId`, `reason` and nothing else. Reading `e.messages` off
+    // it threw a `TypeError` on every turn at 2.1.273 and the row was never
+    // written. `$.session.messages()` is the declared way to ask, and like
+    // every other reading here it costs its own field when it fails.
+    const messages = await safely($, () => $.session.messages());
+    const prior = messages === null ? null : priorHandoffIn(messages);
     const row = windowReading({
         at: new Date().toISOString(),
         session: await safely($, () => $.session.id()),
         turn,
         context: usage?.context ?? null,
-        messages: e.messages.length,
+        messages: messages === null ? null : messages.length,
         handoff:
-            prior === null ? null : { n: prior.lineage.n, chars: (e.messages[prior.index].text ?? "").length },
+            prior === null ? null : { n: prior.lineage.n, chars: (messages[prior.index].text ?? "").length },
     });
 
     await safely($, async () => appendLine($, `${await dataDir($)}/${WINDOW_LOG}`, JSON.stringify(row)));

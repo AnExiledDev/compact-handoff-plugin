@@ -213,16 +213,86 @@ not to be used.
 ## Install
 
 ```bash
+claude plugin marketplace add AnExiledDev/compact-handoff-plugin
+claude plugin install compact-handoff@compact-handoff
+```
+
+Since 0.4.3 this repository is its own marketplace. `.claude-plugin/marketplace.json`
+lists one plugin whose `source` is the repository root, so those two commands are
+the whole install on a machine that has never seen it, and neither of them needs
+a clone. The marketplace is called `compact-handoff` after the only plugin it
+carries, which is why the install id reads `compact-handoff@compact-handoff`.
+`claude plugin install` writes user scope unless you pass `--scope project` or
+`--scope local`. Claude Code picks the install up on its next launch, or on
+`/reload-plugins` in a session that is already open.
+
+Two environment variables belong in the `env` block of `~/.claude/settings.json`,
+and the install does not write them for you:
+
+```json
+{
+  "env": {
+    "CLAUDE_CODE_ENABLE_FUNCTION_HOOKS": "1",
+    "COMPACT_HANDOFF_LIVE": "1"
+  }
+}
+```
+
+Without `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1` the runtime this is built on does
+not exist and the module never loads. Without `COMPACT_HANDOFF_LIVE=1` it
+rehearses: it does the whole job, writes down the handoff it would have handed
+up, and then lets the engine compact anyway. Rehearsing stays the default after
+an install on purpose. The worst case of installing something that replaces your
+compaction should be the compaction you already had, so turning it live is a
+second, deliberate act.
+
+To work on the plugin rather than use it, `--plugin-dir` still loads a folder for
+one session and takes precedence over the installed copy of the same name:
+
+```bash
 git clone https://github.com/AnExiledDev/compact-handoff-plugin.git
 CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 COMPACT_HANDOFF_LIVE=1 claude --plugin-dir ./compact-handoff-plugin
 ```
 
-`--plugin-dir` loads it for that session only. To keep it, put the folder (or a
-symlink to the clone) at `~/.claude/skills/compact-handoff` and set both
-variables in the `env` block of `~/.claude/settings.json`. Without
-`CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1` the runtime this is built on does not
-exist and the module never loads; without `COMPACT_HANDOFF_LIVE=1` it only
-rehearses and the engine's own summariser still runs.
+### Upgrading
+
+```bash
+claude plugin marketplace update compact-handoff
+claude plugin update compact-handoff@compact-handoff
+```
+
+The first refreshes the catalog from GitHub and the second moves the install to
+the version it now names; restart, or run `/reload-plugins`, to load it. Pulling
+a clone upgrades nothing any more, because what runs is the copy the install put
+under `~/.claude/plugins/cache/`, and a clone is only what `--plugin-dir` reads.
+
+### Why not `~/.claude/skills/`
+
+Claude Code will load a plugin placed at `~/.claude/skills/<name>/`, and until
+0.4.3 this file said to install it that way, as a symlink to a clone. Do not.
+**Where a plugin sits in the hook chain depends on how it was loaded**, and a
+plugin loaded out of the skills directory sits inner.
+
+That matters more for this plugin than for most, because it answers
+`session.compact` with the compacted conversation and never calls `next`.
+Anything beneath it on that event is never dispatched at all. Measured on
+2026-09-16 against engine 2.1.273, over four real compactions: a probe plugin
+loaded with `--plugin-dir` ran outer, its `session.compact` hook fired, and
+`next.trace` named compact-handoff as the single link beneath it. The same probe
+symlinked into `~/.claude/skills/` was never dispatched on `session.compact`,
+while its other hooks ran normally, so it was loaded and only its position had
+changed. Renaming it did not move it: `aa-probe`, which sorts before
+`compact-handoff`, and `zz-probe`, which sorts after, behaved identically. What
+decides the order of two skills-directory plugins is not documented and was not
+identified.
+
+So the skills directory is a scaffolding path whose load order nobody has written
+down, and it silently decides whether your other plugins get to see a compaction.
+A marketplace install is the documented path, it is the same on every machine, it
+carries a version `claude plugin update` can move, and it is what the rest of this
+section tells you to do. The measurement is a private one and its write-up is not
+in this repository: it is `notes/design/memory-plugin-compact-hook-spike.md` in
+the private `AnExiledDev/claude-investigations`.
 
 It is written against the type declarations Claude Code prints about itself
 (`/plugin-types`, build 2.1.269), published alongside

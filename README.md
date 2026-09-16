@@ -194,6 +194,7 @@ that matter for that second case:
 | `maxHandoff` | every `replaced` and `rehearsed` row | the handoff ceiling the size guard used and how it was arrived at: `{window, fraction, capTokens, chars, decider}`, where `decider` is `fraction`, `cap`, `default: window unknown` or `override`; an override past the safe cap adds `overSafeCapChars` and `overSafeCapTokens` saying by how much |
 | `forkContext` | every row that forked | what the session looked like the instant before `$.model.fork`: `{context, model, messages, msSinceLastFork, subagentRanThisTurn}`, where `context` is the whole `$.session.usage().context` object (`tokens`, `window`, `percent`) and `msSinceLastFork` is `null` on a session's first fork |
 | `parts` | every `replaced` and `rehearsed` row | per-part sizes and timings; for the commitments pass, `commitmentsVia`, `commitmentsModel`, `commitmentsPromptChars`, `commitmentsReplyChars`, `commitmentsTokensEstimated`, `commitmentsCostUsd`, `commitmentsCostBasis`, and since 0.4.0 `commitmentsRows` (how many rows came back) with `commitmentsHitCap` and `commitmentsHitCapReason` (`length` or `truncated row`) saying whether the reply stopped at the 8192-token output cap |
+| `seam` | every row this plugin handled itself | `{subscribers, results}`, where each result is `{name, outcome, elapsedMs}` and `outcome` is `ok`, `threw` or `timedOut`; `{subscribers: 0}` alone when nothing subscribed. Absent on `passedThrough` and `overBudget` rows, which never reach the seam |
 | `costUnknownReason` | when `cost` is `null` | why it could not be priced. A run is never priced at 0 because its usage was missing |
 | `costNote` | when nothing was spent | `no model call was made`. A pass-through and a refusal over budget cost a real zero, which is not the same as unknown |
 | `overCeiling` | always | the size guard could not fit the replacement, because the handoff itself is larger than the ceiling and is never trimmed |
@@ -320,12 +321,126 @@ output on 2.1.273 and it could change in any release.
 
 Both write-ups are private and neither is in this repository.
 
+Since 0.5.0 a second plugin has another way in that does not depend on the key
+order at all. It subscribes to the seam this plugin exposes, and the next
+section is how.
+
 This plugin is written against the type declarations Claude Code prints about
 itself (`/plugin-types`, build 2.1.269), published alongside
 [cc-changelog-plugin](https://github.com/AnExiledDev/cc-changelog-plugin/tree/main/types).
 The ledger, grading and A/B tooling under `bench/` was measured on one private
 transcript; the checklist and result tables for it are not in this repository,
 only the numbers the README quotes.
+
+## Working beside another plugin
+
+Alone, this plugin is the whole compaction. It answers `session.compact` with
+the conversation it wants the session to carry and it never calls `next`, so the
+engine's summariser does not run and neither does anything sitting beneath it on
+that event. That is what it is for, and it is also the problem: a second plugin
+that wants to read a conversation the moment before it is compacted has nowhere
+to stand. Within the `user` tier the chain order is the key order under
+`enabledPlugins` and `claude plugin install` appends last, so a plugin installed
+after this one is never dispatched `session.compact` at all. The measurement is
+in the section above.
+
+Since 0.5.0 there is a seam for exactly that plugin. This one adds a noun to `$`
+through an `engine.create` fold, which is the fold that builds `$`, and the
+declarations say every noun a plugin's step adds is on every plugin's `$`:
+
+```js
+$.compactHandoff = {
+    version: "0.5.0",
+    beforeCompact(fn, options),  // returns the function that unsubscribes
+};
+```
+
+A subscriber is called with the same `session.compact` input this plugin
+received, at the same moment this plugin forks, and the compaction waits for
+both. Both reads run over one pre-compaction transcript, so the second one is a
+cache read rather than a second cold pass, which is the only reason running them
+together is affordable. Measured during the spike that led to this, on a 57k
+transcript, a second fork beside this plugin's own cost $0.0012 waived and took
+about 2 seconds, against $0.4995 for the same fork taken from `turn.complete`
+after the compaction had already happened.
+
+Here is a whole subscriber, written the way the memory plugin does it, so that
+it still works with this plugin absent:
+
+```js
+export const register = (on) => {
+    let unsubscribe = null;
+
+    on("session.start", async ($, e, next) => {
+        if (typeof $.compactHandoff?.beforeCompact === "function") {
+            unsubscribe = $.compactHandoff.beforeCompact(
+                async (compact) => void (await remember(compact.messages)),
+                { name: "memory-handoff" },
+            );
+        }
+
+        return next(e);
+    });
+
+    on("session.compact", async ($, e, next) => {
+        // Subscribed, so the seam is bringing this same event along in a
+        // moment and forking here as well would be two forks for one
+        // compaction.
+        if (unsubscribe === null) {
+            await remember(e.messages);
+        }
+
+        return next(e);
+    });
+};
+```
+
+`options.name` is what the row calls the subscriber and it defaults to
+`anonymous`. Name it. A row that says `anonymous` timed out tells you nothing
+you can act on.
+
+What the seam will and will not do to you:
+
+- A subscriber that throws is a field on the row and changes nothing else. This
+  plugin's own outcome is the same either way, and the test that pins that
+  compares both rows against a run with nobody subscribed.
+- A subscriber still running after `COMPACT_HANDOFF_SEAM_TIMEOUT_MS`
+  (default `90000`) is abandoned. Its promise is not cancelled, because nothing
+  here can cancel one, its result is ignored and the compaction goes on.
+- Nothing is called on a compaction this plugin only passes through. A
+  subagent's compaction and a session already over its budget are handed back to
+  the engine before the seam is reached, and those rows carry no `seam` field at
+  all.
+- With nobody subscribed the seam is one array copy and the row says
+  `seam: { subscribers: 0 }`. No environment read, no timer, no cost.
+
+The row carries what happened:
+
+```json
+"seam": {
+  "subscribers": 1,
+  "results": [{ "name": "memory-handoff", "outcome": "ok", "elapsedMs": 2104 }]
+}
+```
+
+`outcome` is `ok`, `threw` or `timedOut`, and a `threw` also carries the first
+300 characters of the error as `detail`. `elapsedMs` is measured from the moment
+the subscriber was called, so a `timedOut` reads a little over the cap.
+
+[memory-handoff](https://github.com/AnExiledDev/memory-handoff-plugin) is the
+first subscriber. Either plugin runs with the other absent, which is the point
+of building it this way: with this plugin uninstalled, the memory plugin takes
+its own fork from its own `session.compact` hook and hands the compaction back
+to the engine, and with the memory plugin uninstalled the seam here has zero
+subscribers and costs nothing.
+
+One thing is worth knowing before you lean on it. The type declarations say a
+noun added by one plugin's `engine.create` step is on every plugin's `$` ("every
+noun the plugins' steps added"), and they also say that between hooks the
+interface crosses the chain as descriptors. Whether a function argument survives
+that crossing at 2.1.273 has not been measured live yet. If it turns out a plugin's `$` does not carry
+another plugin's noun on your build, the fallback is the `enabledPlugins` order
+above, which is measured and which works.
 
 ## Settings
 
@@ -341,6 +456,7 @@ only the numbers the README quotes.
 | `COMPACT_HANDOFF_RESTORE_FILE_CHARS` | `20000` | The most of one restored file that comes back; the rest is clipped with a note saying how much. |
 | `COMPACT_HANDOFF_RESTORE_TOTAL_CHARS` | `100000` | The most all restored files may add together, and never more than the ceiling above leaves free after the handoff. |
 | `COMPACT_HANDOFF_MAX_USD_PER_SESSION` | `10` | Past this, compactions fall back to the engine and record `disposition: "overBudget"`. |
+| `COMPACT_HANDOFF_SEAM_TIMEOUT_MS` | `90000` | How long one `$.compactHandoff.beforeCompact` subscriber may run before the compaction goes on without it. Read only when something is subscribed. |
 | `COMPACT_HANDOFF_SUBAGENTS` | off | Off, a subagent's compaction is passed through with a row saying so. On, it is answered like any other. |
 | `COMPACT_HANDOFF_DEV` | off | Registers the four measurement tools. |
 | `COMPACT_HANDOFF_REFRESH` | off | Keeps a fallback handoff on disk for sessions a fork cannot serve (headless). |

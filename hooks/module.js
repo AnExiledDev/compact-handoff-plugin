@@ -543,6 +543,12 @@ export const register = (on) => {
             return next(e);
         }
 
+        // Another plugin's work starts here, before anything is awaited, so it
+        // runs beside this plugin's fork over the same pre-compaction
+        // transcript and both read one warm cache. With nobody subscribed this
+        // is one array copy.
+        const seam = dispatchSeam($, e);
+
         const context = await lineageContext($, e, record);
 
         let handoff = { outcome: "threw", detail: "" };
@@ -563,6 +569,7 @@ export const register = (on) => {
             handoff = { outcome: "threw", detail: String(error) };
         }
 
+        record.seam = await seam;
         record.outcome = handoff.outcome;
         record.usage = handoff.usage ?? null;
         record.staleMessages = handoff.staleMessages ?? null;
@@ -647,6 +654,104 @@ export const register = (on) => {
 
         return { messages: replacement };
     });
+
+    // The noun another plugin reaches this one through. The fold runs once per
+    // load and before any hook of this plugin, `$` here is the empty table, and
+    // `built` is `$` as the steps beneath made it, which is where the version
+    // is read from.
+    on("engine.create", async (_$, e, next) => {
+        const built = await next(e);
+
+        return { ...built, compactHandoff: { version: await pluginVersion(built), beforeCompact } };
+    });
+};
+
+/* ------------------------------------------------------------------ *
+ * The seam: another plugin's work, run beside this plugin's fork.
+ * ------------------------------------------------------------------ */
+
+/** How long one subscriber may run before the compaction goes on without it. */
+const DEFAULT_SEAM_TIMEOUT_MS = 90_000;
+
+/** Every subscriber registered through `$.compactHandoff.beforeCompact`. */
+const subscribers = new Set();
+
+/**
+ * Registers `fn` to be called with the `session.compact` input this plugin
+ * received, beside its own fork. Returns the function that unregisters it.
+ *
+ * This is the whole public API of `$.compactHandoff`, and it exists because a
+ * plugin keyed after this one in `enabledPlugins` never sees `session.compact`
+ * at all: this plugin answers that event without calling `next`.
+ */
+const beforeCompact = (fn, options = {}) => {
+    if (typeof fn !== "function") {
+        throw new TypeError("compactHandoff.beforeCompact takes a function");
+    }
+
+    const name = typeof options?.name === "string" && options.name.trim() !== "" ? options.name.trim() : "anonymous";
+    const entry = { fn, name };
+
+    subscribers.add(entry);
+
+    return () => void subscribers.delete(entry);
+};
+
+/**
+ * Every subscriber, started at once and waited for together.
+ *
+ * Nothing a subscriber does can change what this plugin answers the compaction
+ * with: a throw is a row field, a subscriber still running after the timeout is
+ * left running and its result ignored. The compaction waits for the slower of
+ * this and the fork, which is the price of both reading the same transcript.
+ */
+const dispatchSeam = ($, e) => {
+    const waiting = [...subscribers];
+
+    if (waiting.length === 0) {
+        return Promise.resolve({ subscribers: 0 });
+    }
+
+    const started = waiting.map((entry) => ({
+        name: entry.name,
+        startedAt: Date.now(),
+        work: settledCall(entry.fn, e),
+    }));
+
+    // A host op failing while the seam is collected is a field on the row like
+    // any other reading here, never a compaction this plugin drops.
+    return collectSeam($, started).catch((error) => ({
+        subscribers: started.length,
+        failed: String(error).slice(0, 300),
+    }));
+};
+
+/** The subscriber, called now, as a promise that resolves however it ends. */
+const settledCall = (fn, e) => {
+    const threw = (error) => ({ outcome: "threw", detail: String(error).slice(0, 300) });
+
+    try {
+        return Promise.resolve(fn(e)).then(() => ({ outcome: "ok" }), threw);
+    } catch (error) {
+        return Promise.resolve(threw(error));
+    }
+};
+
+const collectSeam = async ($, started) => {
+    const capMs = capOf(await $.env.get("COMPACT_HANDOFF_SEAM_TIMEOUT_MS"), DEFAULT_SEAM_TIMEOUT_MS);
+
+    const results = await Promise.all(
+        started.map(async (entry) => {
+            const ended = await Promise.race([
+                entry.work,
+                $.clock.sleep(capMs).then(() => ({ outcome: "timedOut" })),
+            ]);
+
+            return { name: entry.name, ...ended, elapsedMs: Date.now() - entry.startedAt };
+        }),
+    );
+
+    return { subscribers: started.length, results };
 };
 
 /** How long one restore read may take before the file is read from the transcript instead. */

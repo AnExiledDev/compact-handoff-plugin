@@ -1,0 +1,24 @@
+{
+  "name": "compact-handoff",
+  "description": "The compact-handoff plugin, distributed from its own repository",
+  "owner": {
+    "name": "AnExiledDev",
+    "email": "696222+AnExiledDev@users.noreply.github.com",
+    "url": "https://github.com/AnExiledDev"
+  },
+  "plugins": [
+    {
+      "name": "compact-handoff",
+      "source": "./",
+      "description": "Replaces the engine's compaction with a subagent's handoff, and measures whether it can be one",
+      "author": {
+        "name": "AnExiledDev",
+        "email": "696222+AnExiledDev@users.noreply.github.com"
+      },
+      "homepage": "https://github.com/AnExiledDev/compact-handoff-plugin",
+      "repository": "https://github.com/AnExiledDev/compact-handoff-plugin",
+      "license": "MIT",
+      "keywords": ["compaction", "context", "handoff", "function-hooks", "session"]
+    }
+  ]
+}

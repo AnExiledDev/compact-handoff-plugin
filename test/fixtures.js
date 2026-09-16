@@ -102,3 +102,132 @@ export const mixedConversation = (make) => [
         make("Bash", { command: "git status --short" }),
     ]),
 ];
+
+/* ------------------------------------------------------------------ *
+ * A host to dispatch a hook against.
+ * ------------------------------------------------------------------ */
+
+/**
+ * The `on` the runtime hands `register`, remembering what was registered.
+ *
+ * `dispatch` picks a handler the way the engine does: a matcher whose every
+ * key the input carries wins, and the unmatched registration is the fallback,
+ * so the `precompute` hook and the general `session.compact` hook can both be
+ * reached from one place.
+ */
+export const fakeRuntime = () => {
+    const registered = [];
+    const on = (event, first, second) => {
+        registered.push({
+            event,
+            match: second === undefined ? null : first,
+            handler: second === undefined ? first : second,
+        });
+    };
+
+    const handlerFor = (event, input) => {
+        const candidates = registered.filter((entry) => entry.event === event);
+        const matched = candidates.find(
+            (entry) => entry.match !== null && Object.entries(entry.match).every(([key, value]) => input?.[key] === value),
+        );
+
+        return (matched ?? candidates.find((entry) => entry.match === null))?.handler ?? null;
+    };
+
+    return {
+        on,
+        registered,
+        dispatch: async (event, $, input, next = passThrough()) => {
+            const handler = handlerFor(event, input);
+
+            if (handler === null) {
+                throw new Error(`nothing is registered for ${event}`);
+            }
+
+            return handler($, input, next);
+        },
+    };
+};
+
+/** The `next` a dispatch carries: answers, and remembers that it was reached. */
+export const passThrough = () => {
+    const next = (input) => {
+        next.calls.push(input);
+
+        return { passedThrough: true };
+    };
+
+    next.calls = [];
+    next.signal = undefined;
+
+    return next;
+};
+
+/**
+ * The `$` a hook is handed, in memory.
+ *
+ * `clock.now` deliberately answers a **Promise**, which is what engine 2.1.273
+ * really does against a declaration that says `number`. Nothing in the module
+ * may depend on it: every duration is `Date.now()`, which is right whichever
+ * the engine returns. Anything a test steers goes in `overrides`.
+ */
+export const fakeApi = (overrides = {}) => {
+    const files = new Map(Object.entries(overrides.files ?? {}));
+    const store = new Map();
+    const env = { HOME: "/home/nobody", ...overrides.env };
+    const appends = [];
+    const toasts = [];
+
+    files.set("/plugin/.claude-plugin/plugin.json", JSON.stringify({ version: "0.0.0-test" }));
+
+    const $ = {
+        plugin: { root: "/plugin" },
+        env: { get: async (name) => env[name] },
+        store: {
+            get: async (key) => store.get(key),
+            set: async (key, value) => void store.set(key, value),
+            delete: async (key) => void store.delete(key),
+        },
+        fs: {
+            read: async (path) => {
+                if (!files.has(path)) {
+                    throw new Error(`no such file: ${path}`);
+                }
+
+                return files.get(path);
+            },
+            write: async (path, text) => void files.set(path, text),
+            exists: async (path) => files.has(path),
+            list: async () => [],
+        },
+        // `appendLine` is the only caller, as
+        // `sh -c '... "$1"' compact-handoff <file>` with the row on stdin.
+        process: {
+            run: async (argv, options = {}) => {
+                appends.push({ file: argv.at(-1), line: (options.stdin ?? "").trimEnd() });
+
+                return { code: 0, stdout: "", stderr: "" };
+            },
+        },
+        session: {
+            id: async () => "session-under-test",
+            cwd: async () => "/repo",
+            model: async () => "claude-sonnet-5",
+            messages: async () => overrides.messages ?? [],
+            usage: async () => ({ context: { tokens: 12_000, window: 200_000, percent: 6 } }),
+            ...overrides.session,
+        },
+        ui: { toast: (text, options) => void toasts.push({ text, options }), log: () => {} },
+        clock: { now: () => Promise.resolve(Date.now()), sleep: async () => {}, ...overrides.clock },
+    };
+
+    return {
+        $,
+        files,
+        store,
+        toasts,
+        appends,
+        /** Every row appended to a log whose path ends in `name`, parsed. */
+        rowsIn: (name) => appends.filter((entry) => entry.file.endsWith(name)).map((entry) => JSON.parse(entry.line)),
+    };
+};

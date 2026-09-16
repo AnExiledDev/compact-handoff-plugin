@@ -177,6 +177,11 @@ export const fakeApi = (overrides = {}) => {
     const env = { HOME: "/home/nobody", ...overrides.env };
     const appends = [];
     const toasts = [];
+    const tools = [];
+    const toolCalls = [];
+    // What a raised tool answers. The seam reads `result` and `deny` off this
+    // exactly as the engine's own `tool.call` result is declared.
+    const answerCall = overrides.toolCall ?? (async () => ({ result: "answered" }));
 
     files.set("/plugin/.claude-plugin/plugin.json", JSON.stringify({ version: "0.0.0-test" }));
 
@@ -217,6 +222,14 @@ export const fakeApi = (overrides = {}) => {
             usage: async () => ({ context: { tokens: 12_000, window: 200_000, percent: 6 } }),
             ...overrides.session,
         },
+        tool: {
+            register: async (spec) => void tools.push(spec),
+            call: async (input) => {
+                toolCalls.push(input);
+
+                return answerCall(input);
+            },
+        },
         ui: { toast: (text, options) => void toasts.push({ text, options }), log: () => {} },
         clock: { now: () => Promise.resolve(Date.now()), sleep: async () => {}, ...overrides.clock },
     };
@@ -226,6 +239,9 @@ export const fakeApi = (overrides = {}) => {
         files,
         store,
         toasts,
+        tools,
+        /** Every `$.tool.call` input, in the order the module raised them. */
+        toolCalls,
         appends,
         /** Every row appended to a log whose path ends in `name`, parsed. */
         rowsIn: (name) => appends.filter((entry) => entry.file.endsWith(name)).map((entry) => JSON.parse(entry.line)),

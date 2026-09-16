@@ -321,7 +321,7 @@ output on 2.1.273 and it could change in any release.
 
 Both write-ups are private and neither is in this repository.
 
-Since 0.5.0 a second plugin has another way in that does not depend on the key
+Since 0.6.0 a second plugin has another way in that does not depend on the key
 order at all. It subscribes to the seam this plugin exposes, and the next
 section is how.
 
@@ -344,50 +344,80 @@ to stand. Within the `user` tier the chain order is the key order under
 after this one is never dispatched `session.compact` at all. The measurement is
 in the section above.
 
-Since 0.5.0 there is a seam for exactly that plugin. This one adds a noun to `$`
+Since 0.6.0 there is a seam for exactly that plugin. This one adds a noun to `$`
 through an `engine.create` fold, which is the fold that builds `$`, and the
 declarations say every noun a plugin's step adds is on every plugin's `$`:
 
 ```js
 $.compactHandoff = {
-    version: "0.5.0",
-    beforeCompact(fn, options),  // returns the function that unsubscribes
+    beforeCompact({ tool, name }),  // resolves { subscribed: true, tool }
+    version(),                      // resolves "0.6.0"
 };
 ```
 
-A subscriber is called with the same `session.compact` input this plugin
-received, at the same moment this plugin forks, and the compaction waits for
-both. Both reads run over one pre-compaction transcript, so the second one is a
-cache read rather than a second cold pass, which is the only reason running them
-together is affordable. Measured during the spike that led to this, on a 57k
-transcript, a second fork beside this plugin's own cost $0.0012 waived and took
-about 2 seconds, against $0.4995 for the same fork taken from `turn.complete`
-after the compaction had already happened.
+**The seam carries strings and nothing else.** `tool` is the full name of a tool
+your plugin answers with a `tool.call` hook of its own. When a compaction starts,
+this plugin raises that tool:
 
-Here is a whole subscriber, written the way the memory plugin does it, so that
+```js
+$.tool.call({ tool, trigger, messageCount });
+```
+
+Your hook then runs in your plugin's own environment, which is the whole reason
+the seam is shaped this way. 0.5.0 took a callback and a callback cannot cross
+this boundary at all: each plugin runs in its own environment, an interface
+call's arguments go through `cloneInto`, and `cloneInto` throws `DataCloneError`
+on a function. The engine's static scan refused both modules outright in the
+same run, before any of that could even be reached. Strings clone. Functions do
+not.
+
+The transcript does not travel either, and that is deliberate. `messageCount` is
+a number, the messages stay where they are, and your hook reads the conversation
+the way this plugin does, with `$.model.fork` over the live session. It is the
+same pre-compaction transcript and the same warm cache. Measured during the spike
+that led to this, on a 57k transcript, a second fork beside this plugin's own
+cost $0.0012 waived and took about 2 seconds, against $0.4995 for the same fork
+taken from `turn.complete` after the compaction had already happened. Cloning a
+megabyte of messages across the boundary would buy nothing a fork does not
+already give you.
+
+Here is a whole subscriber, written the way the memory plugin writes it, so that
 it still works with this plugin absent:
 
 ```js
-export const register = (on) => {
-    let unsubscribe = null;
+const SEAM_TOOL = "mcp__memory-handoff__before_compact";
 
+export const register = (on) => {
     on("session.start", async ($, e, next) => {
-        if (typeof $.compactHandoff?.beforeCompact === "function") {
-            unsubscribe = $.compactHandoff.beforeCompact(
-                async (compact) => void (await remember(compact.messages)),
-                { name: "memory-handoff" },
-            );
+        try {
+            await $.compactHandoff.beforeCompact({ tool: SEAM_TOOL, name: "memory-handoff" });
+            await $.store.set("seam", { present: true, at: Date.now() });
+        } catch (error) {
+            // With compact-handoff absent there is no such noun, and reading it
+            // throws a TypeError. That throw is the detection.
+            await $.store.set("seam", { present: false, detail: String(error), at: Date.now() });
         }
 
         return next(e);
     });
 
+    // The raise lands here, in this plugin's own environment, where a fork and
+    // a database and anything else this plugin owns all work normally.
+    on("tool.call", { tool: SEAM_TOOL }, async ($, e) => {
+        const outcome = await remember($, e.trigger, e.messageCount);
+
+        // Never `next(e)`. The call exists for this hook and for nothing else.
+        return { result: { outcome } };
+    });
+
     on("session.compact", async ($, e, next) => {
-        // Subscribed, so the seam is bringing this same event along in a
-        // moment and forking here as well would be two forks for one
+        const seam = await $.store.get("seam");
+
+        // Subscribed, so the raise is bringing this same compaction along in a
+        // moment and working here as well would be two passes for one
         // compaction.
-        if (unsubscribe === null) {
-            await remember(e.messages);
+        if (seam?.present !== true) {
+            await remember($, e.trigger, e.messages.length);
         }
 
         return next(e);
@@ -395,19 +425,28 @@ export const register = (on) => {
 };
 ```
 
-`options.name` is what the row calls the subscriber and it defaults to
-`anonymous`. Name it. A row that says `anonymous` timed out tells you nothing
-you can act on.
+Write the calls out longhand, exactly as they are above. The engine scans a
+hooks module before it loads it and refuses `$.compactHandoff?.beforeCompact`,
+`const seam = $.compactHandoff`, and anything else that reads a noun of `$`
+rather than calling an event on it. Both of those spellings are why there is no
+`typeof` check here: the try/catch is the check.
+
+`name` is what the row calls the subscriber and it defaults to the tool name.
+Name it anyway. Subscribing twice for one tool is subscribing once, so a plugin
+reload costs nothing, and there is no unsubscribe: a subscription lives for as
+long as the session does.
 
 What the seam will and will not do to you:
 
-- A subscriber that throws is a field on the row and changes nothing else. This
+- A raise that throws is a field on the row and changes nothing else. This
   plugin's own outcome is the same either way, and the test that pins that
   compares both rows against a run with nobody subscribed.
-- A subscriber still running after `COMPACT_HANDOFF_SEAM_TIMEOUT_MS`
-  (default `90000`) is abandoned. Its promise is not cancelled, because nothing
-  here can cancel one, its result is ignored and the compaction goes on.
-- Nothing is called on a compaction this plugin only passes through. A
+- A hook that answers `{ deny }` is recorded as `denied` with the refusal on
+  the row. Denying is a legitimate answer and it costs the compaction nothing.
+- A raise still pending after `COMPACT_HANDOFF_SEAM_TIMEOUT_MS` (default
+  `90000`) is abandoned. Nothing here can cancel one, so it is left running, its
+  answer is ignored and the compaction goes on.
+- Nothing is raised on a compaction this plugin only passes through. A
   subagent's compaction and a session already over its budget are handed back to
   the engine before the seam is reached, and those rows carry no `seam` field at
   all.
@@ -419,28 +458,37 @@ The row carries what happened:
 ```json
 "seam": {
   "subscribers": 1,
-  "results": [{ "name": "memory-handoff", "outcome": "ok", "elapsedMs": 2104 }]
+  "results": [
+    {
+      "name": "memory-handoff",
+      "tool": "mcp__memory-handoff__before_compact",
+      "outcome": "ok",
+      "elapsedMs": 2104
+    }
+  ]
 }
 ```
 
-`outcome` is `ok`, `threw` or `timedOut`, and a `threw` also carries the first
-300 characters of the error as `detail`. `elapsedMs` is measured from the moment
-the subscriber was called, so a `timedOut` reads a little over the cap.
+`outcome` is `ok`, `denied`, `threw` or `timedOut`. A `denied` carries the
+refusal as `detail` and a `threw` carries the first 300 characters of the error,
+and `elapsedMs` is measured from the moment the tool was raised, so a `timedOut`
+reads a little over the cap.
 
 [memory-handoff](https://github.com/AnExiledDev/memory-handoff-plugin) is the
-first subscriber. Either plugin runs with the other absent, which is the point
-of building it this way: with this plugin uninstalled, the memory plugin takes
-its own fork from its own `session.compact` hook and hands the compaction back
-to the engine, and with the memory plugin uninstalled the seam here has zero
-subscribers and costs nothing.
+first subscriber. Either plugin runs with the other absent, which is the point of
+building it this way: with this plugin uninstalled, the memory plugin takes its
+own fork from its own `session.compact` hook and hands the compaction back to the
+engine, and with the memory plugin uninstalled the seam here has zero subscribers
+and costs nothing.
 
-One thing is worth knowing before you lean on it. The type declarations say a
-noun added by one plugin's `engine.create` step is on every plugin's `$` ("every
-noun the plugins' steps added"), and they also say that between hooks the
-interface crosses the chain as descriptors. Whether a function argument survives
-that crossing at 2.1.273 has not been measured live yet. If it turns out a plugin's `$` does not carry
-another plugin's noun on your build, the fallback is the `enabledPlugins` order
-above, which is measured and which works.
+Two things about it are still unmeasured on a live engine. The declarations say a
+noun added by one plugin's `engine.create` step is on every plugin's `$`, and the
+run that was meant to prove it never got that far, because the scan refused both
+0.5.0 modules at load. And a raise of a tool nobody registered may or may not
+reach a `tool.call` hook that matches it; the memory plugin leaves the tool
+unregistered for now and registering it is the fallback if the raise comes back
+refused. If the noun turns out not to reach another plugin's `$` on your build,
+the `enabledPlugins` order documented above is measured and it works.
 
 ## Settings
 
@@ -456,7 +504,7 @@ above, which is measured and which works.
 | `COMPACT_HANDOFF_RESTORE_FILE_CHARS` | `20000` | The most of one restored file that comes back; the rest is clipped with a note saying how much. |
 | `COMPACT_HANDOFF_RESTORE_TOTAL_CHARS` | `100000` | The most all restored files may add together, and never more than the ceiling above leaves free after the handoff. |
 | `COMPACT_HANDOFF_MAX_USD_PER_SESSION` | `10` | Past this, compactions fall back to the engine and record `disposition: "overBudget"`. |
-| `COMPACT_HANDOFF_SEAM_TIMEOUT_MS` | `90000` | How long one `$.compactHandoff.beforeCompact` subscriber may run before the compaction goes on without it. Read only when something is subscribed. |
+| `COMPACT_HANDOFF_SEAM_TIMEOUT_MS` | `90000` | How long one raised seam tool may run before the compaction goes on without it. Read only when something is subscribed. |
 | `COMPACT_HANDOFF_SUBAGENTS` | off | Off, a subagent's compaction is passed through with a row saying so. On, it is answered like any other. |
 | `COMPACT_HANDOFF_DEV` | off | Registers the four measurement tools. |
 | `COMPACT_HANDOFF_REFRESH` | off | Keeps a fallback handoff on disk for sessions a fork cannot serve (headless). |

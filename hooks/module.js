@@ -656,57 +656,89 @@ export const register = (on) => {
     });
 
     // The noun another plugin reaches this one through. The fold runs once per
-    // load and before any hook of this plugin, `$` here is the empty table, and
-    // `built` is `$` as the steps beneath made it, which is where the version
-    // is read from.
+    // load and before any hook of this plugin, and `built` is `$` as the steps
+    // beneath made it. Nothing may be done with `built` but spread it: at
+    // `engine.create` the static scan refuses the value of `next(e)` passed to
+    // a function, and handing it to `pluginVersion` here is what refused 0.5.0
+    // at load ("the value of next(e) at engine.create is passed as an argument").
     on("engine.create", async (_$, e, next) => {
         const built = await next(e);
 
-        return { ...built, compactHandoff: { version: await pluginVersion(built), beforeCompact } };
+        return { ...built, compactHandoff: { beforeCompact, version } };
     });
 };
 
 /* ------------------------------------------------------------------ *
  * The seam: another plugin's work, run beside this plugin's fork.
+ *
+ * The seam carries strings and nothing else. Revision 1 took a callback, and a
+ * callback cannot cross a plugin boundary here at all: every plugin runs in its
+ * own environment and an interface call's arguments go through `cloneInto`,
+ * which throws `DataCloneError` on a function. So a subscriber names a TOOL it
+ * answers, and this plugin raises that tool through `$.tool.call`, which runs
+ * the subscriber's work in the subscriber's own environment.
  * ------------------------------------------------------------------ */
+
+/**
+ * The version `$.compactHandoff.version()` answers, and a constant because the
+ * `engine.create` fold may not pass `built` to a function and `$` there is the
+ * empty table, so nothing at the fold can read the manifest. `test/module.test.js`
+ * asserts it against `.claude-plugin/plugin.json` so the two cannot drift.
+ */
+export const PLUGIN_VERSION = "0.6.0";
 
 /** How long one subscriber may run before the compaction goes on without it. */
 const DEFAULT_SEAM_TIMEOUT_MS = 90_000;
 
-/** Every subscriber registered through `$.compactHandoff.beforeCompact`. */
-const subscribers = new Set();
+/**
+ * Every subscriber, keyed by the tool it answers: subscribing twice is once.
+ *
+ * Exported so a test can start from an empty seam. A subscription lives for the
+ * load and nothing in the runtime ever removes one.
+ */
+export const seamSubscribers = new Map();
 
 /**
- * Registers `fn` to be called with the `session.compact` input this plugin
- * received, beside its own fork. Returns the function that unregisters it.
+ * Registers the tool this plugin raises when a compaction is about to happen,
+ * beside its own fork. Resolves `{ subscribed: true, tool }`.
  *
- * This is the whole public API of `$.compactHandoff`, and it exists because a
- * plugin keyed after this one in `enabledPlugins` never sees `session.compact`
- * at all: this plugin answers that event without calling `next`.
+ * This is the whole public API of `$.compactHandoff` beside `version`, and it
+ * exists because a plugin keyed after this one in `enabledPlugins` never sees
+ * `session.compact` at all: this plugin answers that event without calling
+ * `next`. There is no unsubscribe, and a subscription lives for the load.
  */
-const beforeCompact = (fn, options = {}) => {
-    if (typeof fn !== "function") {
-        throw new TypeError("compactHandoff.beforeCompact takes a function");
+const beforeCompact = async (options) => {
+    const tool = typeof options?.tool === "string" ? options.tool.trim() : "";
+
+    if (tool === "") {
+        throw new TypeError("compactHandoff.beforeCompact takes { tool }, the full name of the tool to raise");
     }
 
-    const name = typeof options?.name === "string" && options.name.trim() !== "" ? options.name.trim() : "anonymous";
-    const entry = { fn, name };
+    if (seamSubscribers.has(tool)) {
+        return { subscribed: true, tool };
+    }
 
-    subscribers.add(entry);
+    const name = typeof options?.name === "string" && options.name.trim() !== "" ? options.name.trim() : tool;
 
-    return () => void subscribers.delete(entry);
+    seamSubscribers.set(tool, { tool, name });
+
+    return { subscribed: true, tool };
 };
 
+/** This plugin's version, for a subscriber that wants to know what it got. */
+const version = async () => PLUGIN_VERSION;
+
 /**
- * Every subscriber, started at once and waited for together.
+ * Every subscriber, raised at once and waited for together.
  *
  * Nothing a subscriber does can change what this plugin answers the compaction
- * with: a throw is a row field, a subscriber still running after the timeout is
- * left running and its result ignored. The compaction waits for the slower of
- * this and the fork, which is the price of both reading the same transcript.
+ * with: a throw and a deny are row fields, a subscriber still running after the
+ * timeout is left running and its result ignored. The compaction waits for the
+ * slower of this and the fork, which is the price of both reading the same
+ * transcript while its cache is warm.
  */
 const dispatchSeam = ($, e) => {
-    const waiting = [...subscribers];
+    const waiting = [...seamSubscribers.values()];
 
     if (waiting.length === 0) {
         return Promise.resolve({ subscribers: 0 });
@@ -714,8 +746,9 @@ const dispatchSeam = ($, e) => {
 
     const started = waiting.map((entry) => ({
         name: entry.name,
+        tool: entry.tool,
         startedAt: Date.now(),
-        work: settledCall(entry.fn, e),
+        work: settledCall($, entry.tool, e),
     }));
 
     // A host op failing while the seam is collected is a field on the row like
@@ -726,15 +759,38 @@ const dispatchSeam = ($, e) => {
     }));
 };
 
-/** The subscriber, called now, as a promise that resolves however it ends. */
-const settledCall = (fn, e) => {
+/**
+ * The subscriber's tool, raised now, as a promise that resolves however it ends.
+ *
+ * The raise carries three small values and no transcript. The subscriber reads
+ * the conversation the way this plugin does, with `$.model.fork` over the live
+ * session, which is the same pre-compaction transcript and the same warm cache;
+ * sending the messages through would clone a megabyte to say what a fork reads
+ * for nothing.
+ */
+const settledCall = ($, tool, e) => {
     const threw = (error) => ({ outcome: "threw", detail: String(error).slice(0, 300) });
 
     try {
-        return Promise.resolve(fn(e)).then(() => ({ outcome: "ok" }), threw);
+        return Promise.resolve(
+            $.tool.call({ tool, trigger: e.trigger, messageCount: e.messages.length }),
+        ).then(seamOutcome, threw);
     } catch (error) {
         return Promise.resolve(threw(error));
     }
+};
+
+/** What the raise resolved to, read as an outcome: an answer, or a refusal. */
+const seamOutcome = (answer) => {
+    if (answer !== null && typeof answer === "object" && typeof answer.deny === "string") {
+        return { outcome: "denied", detail: answer.deny.slice(0, 300) };
+    }
+
+    if (answer === null || typeof answer !== "object" || answer.result === undefined) {
+        return { outcome: "ok", detail: "the raise was answered with no result" };
+    }
+
+    return { outcome: "ok" };
 };
 
 const collectSeam = async ($, started) => {
@@ -747,7 +803,7 @@ const collectSeam = async ($, started) => {
                 $.clock.sleep(capMs).then(() => ({ outcome: "timedOut" })),
             ]);
 
-            return { name: entry.name, ...ended, elapsedMs: Date.now() - entry.startedAt };
+            return { name: entry.name, tool: entry.tool, ...ended, elapsedMs: Date.now() - entry.startedAt };
         }),
     );
 

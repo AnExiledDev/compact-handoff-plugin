@@ -481,14 +481,20 @@ own fork from its own `session.compact` hook and hands the compaction back to th
 engine, and with the memory plugin uninstalled the seam here has zero subscribers
 and costs nothing.
 
-Two things about it are still unmeasured on a live engine. The declarations say a
-noun added by one plugin's `engine.create` step is on every plugin's `$`, and the
-run that was meant to prove it never got that far, because the scan refused both
-0.5.0 modules at load. And a raise of a tool nobody registered may or may not
-reach a `tool.call` hook that matches it; the memory plugin leaves the tool
-unregistered for now and registering it is the fallback if the raise comes back
-refused. If the noun turns out not to reach another plugin's `$` on your build,
-the `enabledPlugins` order documented above is measured and it works.
+Both halves of that are measured on engine 2.1.273 (2026-09-16). The noun this
+plugin adds at `engine.create` does reach the memory plugin's `$`: its
+`session.start` subscribed through `$.compactHandoff.beforeCompact` in about
+2 ms and read `0.6.0` back from `version()`. And a raised tool has to be
+registered: raising `mcp__memory-handoff__before_compact` before the memory
+plugin registered it came back refused with `$.tool.call: no tool named
+"mcp__memory-handoff__before_compact" in this session`, and once registered the
+raise reached the hook and answered `ok` in 6030 ms, inside a compaction whose
+own fork took 19293 ms. Both forks read the same warm cache, 50630 of 50961
+input tokens on each row. The seam never shows up in the session transcript as
+a tool use, though the registered tool is listed to the model, and the memory
+plugin denies any call that does not carry the seam's own fields. Should the
+noun fail to reach another plugin's `$` on your build, the `enabledPlugins`
+order documented above is measured and it works.
 
 ## Settings
 

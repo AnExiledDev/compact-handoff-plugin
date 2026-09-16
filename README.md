@@ -172,6 +172,15 @@ rules and similar."*
 `percent` is computed to one decimal from `tokens / window`; the engine's own
 whole-number figure is the fallback when a reading carries no window.
 
+**It wrote nothing at all until 0.4.3.** The reading was taken off the
+`turn.complete` event's own `messages`, and that event carries no transcript:
+it is `answer`, `durationMs`, `aborted`, `turnId` and `reason`, whatever the
+declarations imply. So every turn on engine 2.1.273 threw a `TypeError`, the
+engine printed `turn.complete hook skipped: threw` and no row was ever
+appended. The transcript comes from `$.session.messages()` now, which costs a
+host round trip per turn, and a turn whose transcript cannot be read still
+writes its row with `messages` and the handoff fields null.
+
 ### Reading one row
 
 A row says what the compaction did and, when it did not do it, why. The fields
@@ -516,6 +525,16 @@ so the ambient config dir authenticates the call with nothing copied at all.
   rendered *"2 tool calls: 0 file writes, 0 shell commands"* over two real Bash
   calls. The ledger reads `use.name ?? use.tool`, and the tests carry fixtures
   for both shapes.
+- **Every timing on a row written before 0.4.3 is `null`, and cannot be
+  recovered.** `$.clock.now()` is declared `() => number` and returns a
+  **Promise** at 2.1.273, so `now() - startedAt` was `NaN` and `JSON.stringify`
+  wrote it as `null`: `elapsedMs`, `restore.ms` and every `parts.*Ms`, on 71 of
+  the first 72 rows on the machine this was written on. The same arithmetic
+  drove three deadlines, so an abandoned pending handoff was never cleared, a
+  refresh was never due on elapsed time, and `waitForFile` never reached its
+  budget. Every duration is `Date.now()` since 0.4.3, which is right whichever
+  the engine returns, and a stamp stored by an older version is read as no
+  reading rather than compared against.
 
 ## The bench
 

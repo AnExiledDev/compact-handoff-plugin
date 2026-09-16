@@ -158,7 +158,9 @@ export const passThrough = () => {
     };
 
     next.calls = [];
-    next.signal = undefined;
+    // The engine hands `next` an AbortSignal, and the compaction reads it to
+    // decide whether its answer can still be applied.
+    next.signal = { aborted: false };
 
     return next;
 };
@@ -229,6 +231,13 @@ export const fakeApi = (overrides = {}) => {
 
                 return answerCall(input);
             },
+        },
+        // A fork that answers nothing is the default, because most tests want
+        // the fallback path; a test steering one passes `overrides.model`.
+        model: {
+            fork: async () => null,
+            complete: async () => null,
+            ...overrides.model,
         },
         ui: { toast: (text, options) => void toasts.push({ text, options }), log: () => {} },
         clock: { now: () => Promise.resolve(Date.now()), sleep: async () => {}, ...overrides.clock },

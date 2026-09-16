@@ -10,6 +10,7 @@ import {
     costOfNothing,
     estimatedUsage,
     fallbackReasonFor,
+    forkInputOf,
     handoffCeiling,
     isPinnable,
     ledgerRows,
@@ -1011,5 +1012,37 @@ describe("the commitments reply against its output cap", () => {
         const out = commitmentsOutcome("", 8192);
 
         assert.deepEqual(out, { rows: 0, hitCap: false, hitCapReason: null });
+    });
+});
+
+describe("what a fork was charged to read, against the session it forked from", () => {
+    // Both rows are real, off `usage` and `forkContext.context` in
+    // `~/.claude/compact-handoff/index.jsonl`: the cold one 2026-09-16T17:35Z,
+    // the warm one 2026-09-16T18:30Z. Across the 24 rows carrying both
+    // readings the split is clean: every cold fork is at or below 0.47 of its
+    // context and every warm one at or above 1.01, with nothing between.
+    const cold = { input_tokens: 46_387, output_tokens: 9909, cache_read_input_tokens: 18_705, cache_creation_input_tokens: 0 };
+    const warm = { input_tokens: 2291, output_tokens: 1894, cache_read_input_tokens: 56_851, cache_creation_input_tokens: 0 };
+
+    it("reads a cold fork as short of the context it should have carried", () => {
+        const input = forkInputOf(cold, { tokens: 164_273, window: 200_000 });
+
+        assert.equal(input.sent, 65_092);
+        assert.equal(input.cacheRead, 18_705);
+        assert.equal(input.contextTokens, 164_273);
+        assert.equal(input.matchesContext, false);
+    });
+
+    it("reads a warm fork as carrying it", () => {
+        const input = forkInputOf(warm, { tokens: 56_850, window: 200_000 });
+
+        assert.equal(input.sent, 59_142);
+        assert.equal(input.matchesContext, true);
+    });
+
+    it("calls an unknown an unknown rather than a mismatch", () => {
+        assert.equal(forkInputOf(null, { tokens: 164_273 }).matchesContext, null);
+        assert.equal(forkInputOf(cold, null).matchesContext, null);
+        assert.equal(forkInputOf(cold, { tokens: 0 }).matchesContext, null);
     });
 });

@@ -543,3 +543,90 @@ describe("the module is spelled the way the engine's static scan demands", () =>
         assert.equal(/[\w.]+\(\s*built\s*[,)]/u.test(moduleSource), false);
     });
 });
+
+/**
+ * Issue #690: some forks come back having read a transcript that is not this
+ * conversation, and the reply reads like any other summary. The only thing on
+ * the row that can tell is what the fork was charged for.
+ */
+describe("a fork charged for a fraction of the session's context", () => {
+    const coldUsage = {
+        input_tokens: 46_387,
+        output_tokens: 9909,
+        cache_read_input_tokens: 18_705,
+        cache_creation_input_tokens: 0,
+    };
+
+    /** A live session holding 164k tokens, with a handoff already on disk. */
+    const forkingHost = (usage) =>
+        fakeApi({
+            env: { COMPACT_HANDOFF_LIVE: "1" },
+            files: { "/plugin/.runs/latest.md": "THE HANDOFF ON DISK" },
+            messages: [userTurn("go"), assistantTurn("done")],
+            model: { fork: async () => ({ text: "A SUMMARY OF SOME OTHER CONVERSATION", usage }) },
+            session: { usage: async () => ({ context: { tokens: 164_273, window: 200_000, percent: 82 } }) },
+        });
+
+    const compaction = () => ({
+        trigger: "auto",
+        agentId: null,
+        messages: [userTurn("go"), assistantTurn("done")],
+        instructions: "",
+    });
+
+    it("is recorded as a mismatch and falls back to the handoff on disk", async () => {
+        const runtime = await registered();
+        const host = forkingHost(coldUsage);
+
+        host.store.set("ready", { messages: 2, at: new Date().toISOString() });
+
+        const answer = await runtime.dispatch("session.compact", host.$, compaction(), passThrough());
+        const row = host.rowsIn("index.jsonl").at(-1);
+
+        assert.equal(row.forkOutcome, "mismatch");
+        assert.equal(row.forkInput.sent, 65_092);
+        assert.equal(row.forkInput.contextTokens, 164_273);
+        assert.equal(row.forkInput.matchesContext, false);
+        assert.equal(row.outcome, "handoff");
+        // The tokens were spent whether or not the answer was used.
+        assert.equal(row.usage.input_tokens, 46_387);
+
+        const replaced = JSON.stringify(answer.messages);
+
+        assert.ok(replaced.includes("THE HANDOFF ON DISK"), "the on-disk handoff replaced the conversation");
+        assert.ok(!replaced.includes("SOME OTHER CONVERSATION"), "the cold fork's answer is not handed up");
+    });
+
+    it("hands up a fork that did read this conversation, and says what it read", async () => {
+        const runtime = await registered();
+        const warm = {
+            input_tokens: 2291,
+            output_tokens: 1894,
+            cache_read_input_tokens: 165_000,
+            cache_creation_input_tokens: 0,
+        };
+        const host = forkingHost(warm);
+
+        const answer = await runtime.dispatch("session.compact", host.$, compaction(), passThrough());
+        const row = host.rowsIn("index.jsonl").at(-1);
+
+        assert.equal(row.forkOutcome, undefined);
+        assert.equal(row.outcome, "handoff");
+        assert.equal(row.forkInput.matchesContext, true);
+        assert.ok(JSON.stringify(answer.messages).includes("SOME OTHER CONVERSATION"));
+    });
+
+    it("carries the reading on a row that never forked at all", async () => {
+        const runtime = await registered();
+        const host = fakeApi();
+
+        await runtime.dispatch(
+            "session.compact",
+            host.$,
+            { trigger: "manual", agentId: "agent-1", messages: [userTurn("go")], instructions: "" },
+            passThrough(),
+        );
+
+        assert.equal(host.rowsIn("index.jsonl").at(-1).forkInput, null);
+    });
+});

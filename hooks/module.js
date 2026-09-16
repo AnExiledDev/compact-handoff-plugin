@@ -249,6 +249,7 @@ import {
     costOf,
     costOfNothing,
     estimatedUsage,
+    forkInputOf,
     handoffCeiling,
     fallbackReasonFor,
     isPinnable,
@@ -510,6 +511,11 @@ export const register = (on) => {
             trigger: e.trigger,
             agentId: e.agentId ?? null,
             messagesIn: e.messages.length,
+            // What the fork was charged to read, against what this session
+            // holds; null on every row that never reached a fork. Issue #690:
+            // a fork answering over a transcript that is not this conversation
+            // is invisible in every other field on the row.
+            forkInput: null,
             pinnable: e.messages.filter(isPinnable).length,
             pinnedSkipped: pinSkipCounts(e.messages),
             plugin: await pluginVersion($),
@@ -571,7 +577,9 @@ export const register = (on) => {
 
         record.seam = await seam;
         record.outcome = handoff.outcome;
-        record.usage = handoff.usage ?? null;
+        // A fork that ran and was refused still spent its tokens, so a usage
+        // already on the record outlives the fallback that replaced it.
+        record.usage = handoff.usage ?? record.usage ?? null;
         record.staleMessages = handoff.staleMessages ?? null;
         record.elapsedMs = Date.now() - startedAt;
         record.aborted = next.signal.aborted;
@@ -931,6 +939,11 @@ const capOf = (value, fallback) => {
  *
  * Null means no warm transcript (a cold session, or a headless one), which is
  * what the handoff on disk is kept for.
+ *
+ * A reply is not proof that the fork read this conversation. Some forks come
+ * back having been charged for a fraction of the session's context (#690), and
+ * the reply reads like any other summary, so `record.forkInput` is compared
+ * against the context and a short one is refused here rather than handed up.
  */
 const forkHandoff = async ($, e, record) => {
     const asked = typeof e.instructions === "string" && e.instructions.trim() !== ""
@@ -943,6 +956,23 @@ const forkHandoff = async ($, e, record) => {
 
     if (reply === null) {
         return { outcome: "cold", detail: "the fork found no warm main-thread transcript" };
+    }
+
+    record.forkInput = forkInputOf(reply.usage, record.forkContext?.context ?? null);
+
+    // A fork charged for a fraction of the context answered over a transcript
+    // that is not this conversation, and a summary of the wrong conversation is
+    // worse than the engine's own. The tokens are spent either way, so the row
+    // keeps the usage and is priced on it.
+    if (record.forkInput.matchesContext === false) {
+        record.usage = reply.usage;
+
+        return {
+            outcome: "mismatch",
+            detail:
+                `the fork was charged for ${record.forkInput.sent} input tokens against a ` +
+                `${record.forkInput.contextTokens} token context, so it did not read this conversation`,
+        };
     }
 
     const parsed = parseRestoreRequests(reply.text.trim());

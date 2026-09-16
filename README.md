@@ -192,6 +192,7 @@ that matter for that second case:
 | `fallbackReason` | every disposition but `replaced` | one line naming why, e.g. `noHandoff: no handoff has been written yet (fork cold: the fork found no warm main-thread transcript)` |
 | `cost` | always | `{forkUsd, commitmentsUsd, commitmentsBasis, totalUsd, cacheReadWaivedUsd, basis, forkUsage, model, priced, pricesTaken}`, or `null`. Since 0.4.1 cache reads are stored in `forkUsage.cacheRead` and priced into `cacheReadWaivedUsd` at list, and never added to `forkUsd` or `totalUsd`, because on a subscription they cost nothing; `basis` says so. Rows from 0.4.0 and earlier charged them. `commitmentsBasis` is `estimate: chars/4, no cache` since 0.4.0, `none` when no commitments pass ran, `measured` on rows from 0.3.0 and earlier |
 | `maxHandoff` | every `replaced` and `rehearsed` row | the handoff ceiling the size guard used and how it was arrived at: `{window, fraction, capTokens, chars, decider}`, where `decider` is `fraction`, `cap`, `default: window unknown` or `override`; an override past the safe cap adds `overSafeCapChars` and `overSafeCapTokens` saying by how much |
+| `forkInput` | every row, `null` on the rows that never forked | what the fork was charged to read against what the session holds: `{sent, cacheRead, contextTokens, matchesContext}`. `sent` is input plus cache read plus cache write, which is the whole conversation for a warm fork and a prefix for a cold one; `matchesContext` is false when `sent` falls more than a fifth short of `contextTokens`, and that is the reading that refuses the fork's answer (`forkOutcome: "mismatch"`). Added in 0.4.4 |
 | `forkContext` | every row that forked | what the session looked like the instant before `$.model.fork`: `{context, model, messages, msSinceLastFork, subagentRanThisTurn}`, where `context` is the whole `$.session.usage().context` object (`tokens`, `window`, `percent`) and `msSinceLastFork` is `null` on a session's first fork |
 | `parts` | every `replaced` and `rehearsed` row | per-part sizes and timings; for the commitments pass, `commitmentsVia`, `commitmentsModel`, `commitmentsPromptChars`, `commitmentsReplyChars`, `commitmentsTokensEstimated`, `commitmentsCostUsd`, `commitmentsCostBasis`, and since 0.4.0 `commitmentsRows` (how many rows came back) with `commitmentsHitCap` and `commitmentsHitCapReason` (`length` or `truncated row`) saying whether the reply stopped at the 8192-token output cap |
 | `costUnknownReason` | when `cost` is `null` | why it could not be priced. A run is never priced at 0 because its usage was missing |
@@ -389,6 +390,39 @@ The nine live checks below cost $2.32 of plugin spend across 37 compactions, on
 Haiku 4.5, which is the number to have in mind for everyday use. That total is
 the whole bench ledger, including the runs that failed and were fixed, not only
 the nine that pass.
+
+### A warm fork and a cold fork cost differently, and only one of them works
+
+`$.model.fork` is documented to run over this session's own cache-safe
+transcript snapshot, and when it does, the fork is **warm**: it is charged for
+the whole conversation at the cache-read rate, so `forkInput.sent` lands at or
+just above `forkInput.contextTokens` and almost all of it is `cacheRead`. That
+is the cheap case the cost table above was measured in.
+
+Some forks come back **cold** instead. The fork is charged for a prefix and for
+tens of thousands of *uncached* input tokens, and it answers over a transcript
+that is not this conversation. Across the 24 rows in one box's `index.jsonl`
+carrying both readings, the split is clean and there is nothing in between: the
+ten cold forks were charged for 0.40 to 0.47 of their session's context (65k to
+78k sent against 164k to 167k held), the fourteen warm ones for 1.01 to 1.04 of
+theirs. Cold forks cost **more** than warm ones, because a cache miss is charged
+at the full input rate: each of those ten paid for 40k to 52k *uncached* input
+tokens, against 15k to 20k of cache read.
+
+The reply reads like any other summary, so nothing but `forkInput` can tell.
+Since 0.4.4 a fork whose input is more than a fifth short of the context is
+refused: the row records `forkOutcome: "mismatch"` with the two numbers, the
+compaction falls back to the handoff on disk, and the tokens the fork already
+spent stay on the row and are priced, because they were spent either way.
+
+Every cold row measured so far was a `trigger: auto` compaction of a session
+holding 164k tokens or more, and all ten are paired with a second
+`session.compact` dispatch carrying an `agentId`, 0.07 to 0.17 seconds later,
+over a transcript one message shorter and with one more pinnable turn in it.
+None of the fourteen warm rows has such a partner.
+`SessionCompactInput.agentId` is declared as "the id of the loop compacting,
+for a subagent's **or a fork's** own transcript". `notes/design/compact-handoff-cold-forks.md` in the
+`claude-investigations` repo holds the measurement and what it could not show.
 
 ## What was verified live
 

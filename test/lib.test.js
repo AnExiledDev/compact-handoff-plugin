@@ -201,10 +201,11 @@ describe("replacementFor", () => {
         );
     });
 
-    it("hands the pinned turns back with their handle intact", () => {
+    it("hands the pinned turns back as words only, without the engine's handle", () => {
         const out = replacementFor([userTurn("first")], "H");
 
-        assert.equal(out[1].handle, "h-user");
+        assert.equal(out[1].handle, undefined);
+        assert.deepEqual(out[1], { role: "user", text: "first", toolUses: [] });
     });
 
     it("survives a conversation with nothing in it", () => {

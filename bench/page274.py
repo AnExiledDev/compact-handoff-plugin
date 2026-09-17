@@ -8,6 +8,7 @@ to read four compactions of the same conversation next to each other and decide.
 import html
 import json
 import os
+import re
 
 PANES = (
     (
@@ -55,6 +56,7 @@ tr.plugin td { background: #141a24; }
   margin: 1.2rem 0; color: #cfc8b4;
 }
 .note strong { color: #e8d9a8; }
+.grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1rem; align-items: start; }
 @media (max-width: 1500px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 800px)  { .grid { grid-template-columns: 1fr; } }
@@ -79,8 +81,53 @@ details pre {
   white-space: pre-wrap; word-break: break-word;
   font: 12.5px/1.55 ui-monospace, Menlo, Consolas, monospace; color: #c3c9d4;
 }
+
+.sects { margin: 0; padding: .6rem 1rem 1rem; list-style: none; }
+.sects li { margin: 0 0 .75rem; padding: 0; }
+.sects b { display: block; color: #fff; font-size: 13.5px; }
+.sects span { display: block; color: #98a0ae; font-size: 12.5px; line-height: 1.45; margin-top: .15rem; }
 footer { margin-top: 3rem; padding-top: 1.2rem; border-top: 1px solid #222733; color: #6f7787; font-size: 13px; }
 """
+
+
+SECTION_RE = re.compile(r"^\s*(?:(#{2,4})\s+(\S.*)|(\d{1,2})\.\s+([A-Z][^:]{3,90}):)\s*$")
+
+
+def sections(text, limit=150):
+    """Every heading in one arm's output, with the first line of prose under it.
+
+    Both arms number their sections and both also use markdown headings, so one
+    pattern reads either. The first non-blank line below a heading is the whole
+    point: a heading alone does not show which way a section faces.
+    """
+    lines = (text or "").splitlines()
+    found = []
+
+    for index, line in enumerate(lines):
+        match = SECTION_RE.match(line)
+
+        if not match:
+            continue
+
+        heading = (match.group(2) or f"{match.group(3)}. {match.group(4)}").strip()
+        first = next((l.strip() for l in lines[index + 1 : index + 8] if l.strip()), "")
+        found.append((heading, first[:limit] + ("..." if len(first) > limit else "")))
+
+    return found
+
+
+def section_list(title, why, text, mine=False):
+    rows = "\n".join(
+        f"<li><b>{esc(head)}</b><span>{esc(first)}</span></li>" for head, first in sections(text)
+    ) or "<li><b>nothing to show</b></li>"
+
+    return f"""<section class="pane{' mine' if mine else ''}">
+  <header>
+    <h3>{esc(title)}</h3>
+    <p class="why">{esc(why)}</p>
+  </header>
+  <ul class="sects">{rows}</ul>
+</section>"""
 
 
 def esc(text):
@@ -174,6 +221,20 @@ def render(row, out):
         )
     )
 
+    section_panes = [
+        section_list(
+            "Claude Code's new catch-up note",
+            "What the built-in version wrote, heading by heading.",
+            (arms.get("handoff274") or {}).get("text"),
+        ),
+        section_list(
+            "Our plugin",
+            "What ours wrote, heading by heading. The last four sections have no equivalent on the left.",
+            plug.get("handoffText"),
+            mine=True,
+        ),
+    ]
+
     doc = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -243,8 +304,8 @@ def render(row, out):
   <li>
     <strong>Column 3 is the interesting one.</strong> It reads like a handover note rather than a
     record of what happened: it ends with what was finished and what someone picking this up needs to
-    know. That is the same shape our plugin has been writing all along, so Claude Code has moved toward
-    what we were already doing.
+    know. That is the instinct our plugin was built on, reached separately - though ours goes further,
+    as the section-by-section comparison below shows.
   </li>
   <li>
     <strong>There is no reason to drop our plugin and go back to the built-in behaviour.</strong> The
@@ -253,6 +314,23 @@ def render(row, out):
     remember, which none of the built-in options can do.
   </li>
 </ol>
+
+<h2>Section by section: the new catch-up note, and ours</h2>
+<p>
+  Every heading each one wrote, with the first line underneath it. Sections 1 to 7 are near-identical.
+  What differs is the end.
+</p>
+<p>
+  Claude Code's new note renames its last two sections to <em>Work Completed</em> and
+  <em>Context for Continuing Work</em>: it stops describing what happened and starts telling whoever
+  picks this up what they need. Ours keeps the older <em>Current Work</em> and <em>Optional Next Step</em>
+  headings, then goes further - it appends a work ledger and three sections looked up from git and the
+  transcript as the summary is written, rather than remembered. Same instinct, reached separately,
+  carried a different distance.
+</p>
+<div class="grid two">
+{chr(10).join(section_panes)}
+</div>
 
 <h2>The four shortened versions, side by side</h2>
 <div class="grid">

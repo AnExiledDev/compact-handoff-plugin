@@ -56,6 +56,12 @@ const READY_KEY = "ready";
 /** When this session last forked for a handoff, wall clock ms, for the fork's context row. */
 const LAST_FORK_KEY = "lastForkAt";
 
+/** The agent type this plugin defines for the handoff writer, `<plugin>:<name>`. */
+const HANDOFF_AGENT = "compact-handoff:handoff";
+
+/** Whether the type took this session, so a spawn knows which one to name. */
+const HANDOFF_AGENT_KEY = "handoffAgent";
+
 /**
  * The A/B bench. A variant is a file rather than a tool argument so the
  * instruction never enters the transcript: every arm is then asked over a
@@ -367,8 +373,15 @@ export const register = (on) => {
             await registerBenchTools($);
         }
 
+        await registerHandoffAgent($);
+
         return next(e);
     });
+
+    // Nothing should delegate to this agent but this plugin. `agent.offer`
+    // hides it from the model's listing without hiding it from
+    // `$.agent.spawn`, which is what a runner-only type is for.
+    on("agent.offer", { agent: HANDOFF_AGENT }, () => ({ isOffered: false }));
 
 
     // The tool only arms it. `$.session.compact` refuses to run under a hook
@@ -693,7 +706,7 @@ export const register = (on) => {
  * empty table, so nothing at the fold can read the manifest. `test/module.test.js`
  * asserts it against `.claude-plugin/plugin.json` so the two cannot drift.
  */
-export const PLUGIN_VERSION = "0.7.0";
+export const PLUGIN_VERSION = "0.9.0";
 
 /** How long one subscriber may run before the compaction goes on without it. */
 const DEFAULT_SEAM_TIMEOUT_MS = 90_000;
@@ -1499,6 +1512,53 @@ const isRefreshDue = async ($, messages) => {
 const msSince = (at) => (typeof at === "number" && Number.isFinite(at) ? Date.now() - at : null);
 
 /**
+ * Defines the agent type that writes handoffs, once per session.
+ *
+ * Before 0.9.0 the writer was `general-purpose` carrying the whole of the
+ * instructions in its first turn. A type of its own is cheaper and tighter on
+ * every count that matters here:
+ *
+ *   - `omitClaudeMd` drops the person's CLAUDE.md, the project's and the rules
+ *     from its context. A handoff writer reads one transcript and writes one
+ *     file; none of that applies to it, and it was paid for on every refresh.
+ *   - `tools` is the four it actually uses. It cannot edit, run a command, or
+ *     reach the network, so the worst a confused one can do is write the wrong
+ *     notes to the file it was told to write.
+ *   - `background` says out loud what this plugin has always done, which is
+ *     spawn and not wait.
+ *
+ * It is best-effort, and the store is why: `$.agent.register` rejects until the
+ * session binds and can be denied by a hook, and a spawn naming a type that was
+ * never defined would lose the handoff outright. What the registration answered
+ * decides which of the two spawns runs.
+ */
+const registerHandoffAgent = async ($) => {
+    try {
+        const registered = await $.agent.register({
+            name: "handoff",
+            description:
+                "Writes the handoff a compacted session continues from, out of a transcript file. " +
+                "Spawned by the compact-handoff plugin; nothing else should delegate to it.",
+            prompt: HANDOFF_SYSTEM_PROMPT,
+            tools: ["Read", "Write", "Grep", "Glob"],
+            omitClaudeMd: true,
+            background: true,
+        });
+
+        await $.store.set(HANDOFF_AGENT_KEY, { registered: true, agent: registered.agent ?? HANDOFF_AGENT });
+    } catch (error) {
+        await $.store.set(HANDOFF_AGENT_KEY, { registered: false, detail: String(error).slice(0, 2000) });
+    }
+};
+
+/** The registered type when it took, and `general-purpose` when it did not. */
+const handoffAgentType = async ($) => {
+    const reading = await safely($, () => $.store.get(HANDOFF_AGENT_KEY));
+
+    return reading !== null && reading !== undefined && reading.registered === true ? HANDOFF_AGENT : null;
+};
+
+/**
  * Starts the subagent that writes the next handoff and deliberately does not
  * wait for it: `$.agent.spawn` resolves in about 400 ms with `{ model, agentId }`
  * and no text, and the subagent writes its file minutes later, long after this
@@ -1515,13 +1575,18 @@ const refreshHandoff = async ($, messages) => {
     const model = await $.env.get("COMPACT_HANDOFF_MODEL");
 
     try {
+        const agent = await handoffAgentType($);
+
+        // With the type registered its system prompt already carries the
+        // standing instructions, so the turn is the two paths and nothing else.
         const spawn = await $.agent.spawn({
-            prompt: handoffPrompt(transcript, file),
+            prompt: agent === null ? handoffPrompt(transcript, file) : handoffTurn(transcript, file),
             description: "Write the compaction handoff",
-            subagentType: "general-purpose",
+            subagentType: agent ?? "general-purpose",
             model: model === "" ? undefined : model,
         });
 
+        record.agent = agent ?? "general-purpose";
         record.outcome = spawn.deny === undefined ? "spawned" : "denied";
         record.detail = spawn.deny ?? "";
         record.model = spawn.model ?? null;
@@ -1537,9 +1602,17 @@ const refreshHandoff = async ($, messages) => {
     await appendRun($, record);
 };
 
-const handoffPrompt = (path, answer) => `A Claude Code session will soon run out of room and lose its transcript. Its whole conversation so far is in \`${path}\`, oldest first, one block per message.
+/**
+ * The standing half of the handoff instructions: everything true of every
+ * handoff, and nothing about which files this one reads and writes.
+ *
+ * It is the registered agent's system prompt, and it is also the head of the
+ * prompt the fallback spawn sends, so the two paths ask for the same thing and
+ * there is one copy of what a handoff is.
+ */
+const HANDOFF_SYSTEM_PROMPT = `You write the handoff a Claude Code session continues from when it runs out of room and loses its transcript. You are writing for the same agent, mid-task, who will wake up with your text and nothing else.
 
-Read it and write the handoff the session continues from. You are writing for the same agent, mid-task, who will wake up with your text and nothing else.
+Your turn names a transcript file and the file to answer in. The transcript is the whole conversation so far, oldest first, one block per message.
 
 Cover, in this order and only where the transcript has them:
 
@@ -1552,7 +1625,14 @@ Cover, in this order and only where the transcript has them:
 
 Write it as notes, dense and specific. Numbers, paths and names in full. No preamble, no sign-off, no summary of your own process.
 
-**Write the handoff to \`${answer}\`, in one write, and nothing else to that file.** Its last line must be exactly \`${SENTINEL}\`, which is how the session knows the text is finished; a file without it is ignored. Reply with just the word DONE.`;
+**Write the handoff in one write, and nothing else to that file.** Its last line must be exactly \`${SENTINEL}\`, which is how the session knows the text is finished; a file without it is ignored. Reply with just the word DONE.`;
+
+/** The half that changes: which transcript to read, and where the answer goes. */
+const handoffTurn = (path, answer) =>
+    `Transcript: \`${path}\`\nWrite the handoff to \`${answer}\`.`;
+
+/** The whole of it, for a spawn that has no system prompt of its own. */
+const handoffPrompt = (path, answer) => `${HANDOFF_SYSTEM_PROMPT}\n\n${handoffTurn(path, answer)}`;
 
 /** The transcript as the subagent reads it, clamped to something writable. */
 const renderTranscript = (messages) => {
@@ -1809,6 +1889,10 @@ const readRuns = async ($, e) => {
         spentUsd: Number((await spentThisSession($)).toFixed(4)),
         ceilingUsd: await budgetCeiling($),
         handoff: await handoffState($),
+        // Whether `$.agent.register` took this session. A false reading is not a
+        // failure: the spawn falls back to general-purpose with the standing
+        // instructions folded back into the turn.
+        agent: (await safely($, () => $.store.get(HANDOFF_AGENT_KEY))) ?? null,
         lookups: await lookupTotals($),
         restores: restoreTotals(rows),
         last: rows[rows.length - 1] ?? null,

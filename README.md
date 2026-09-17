@@ -368,7 +368,7 @@ declarations say every noun a plugin's step adds is on every plugin's `$`:
 ```js
 $.compactHandoff = {
     beforeCompact({ tool, name }),  // resolves { subscribed: true, tool }
-    version(),                      // resolves "0.8.0"
+    version(),                      // resolves "0.9.0"
 };
 ```
 
@@ -543,6 +543,53 @@ a tool use, though the registered tool is listed to the model, and the memory
 plugin denies any call that does not carry the seam's own fields. Should the
 noun fail to reach another plugin's `$` on your build, the `enabledPlugins`
 order documented above is measured and it works.
+
+## The handoff writer is a declared agent type
+
+Since 0.9.0 the fork that writes a handoff is an agent type this plugin declares
+rather than an anonymous `general-purpose` spawn carrying its instructions in the
+turn. `session.start` calls `$.agent.register` and the engine hands back
+`compact-handoff:handoff`, which `$.agent.spawn` then names.
+
+Three things move from the prompt into the spec, where the engine enforces them
+instead of the fork choosing to comply:
+
+- `tools: ["Read", "Write", "Grep", "Glob"]`. The writer reads one transcript and
+  writes one file. It could never edit, run a command or spawn anything, and now
+  it cannot be asked to.
+- `omitClaudeMd: true`. The writer needs the transcript, never the project's
+  instructions, and this repo's `CLAUDE.md` pulls in an `AGENTS.md` large enough
+  to matter against a cold fork's window (see check 2 above). Dropping it is the
+  single largest cut to what the fork is charged to read.
+- `background: true`. The handoff is written between turns; it was already
+  running out of band and the spec says so.
+
+The standing instructions live in the spec's `prompt`, so the turn the fork
+receives is two lines: the transcript path and where to write the answer.
+
+**A registration that does not take loses the agent type, never the handoff.**
+`session.start` records the outcome in the plugin's store, `handoff_status`
+reports it under `agent`, and a false reading routes the spawn back to
+`general-purpose` with the standing instructions folded into the turn exactly as
+before 0.9.0. Nothing about a refused registration is silent and nothing about it
+stops a compaction.
+
+The type is registered and then hidden: `on("agent.offer", { agent:
+"compact-handoff:handoff" }, () => ({ isOffered: false }))` keeps it out of the
+Agent tool's list, because a session that delegates its own work to the handoff
+writer gets a handoff, not the work. `$.agent.spawn` still reaches it by name.
+
+Both halves are verified live on engine 2.1.274 (2026-09-17), in a headless
+session with nothing but this plugin loaded. `handoff_status` answered
+`{"registered": true, "agent": "compact-handoff:handoff"}`, and asked to list
+every `subagent_type` the Agent tool offers, the same session named five and
+`compact-handoff:handoff` was not among them.
+
+What the test suite cannot reach: `claude plugin test` supplies no engine
+implementation for `agent.register` at all, so the engine's own schema never sees
+the spec there. `engine-test/agent.test.ts` covers the two shapes that are
+testable — the spec this plugin sends, and the fallback when the registration is
+refused — and the live check above covers the third.
 
 ## Settings
 

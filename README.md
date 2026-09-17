@@ -925,6 +925,32 @@ python3 bench/baseline.py table
   compaction instruction, lifted verbatim out of `pretty-v2.1.270.js`. The
   variant is read off disk inside the hook and never enters the transcript, so
   two arms differ only in what the fork was asked.
+- **`baseline.txt` is still current.** 2.1.274 ships three compaction prompts
+  where 2.1.270 shipped one, and the full-history prompt among them is
+  byte-identical to this file (`diff`, exit 0). The two that are new are
+  committed beside it: `recent274.txt` summarises only the tail because the
+  engine now keeps earlier messages intact, and `handoff274.txt` is written to
+  sit at the *start* of a continuing session. Neither replaces `baseline.txt` as
+  the arm to measure against, because neither is what a full compaction runs.
+- **`bench/compare274.py` puts all four side by side** — the three stock prompts
+  and the plugin — over one fixture in one session, and `bench/page274.py`
+  renders the row as a single self-contained HTML page:
+
+  ```
+  python3 bench/compare274.py setup <transcript.jsonl> --target 60000
+  python3 bench/compare274.py run
+  python3 bench/compare274.py page --out /tmp/compaction.html
+  ```
+
+  One caveat the page repeats, because it bounds what the run proves:
+  `$.model.fork` appends one user message to the *whole* session transcript and
+  offers no way to hand it only the tail, so the `recent274` arm reads the same
+  conversation the others do. It measures what that prompt's instructions
+  produce, not what the engine's kept-tail path produces.
+- **None of the three reaches a `session.compact` hook.** The 2.1.274
+  declarations hand the hook the whole transcript under `messages` and carry no
+  kept-tail field, so the engine's prompt split is internal to the path this
+  plugin replaces and changes nothing about what it does.
 - **`bench/summarise_runs.py` reads a week of real compactions** and asks a
   model nothing: cost distribution, which parts failed and why, how deep
   lineages went, what sessions re-ran after a compaction, and every feedback

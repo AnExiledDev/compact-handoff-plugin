@@ -12,21 +12,24 @@ import os
 PANES = (
     (
         "baseline",
-        "Stock, full history",
-        "Claude Code's own compaction prompt. Byte-identical in 2.1.270 and 2.1.274 — "
-        "this is the arm the bench has always measured against, and nothing about it changed.",
+        "1. What Claude Code has always done",
+        "When a chat gets too long, Claude Code rewrites the whole conversation into a summary and "
+        "throws the original away. This is that. It did NOT change in 2.1.274 - the wording is "
+        "identical to 2.1.270, character for character.",
     ),
     (
         "recent274",
-        "Stock, recent portion (new in 2.1.274)",
-        "Summarises only the tail, because the engine now keeps earlier messages intact rather than "
-        "replacing the whole conversation.",
+        "2. NEW: summarise only the last few messages",
+        "2.1.274 added this. Instead of rewriting everything, Claude Code can now keep the older "
+        "messages as they are and summarise only the recent ones. So this summary is meant to cover "
+        "just the tail end, not the whole chat.",
     ),
     (
         "handoff274",
-        "Stock, continuing session (new in 2.1.274)",
-        "A summary written to sit at the start of a continuing session, with newer messages arriving "
-        "after it. Its last two sections are Work Completed and Context for Continuing Work.",
+        "3. NEW: a catch-up note for carrying on",
+        "2.1.274 also added this. It writes a 'here is where we got to' note that goes at the top of "
+        "a continuing session, with new messages arriving underneath it. It ends with what was "
+        "finished and what to do next.",
     ),
 )
 
@@ -117,14 +120,14 @@ def pane(title, why, meta, text, mine=False):
 
 def summary_table(row):
     lines = [
-        "<table><thead><tr><th>Arm</th><th>What ran</th><th class='num'>Prompt</th>"
+        "<table><thead><tr><th>Which one</th><th>What it does</th><th class='num'>Prompt</th>"
         "<th class='num'>Output</th><th class='num'>Cost</th><th class='num'>Elapsed</th></tr></thead><tbody>"
     ]
 
-    for key, title, _ in PANES:
+    for number, (key, title, _) in enumerate(PANES, start=1):
         arm = (row.get("arms") or {}).get(key) or {}
         lines.append(
-            f"<tr><td>{esc(key)}</td><td>{esc(title)}</td>"
+            f"<tr><td>{number}</td><td>{esc(title.split('. ', 1)[-1])}</td>"
             f"<td class='num'>{num((row.get('promptChars') or {}).get(key))}</td>"
             f"<td class='num'>{num(arm.get('chars'))}</td>"
             f"<td class='num'>{esc(usd(arm.get('cost')))}</td>"
@@ -133,7 +136,7 @@ def summary_table(row):
 
     plug = row.get("plugin") or {}
     lines.append(
-        "<tr class='plugin'><td>compact-handoff</td><td>The plugin answering session.compact</td>"
+        "<tr class='plugin'><td>4</td><td>Our plugin, instead of any of the above</td>"
         "<td class='num'>-</td>"
         f"<td class='num'>{num(plug.get('handoffChars'))}</td>"
         f"<td class='num'>{esc(usd(plug.get('cost')))}</td>"
@@ -160,8 +163,9 @@ def render(row, out):
     panes.append(
         pane(
             "compact-handoff",
-            "What this plugin installs instead: the model's summary plus three parts it reads rather "
-            "than recalls, handed up as the replacement transcript.",
+            "4. Our plugin, which replaces all of the above. It writes a summary too, then adds three "
+            "sections it looks up from disk instead of trying to remember, and hands the whole thing "
+            "back as the new conversation.",
             f"{num(plug.get('handoffChars'))} chars "
             f"(summary {num(plug.get('summaryChars'))}) · {usd(plug.get('cost'))} · "
             f"{plug.get('disposition') or '-'}",
@@ -180,86 +184,94 @@ def render(row, out):
 </head>
 <body>
 
-<h1>Compaction, four ways</h1>
+<h1>Four ways to shorten a long chat</h1>
 <p class="sub">
   One conversation, one session, four compactions of it. Claude Code {esc(row.get('version') or '?')},
-  model {esc(row.get('model') or '?')}, fixture cut to ~{row.get('target', 0):,} tokens
+  model {esc(row.get('model') or '?')}, shortened from a real chat of about {row.get('target', 0):,} tokens
   ({num(row.get('fixtureBytes'))} bytes). Run {esc(row.get('at') or '')}.
 </p>
 
-<h2>What actually changed in 2.1.274</h2>
+<h2>What this page is</h2>
 <p>
-  The full-history compaction prompt is <strong>byte-identical</strong> to the 2.1.270 copy this bench
-  has always measured against. Nothing about it moved. What 2.1.274 added is two more prompts beside it:
-  one that summarises only the recent tail because earlier messages are now kept intact, and one written
-  to sit at the <em>start</em> of a continuing session with newer messages arriving after it.
-  Compaction stopped being one shot that replaces everything.
+  When a chat gets too long, it has to be shortened. Claude Code calls this compaction. Below is the
+  same conversation shortened four different ways, so you can read them next to each other and decide
+  which you like.
+</p>
+<h2>What changed in version 2.1.274</h2>
+<p>
+  The old way of shortening a chat <strong>did not change at all</strong>. We compared the exact wording
+  Claude Code uses, and it is identical to the previous version, character for character. So there is no
+  "new version" of the old behaviour to go back to.
+</p>
+<p>
+  What the new version added is <strong>two extra ways</strong> alongside it. One summarises only the
+  last few messages, because it can now keep the older ones as they are. The other writes a catch-up
+  note that sits at the top of a continuing session. Shortening a chat is no longer one single move that
+  wipes everything.
 </p>
 
 <div class="note">
-  <strong>Read the recent-portion arm as a prompt comparison, not as engine behaviour.</strong>
-  <code>$.model.fork</code> appends one user message to the whole session transcript and offers no way to
-  hand it only the tail, so that arm read the same conversation the others did. It shows what those
-  instructions produce over this material. It does not reproduce the engine's kept-tail path.
+  <strong>One thing to know about column 2 before you judge it.</strong>
+  We could not feed it only the last few messages - the tool we use to run these tests always hands over
+  the whole conversation. So column 2 read everything, the same as the others, while being told to cover
+  only the recent part. It shows how those instructions behave. It is not an exact copy of what Claude
+  Code itself would do.
 </div>
 
 <div class="note">
-  <strong>A plugin that answers <code>session.compact</code> never sees any of this.</strong>
-  The 2.1.274 declarations give the hook the whole transcript under <code>messages</code> and carry no
-  kept-tail field. The engine's three prompts are internal to the path a hook replaces, so
-  compact-handoff's behaviour is unchanged by the new ones.
+  <strong>None of this reaches our plugin.</strong>
+  When our plugin takes over the shortening, Claude Code hands it the entire conversation and nothing
+  else. The three ways above all live inside the part our plugin replaces, so the new version changes
+  nothing about how our plugin works.
 </div>
 
-<h2>The numbers</h2>
+<h2>Size, cost and time</h2>
 {summary_table(row)}
 
-<h2>What this run showed</h2>
+<h2>What we learned</h2>
 <p>
-  One run, one conversation. Half of any summary is chance, so read the shapes rather than the
-  character counts: a second run would move every number here and would not move the three findings.
+  This is one test on one conversation. Summaries vary a lot run to run, so do not read much into the
+  exact sizes - run it again and every number moves. The three points below would not move.
 </p>
 <ol>
   <li>
-    <strong>The recent-portion arm summarised almost nothing.</strong> It was told the earlier messages
-    are retained, so it wrote up only the last two turns of the fixture — the bench's own
-    "reply with the word ready" and "use the ab_fork tool" — and dropped the whole conversation that
-    came before them. That is the prompt working as designed, and it is the proof that this prompt is
-    not a compaction on its own. It is the tail half of a two-part scheme whose other half is the
-    messages the engine keeps intact.
+    <strong>Column 2 barely summarised anything.</strong> It was told the older messages are being kept,
+    so it wrote up only the last two messages and skipped everything before them. That is it doing
+    exactly what it was asked. It also shows this way of shortening does not work on its own - it is
+    only half the job, and the other half is the older messages Claude Code keeps untouched.
   </li>
   <li>
-    <strong>The continuing-session arm is the interesting one.</strong> It reads as a handoff rather
-    than a record: its last two sections are Work Completed and Context for Continuing Work, where the
-    full-history prompt ends on Current Work and Optional Next Step. That is the same shape this plugin
-    has been writing since before 2.1.274 — the engine has moved toward the plugin's idea, not away
-    from it.
+    <strong>Column 3 is the interesting one.</strong> It reads like a handover note rather than a
+    record of what happened: it ends with what was finished and what someone picking this up needs to
+    know. That is the same shape our plugin has been writing all along, so Claude Code has moved toward
+    what we were already doing.
   </li>
   <li>
-    <strong>Nothing here is a reason to go back to stock.</strong> The full-history prompt did not
-    change, so "the new baseline" is only new in the sense that two prompts joined it, and neither
-    replaces what a <code>session.compact</code> hook does. The plugin's own output still carries the
-    three parts it reads rather than recalls, which no stock prompt can produce at any price.
+    <strong>There is no reason to drop our plugin and go back to the built-in behaviour.</strong> The
+    old way did not change, so there is no improvement to switch back to, and neither new way does what
+    our plugin does. Our plugin still adds three sections it looks up from disk rather than trying to
+    remember, which none of the built-in options can do.
   </li>
 </ol>
 
-<h2>The four compactions</h2>
+<h2>The four shortened versions, side by side</h2>
 <div class="grid">
 {chr(10).join(panes)}
 </div>
 
-<h2>The plugin's model summary on its own</h2>
+<h2>Our plugin's summary on its own</h2>
 <p>
-  The pane above is the assembled four-part handoff. This is just the part the model wrote, which is
-  what the three stock arms are actually comparable to.
+  Column 4 above is the finished thing: a summary plus three looked-up sections. Below is just the
+  summary part, which is the fair like-for-like against the three built-in versions.
 </p>
 <details open>
-  <summary>compact-handoff summary ({num(plug.get('summaryChars'))} chars)</summary>
+  <summary>Our plugin's summary ({num(plug.get('summaryChars'))} chars)</summary>
   <pre>{esc(plug.get('summaryText') or 'nothing recorded')}</pre>
 </details>
 
-<h2>The row</h2>
+<h2>Raw data</h2>
 <details>
-  <summary>compare274.jsonl, this run, with the arm texts stripped</summary>
+  <summary>The recorded results for this run, with the long texts removed</summary>
   <pre>{esc(json.dumps(stripped(row), indent=2))}</pre>
 </details>
 

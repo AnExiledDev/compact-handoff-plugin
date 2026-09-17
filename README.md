@@ -368,7 +368,7 @@ declarations say every noun a plugin's step adds is on every plugin's `$`:
 ```js
 $.compactHandoff = {
     beforeCompact({ tool, name }),  // resolves { subscribed: true, tool }
-    version(),                      // resolves "0.6.0"
+    version(),                      // resolves "0.8.0"
 };
 ```
 
@@ -447,6 +447,37 @@ hooks module before it loads it and refuses `$.compactHandoff?.beforeCompact`,
 `const seam = $.compactHandoff`, and anything else that reads a noun of `$`
 rather than calling an event on it. Both of those spellings are why there is no
 `typeof` check here: the try/catch is the check.
+
+### The seam is typed, not just described
+
+Since 0.8.0 the manifest names a type contract, `types/compact-handoff.d.ts`,
+and it is the same two signatures the snippet above shows, written where a
+compiler can read them:
+
+```json
+"types": "./types/compact-handoff.d.ts"
+```
+
+Run `/plugin-types` in the subscriber's own checkout. It copies this file
+verbatim to `.claude/types/claude-code-plugins/compact-handoff.d.ts` under a
+banner naming this plugin, its version and its tier, and references it from
+`.claude/types/claude-code-plugins.d.ts` beside it. Point the subscriber's
+`tsconfig.json` or `jsconfig.json` at that folder:
+
+```json
+"include": [".claude/types", "hooks"]
+```
+
+and `$.compactHandoff.beforeCompact({ tool })` is typed in the subscriber with
+nothing copied and nothing to keep in step by hand. A contract that could not
+be read, or did not itself typecheck, is listed at the end of the index with
+the reason rather than silently skipped, and `claude plugin validate` checks it
+before any of that: it answers `types ./types/compact-handoff.d.ts declares on
+$: $.compactHandoff`.
+
+The generated folder is not committed here. It is a per-project index of
+whatever plugins that project has enabled, so it belongs in `.gitignore`, which
+is where this repo puts it.
 
 `name` is what the row calls the subscriber and it defaults to the tool name.
 Name it anyway. Subscribing twice for one tool is subscribing once, so a plugin
@@ -761,6 +792,40 @@ so the ambient config dir authenticates the call with nothing copied at all.
   budget. Every duration is `Date.now()` since 0.4.3, which is right whichever
   the engine returns, and a stamp stored by an older version is read as no
   reading rather than compared against.
+
+## Tests
+
+Two suites, two runners, and both have to pass:
+
+```
+bun test                # the module's own functions, against a stub $
+claude plugin test .    # the plugin loaded into a real engine
+```
+
+`bunfig.toml` pins `[test] root = "test"`, and that is load-bearing rather than
+tidy. Bun's positional argument is a substring filter and not a directory, so
+`bun test test/` still matches `engine-test/`, and the run fails with `Cannot
+find module 'claude-code/testing'` on a suite that was never meant for it.
+
+`claude plugin test` runs every `*.test.ts` under the plugin root, each file in
+a child of the binary, in an environment like the one the hooks run in. That
+buys the one thing a stub `$` cannot: the seam resolved through a live engine,
+with this plugin's `engine.create` fold actually folded and a subscriber
+actually beneath it. `engine-test/seam.test.ts` is that test, and breaking the
+fold (dropping `version` from the noun) turns all three red with
+`$.compactHandoff.version is not a function`.
+
+Two shapes in there are forced by the engine rather than chosen:
+
+- **The subscriber is an inline plugin (`{ plugins: [probe] }`), not a hook
+  registered in the test body.** The static scan reads `$.<noun>.<event>` off a
+  hooks module's `register`; a hook closed over by a test body is never scanned,
+  and every call it makes on another plugin's noun is refused at the call site
+  with `its hooks module does not call it`.
+- **That `register` closes over nothing,** not even a `const` at the top of the
+  file. It is loaded the way a module is, and a name from the test file's scope
+  fails with `PROBE_TOOL is not defined`. What the probe learns comes back out
+  through the tool result.
 
 ## The bench
 

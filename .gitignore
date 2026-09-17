@@ -1,4 +1,5 @@
 .claude/types/
 .runs/
 __pycache__/
+evals/results/
 node_modules/

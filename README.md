@@ -874,6 +874,38 @@ Two shapes in there are forced by the engine rather than chosen:
   fails with `PROBE_TOOL is not defined`. What the probe learns comes back out
   through the tool result.
 
+## The eval suite
+
+`evals/` is a third runner, and unlike the two above it costs money and answers
+a different question: not whether the code is right, but whether an agent that
+has this plugin loaded actually reaches for it.
+
+```
+claude plugin eval . --ablation with-without --no-publish \
+  --allow-tools 'mcp__compact-handoff__*'
+```
+
+Three cases, two runs each, both arms: about **$0.55** a suite on 2.1.274, and
+no LLM graders at all, which is why it is that cheap. Every grader is `regex` or
+`tool_used`, so the whole score is free and the only spend is the agent runs
+themselves. The headline number is Δ, the with-plugin score minus the
+no-plugin baseline.
+
+- `01-handoff-status` asks what would happen if the conversation compacted right
+  now. Δ +0.50: the baseline can still say the word "compaction", it just cannot
+  answer.
+- `02-search-history` asks it to search everything stored from before a
+  compaction. Δ +0.75, and the second grader is the interesting one — it fails a
+  run that *invents* an answer instead of saying nothing was stored, which the
+  baseline did once in two runs.
+- `03-neg-plain-question` asks for a haiku. Δ 0.00 on purpose: it is the guard
+  that having these tools loaded does not make an agent call them at a prompt
+  that has nothing to do with them.
+
+A negative case is not padding. A plugin that fires on everything is a
+regression this suite is meant to go red on, and `tool_used` with `min: 0`,
+`max: 0` and `arm: both` is the shape that catches it.
+
 ## The bench
 
 `bench/` is how every number here was measured.

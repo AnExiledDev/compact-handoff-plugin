@@ -693,7 +693,7 @@ export const register = (on) => {
  * empty table, so nothing at the fold can read the manifest. `test/module.test.js`
  * asserts it against `.claude-plugin/plugin.json` so the two cannot drift.
  */
-export const PLUGIN_VERSION = "0.6.0";
+export const PLUGIN_VERSION = "0.7.0";
 
 /** How long one subscriber may run before the compaction goes on without it. */
 const DEFAULT_SEAM_TIMEOUT_MS = 90_000;

@@ -51,9 +51,20 @@ Six parts. Only the first is a model summarising a conversation.
    is easy to find, but what matters is that nothing after it ever checked X,
    and no pattern sees that. Two rounds of prompt wording could not move that
    class of fact; one model call moved it from 35.7% to 73.8%.
-5. **Every user turn, verbatim**, pinned by the engine's own `handle` rather
-   than re-typed, so the words survive word for word instead of being rebuilt
-   from a paraphrase.
+5. **Every user turn, verbatim**, selected by the engine's own `handle` and
+   handed back as its words alone, so nothing is rebuilt from a paraphrase.
+   Until 0.7.0 the turn went back *with* its handle, which hands the engine's
+   own copy up whole, and that copy carries every attachment the turn arrived
+   with: the instruction bundle (CLAUDE.md, every rule file, AGENTS.md,
+   MEMORY.md), the hook outputs, the skill and agent listings. Measured on
+   2026-09-17 (session 7c6495a3, depth 8): a 22.7k-character handoff came back
+   as a 124k-token first turn, and 218k characters of it were four copies of
+   the instruction bundle riding on 19 pinned turns, one of them a 44k-character
+   AGENTS.md. The engine re-emits that bundle on its own after a compaction, so
+   every copy said the same thing twice. A turn without its handle is the
+   person's words and nothing else; the `hook_additional_context` lines those
+   turns carried (the intent ledger's `op:` ids here) go with the attachments.
+   `withHandles` on the row reads 0 from 0.7.0 on.
 6. **The files the next window should have open**, chosen by the summariser
    (0.3.0). Claude Code's own compaction re-attaches up to five of the most
    recently read files, and that path never runs when a hook answers the

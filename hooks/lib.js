@@ -148,18 +148,28 @@ export const pinSkipCounts = (messages) => {
 };
 
 /**
- * The conversation the session carries on with: the handoff first, then every
- * user turn that still has the engine's handle.
+ * The conversation the session carries on with: the handoff first, then the
+ * words of every user turn the engine would vouch for, without the handle.
  *
- * The handle is the whole point. A message handed back with it is the engine's
- * own and stands whole; one without is rebuilt from `role`, `text` and its tool
- * blocks. So the user's words go back untouched and only the connective tissue
- * is something a model wrote.
+ * The handle selects the turn; it is not handed back. A message returned with
+ * it stands as the engine has it, and the engine's copy carries every
+ * attachment the turn arrived with: the instruction bundle (CLAUDE.md, every
+ * rule file, AGENTS.md, MEMORY.md), the hook outputs, the skill and agent
+ * listings. Measured on 2026-09-17 (session 7c6495a3, depth 8): a 22.7k-char
+ * handoff came back as a 124k-token first turn, of which 218k chars were four
+ * copies of the instruction bundle riding on 19 pinned turns. The engine
+ * re-emits that bundle on its own once a compaction has run
+ * (`InstructionsLoaded` has a `compact` load reason), so those copies said
+ * nothing twice. A turn rebuilt from `role` and `text` is the person's words
+ * and nothing else.
  */
 export const replacementFor = (messages, handoff) => [
     { role: "assistant", text: handoff, toolUses: [] },
-    ...messages.filter(isPinnable),
+    ...messages.filter(isPinnable).map(wordsOnly),
 ];
+
+/** A user turn as the person typed it: the engine's attachments stay behind. */
+const wordsOnly = (message) => ({ role: message.role, text: message.text, toolUses: message.toolUses ?? [] });
 
 /* ------------------------------------------------------------------ *
  * The size guard.

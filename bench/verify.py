@@ -33,10 +33,38 @@ import uuid
 import pexpect
 
 PLUGIN = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-WORKTREE = os.path.dirname(os.path.dirname(PLUGIN))
+
+
+def parent_checkout(start):
+    """The repository this plugin is developed inside: the nearest ancestor holding `plugins/` and a `.git`.
+
+    Two parents up from the plugin was the rule until 2026-09-17, and it only
+    held with the plugin at `<checkout>/plugins/compact-handoff`. From a worktree
+    of the plugin's own repo, nested at `plugins/compact-handoff/.claude/worktrees/<name>`,
+    it named `plugins/compact-handoff/.claude`: a directory with nothing in it,
+    whose CLAUDE.md lookup walked up to the checkout's `@AGENTS.md` import and
+    raised the external-imports dialog, and whose project directory nothing had
+    ever written a transcript into, so `--resume` found no conversation.
+    """
+    here = start
+
+    while not (os.path.isdir(os.path.join(here, "plugins")) and os.path.exists(os.path.join(here, ".git"))):
+        up = os.path.dirname(here)
+
+        if up == here:
+            sys.exit(f"no checkout with plugins/ and .git above {start}")
+
+        here = up
+
+    return here
+
+
+WORKTREE = parent_checkout(PLUGIN)
 # A session's transcript lives under its own config dir, so an isolated
-# CLAUDE_CONFIG_DIR cannot resume a fixture written into the ambient one.
-PROJECT_NAME = "-home-deploy-workspace-claude-investigations--claude-worktrees-compact-handoff-plugin"
+# CLAUDE_CONFIG_DIR cannot resume a fixture written into the ambient one. The
+# engine names the project directory after the cwd with every character that
+# is not a letter or digit turned into `-`, so `--resume` looks here and only here.
+PROJECT_NAME = re.sub(r"[^A-Za-z0-9]", "-", WORKTREE)
 
 SCRATCH = os.environ.get("COMPACT_HANDOFF_VERIFY_DIR") or os.path.join(
     os.environ.get("CLAUDE_JOB_DIR", "/tmp"), "tmp", "verify"
@@ -314,6 +342,7 @@ def spawn(session, log, env, model=None, fresh=False, ban=()):
         codec_errors="replace",
     )
     child.logfile_read = open(os.path.join(LOGS, log), "w", buffering=1)
+    accept_external_imports(child)
     accept_bypass(child)
 
     return child
@@ -383,6 +412,50 @@ def accept_bypass(child, attempts=4):
             return True
 
     raise RuntimeError("the bypass dialog would not clear; refusing to type into it")
+
+
+def accept_external_imports(child, attempts=4, wait=25):
+    """Clear the external-imports dialog when the engine raises it, and only then.
+
+    Engine 2.1.274 asks "Allow external CLAUDE.md file imports?" ahead of the
+    bypass warning whenever a CLAUDE.md above the cwd imports a file outside
+    it, and the three `hasClaudeMdExternalIncludes*` keys seeded for the cwd
+    did not suppress it (2026-09-17, both `auto` and `tools` sat on it until
+    their deadline). A cwd at the checkout root does not raise it, because
+    `@AGENTS.md` then resolves inside the cwd; this handler is for the cwd that
+    does. The bypass warning arriving first means there is no imports dialog,
+    so the wait ends there rather than costing every check 25 s.
+    """
+    end = time.time() + wait
+
+    while time.time() < end:
+        drawn = screen(child)
+
+        if "Allowexternal" in drawn:
+            break
+
+        if "Yes,Iaccept" in drawn:
+            return False
+
+        pump(child, 2)
+    else:
+        return False
+
+    for _ in range(attempts):
+        if "\u276fYes,allowexternalimports" not in screen(child):
+            child.send("\x1bOB")
+            pump(child, 2)
+
+        if "\u276fYes,allowexternalimports" not in screen(child):
+            continue
+
+        child.send("\r")
+        pump(child, 4)
+
+        if "Allowexternal" not in screen(child, tail=1500):
+            return True
+
+    raise RuntimeError("the external-imports dialog would not clear; refusing to type into it")
 
 
 def pump(child, seconds):

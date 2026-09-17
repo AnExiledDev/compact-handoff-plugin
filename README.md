@@ -64,7 +64,12 @@ Six parts. Only the first is a model summarising a conversation.
    every copy said the same thing twice. A turn without its handle is the
    person's words and nothing else; the `hook_additional_context` lines those
    turns carried (the intent ledger's `op:` ids here) go with the attachments.
-   `withHandles` on the row reads 0 from 0.7.0 on.
+   Measured live on 2026-09-17 (engine 2.1.274, the bench's `tools` check):
+   the transcript after the boundary held the handoff and two pinned turns of
+   2,155 and 577 bytes with nothing attached to them, the engine re-emitted
+   its instruction bundle once, and the first real turn cost 58k tokens
+   where 0.6.0 had cost 124k. (`withHandles` is a field of the forced-run
+   record `compact_force` writes to `runs.jsonl`, not of the index row.)
 6. **The files the next window should have open**, chosen by the summariser
    (0.3.0). Claude Code's own compaction re-attaches up to five of the most
    recently read files, and that path never runs when a hook answers the
@@ -788,7 +793,7 @@ python3 bench/baseline.py table
   stored rather than on what the terminal printed. A toast on screen is not
   evidence that anything was stored.
 
-Four things about driving a session unattended, each of which cost a run:
+Five things about driving a session unattended, each of which cost a run:
 
 - An unattended TUI stops on three dialogs in sequence, each silently eating
   every keystroke meant for the prompt. The auth chooser wants
@@ -803,7 +808,18 @@ Four things about driving a session unattended, each of which cost a run:
   `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1`.
 - A session's transcript lives under its own `CLAUDE_CONFIG_DIR`. With
   `CLAUDE_CONFIG_DIR=/x`, `--resume <id>` reads
-  `/x/projects/<encoded-cwd>/<id>.jsonl`, not `~/.claude/projects/`.
+  `/x/projects/<encoded-cwd>/<id>.jsonl`, not `~/.claude/projects/`. The
+  encoding turns every character that is not a letter or digit into `-`, and
+  the bench derives the directory from the cwd it spawns with rather than
+  naming it, because a name guessed for one checkout answered "No conversation
+  found" from a worktree of this repo (2026-09-17).
+- The cwd is the checkout the plugin sits inside, found by walking up to the
+  nearest directory with `plugins/` and a `.git`. Two parents up was wrong from
+  a worktree of this repo: it landed in `plugins/compact-handoff/.claude`,
+  whose CLAUDE.md lookup walked up to the checkout's `@AGENTS.md` and raised
+  engine 2.1.274's "Allow external CLAUDE.md file imports?" dialog, which the
+  `hasClaudeMdExternalIncludes*` keys seeded for that cwd did not suppress. The
+  bench answers that dialog too if it appears, before the bypass warning.
 - `/compact` leaves its own text in the input box, so the next thing typed
   compacts a second time *with instructions*. The first run of these checks
   recorded a row dispositioned `instructed` on the word `/quit`.

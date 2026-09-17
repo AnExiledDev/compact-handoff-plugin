@@ -788,7 +788,7 @@ python3 bench/baseline.py table
   stored rather than on what the terminal printed. A toast on screen is not
   evidence that anything was stored.
 
-Four things about driving a session unattended, each of which cost a run:
+Five things about driving a session unattended, each of which cost a run:
 
 - An unattended TUI stops on three dialogs in sequence, each silently eating
   every keystroke meant for the prompt. The auth chooser wants
@@ -803,7 +803,18 @@ Four things about driving a session unattended, each of which cost a run:
   `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1`.
 - A session's transcript lives under its own `CLAUDE_CONFIG_DIR`. With
   `CLAUDE_CONFIG_DIR=/x`, `--resume <id>` reads
-  `/x/projects/<encoded-cwd>/<id>.jsonl`, not `~/.claude/projects/`.
+  `/x/projects/<encoded-cwd>/<id>.jsonl`, not `~/.claude/projects/`. The
+  encoding turns every character that is not a letter or digit into `-`, and
+  the bench derives the directory from the cwd it spawns with rather than
+  naming it, because a name guessed for one checkout answered "No conversation
+  found" from a worktree of this repo (2026-09-17).
+- The cwd is the checkout the plugin sits inside, found by walking up to the
+  nearest directory with `plugins/` and a `.git`. Two parents up was wrong from
+  a worktree of this repo: it landed in `plugins/compact-handoff/.claude`,
+  whose CLAUDE.md lookup walked up to the checkout's `@AGENTS.md` and raised
+  engine 2.1.274's "Allow external CLAUDE.md file imports?" dialog, which the
+  `hasClaudeMdExternalIncludes*` keys seeded for that cwd did not suppress. The
+  bench answers that dialog too if it appears, before the bypass warning.
 - `/compact` leaves its own text in the input box, so the next thing typed
   compacts a second time *with instructions*. The first run of these checks
   recorded a row dispositioned `instructed` on the word `/quit`.

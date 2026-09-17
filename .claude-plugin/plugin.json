@@ -1,8 +1,9 @@
 {
   "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
   "name": "compact-handoff",
-  "version": "0.7.0",
+  "version": "0.9.0",
   "description": "Replaces the engine's compaction with a subagent's handoff, and measures whether it can be one",
+  "types": "./types/compact-handoff.d.ts",
   "author": {
     "name": "AnExiledDev",
     "email": "696222+AnExiledDev@users.noreply.github.com"

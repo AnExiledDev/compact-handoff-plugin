@@ -59,6 +59,12 @@ def spawn(session, log_path):
     env = dict(os.environ)
     env["DISABLE_AUTO_COMPACT"] = "1"
     env["CLAUDE_CODE_FORCE_SESSION_PERSISTENCE"] = "1"
+    # ab_fork is a bench tool and bench tools only register in dev mode. Without
+    # this the run looks healthy and every arm answers "no ab_fork tool exists in
+    # this session", one refusal per replicate, for the price of the forks it did
+    # not do (2026-09-18: $1.23 for eight of them).
+    env["COMPACT_HANDOFF_DEV"] = "1"
+    env["CLAUDE_CODE_ENABLE_FUNCTION_HOOKS"] = "1"
 
     child = pexpect.spawn(
         "claude",

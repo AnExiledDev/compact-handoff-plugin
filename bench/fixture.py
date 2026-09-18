@@ -20,9 +20,15 @@ import json
 import os
 import uuid
 
-WORKTREE = "/home/deploy/workspace/claude-investigations/.claude/worktrees/compact-handoff-plugin"
-PROJECT = "/home/deploy/.claude/projects/-home-deploy-workspace-claude-investigations--claude-worktrees-compact-handoff-plugin"
-BRANCH = "worktree-compact-handoff-plugin"
+# The worktree a fixture is re-homed into is the one this copy of the plugin sits
+# in, not a name typed once: bench worktrees come and go, and a resume whose cwd
+# no longer exists answers "No conversation found" from anywhere.
+WORKTREE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+PROJECT = os.path.join(
+    os.path.expanduser("~/.claude/projects"),
+    "".join(c if c.isalnum() else "-" for c in WORKTREE),
+)
+BRANCH = os.path.basename(WORKTREE)
 
 
 def context_of(record):

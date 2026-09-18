@@ -17,11 +17,14 @@ still be searched for afterwards.
 Six parts. Only the first is a model summarising a conversation.
 
 1. **The summary**, written by a fork of the session itself. The fork is asked
-   with Claude Code's own summariser instruction plus a Work ledger section
-   whose subsections must appear even when empty. The empty-subsection rule is
-   the whole trick: a model with nothing to write under *Rejected by the user*
-   has to decide that heading is empty rather than never think about rejections
-   at all. Rejected-approach carry went from 11.1% to 61.1% on that alone.
+   to enumerate before it narrates: a tagged one-line-per-fact inventory of the
+   whole conversation first, the prose reading second. That is the whole trick.
+   Prose makes the writer choose what is interesting, and the fact nobody finds
+   interesting is the one the next session needed. Through 0.4.x the fork was
+   asked with Claude Code's own nine-section summariser instruction plus a Work
+   ledger section; against the same 82-fact answer key, graded blind, the
+   inventory prompt carries 70.0% where that one carried 63.0%, and it is the
+   only arm whose worst run beat the old prompt's best.
    The fork is also asked to reason in `<analysis>` tags before it writes, and
    **since 0.4.2 that block is dropped before the handoff is assembled**. It is
    still asked for, because the arm that reasons first is the one the bench

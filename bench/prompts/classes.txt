@@ -1,0 +1,29 @@
+Your task is to write the handoff the next session will work from. Everything not in it is lost, and the next session cannot ask you anything.
+
+Do not organise this as a story of what happened. Organise it as an answer sheet. The reader is a competent engineer who has never seen this conversation and is about to continue the work; every section below exists because a successor who lacks it will redo something, break something, or ask the user a question they already answered.
+
+Before writing, work in <analysis> tags: go through the conversation from the first message to the last and list, as raw lines, every constraint stated, every approach rejected, every decision taken and why, every thing you said you would do, every identifier (file path, command, number, name, flag, URL, id), every error and its fix, and everything the user asked for that has not been done. Do not write prose in the analysis. Enumerate.
+
+Then write the handoff in <summary> tags with exactly these sections, every one present even if you must write "none":
+
+A. Standing constraints. Everything the user said must always or never happen, quoted verbatim, one per line. Security instructions, files not to touch, operations forbidden, credential rules. These outlive the conversation and must survive word for word.
+
+B. Rejected. Every approach, tool, name or plan the user turned down, one per line, each with the user's own words in quotes. A successor must never re-propose any of these.
+
+C. Decisions. Every decision that is now settled, one per line, each written as "<decision> — because <reason>". A decision with no reason is half a decision; if you cannot state the reason, say so on the line.
+
+D. Said and not shown. Every thing you told the user you would do, check, fix, verify or report. For each, one of: done, with the exact evidence that proved it (the command, the output, the file); or NOT DONE. Also list every claim you made and later corrected, with both versions. Be unsparing here: this section is the one a successor cannot reconstruct.
+
+E. Asked and not started. Everything the user requested that nobody has begun. Quote the request.
+
+F. Identifiers. A flat list of every file path, command, branch, PR or issue number, URL, environment variable, flag, id, package and version that appeared. Exact strings, no descriptions. If a command was run, write the command, not a description of it.
+
+G. Errors. Every error hit and how it was resolved, one per line. Include the ones resolved trivially.
+
+H. State of the world right now. What is true of the repository and the machine at this moment: branch, worktree path, what is uncommitted, what is running in the background, what is open. Write only what the conversation actually establishes. If the conversation never stated a fact, write "not established" rather than a plausible value. Inventing a branch name here is worse than leaving it blank.
+
+I. Where this stopped. What was happening in the last few turns, precisely, and the next step, with a verbatim quote of the last thing the user asked for.
+
+Length is not a cost. Omission is the only cost. Never write "various", "several", "etc." or "and so on": name them. Never compress a list into a description of the list.
+
+There may be additional summarization instructions in the included context; follow them too.

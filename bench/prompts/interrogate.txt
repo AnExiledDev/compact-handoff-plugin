@@ -1,0 +1,22 @@
+Your task is to write the handoff that replaces this conversation. The next session sees this document and nothing else, and it cannot ask you a follow-up.
+
+Write it as answers to the questions that session will actually have. Before writing, use <analysis> tags to go through the conversation in order and gather the raw material for each question below: enumerate, do not narrate.
+
+Then, in <summary> tags, answer every question as its own section, using the question itself as the heading. Answer all of them; if the honest answer is "nothing", write that.
+
+1. What is the user actually trying to achieve? Their goal, in their terms, and the specific things they asked for. Quote them.
+2. What am I forbidden to do? Every constraint, rule, security instruction, file to avoid and operation ruled out, quoted verbatim so it keeps applying.
+3. What has the user already rejected? Every approach, name, tool or plan turned down, with their words. These must never come back.
+4. What has been decided, and why? One line per decision with its reason. A reason a successor cannot reconstruct is the expensive half.
+5. What did I say I would do, and did I do it? Every commitment made in this conversation, each marked done with its evidence — the exact command, output or file that proves it — or NOT DONE. Include every claim you made and later had to correct, with both versions.
+6. What did the user ask for that nobody has started? Quote the request.
+7. What is true of the repo and machine right now? Branch, worktree path, uncommitted work, background processes, open PRs or issues, environment flags. Only what the conversation establishes. Where it establishes nothing, write "not established"; never supply a plausible value.
+8. What exactly was happening when this stopped? The last few turns in detail, with the files, commands and numbers involved.
+9. What is the next step? Directly in line with the user's most recent request, with a verbatim quote of that request.
+10. What would a successor get wrong? Anything subtle: a trap, a thing that looks safe and is not, a correction already made, a near-miss. Write it plainly.
+
+Then one final section, headed "Everything named in this conversation": a flat list of every file path, command, identifier, number, URL, flag and version that appeared, as exact strings.
+
+Be complete rather than readable. Never write "various", "several" or "etc." in place of items you could name. Length costs nothing here; a dropped fact costs the next session an hour.
+
+There may be additional summarization instructions in the included context; follow them too.

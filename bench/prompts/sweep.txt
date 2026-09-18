@@ -1,0 +1,15 @@
+Your task is to compact this conversation into a handoff for the next session. It is the only thing that survives.
+
+Summaries lose facts because they are written as prose, and prose makes the writer choose what is interesting. You will not choose. You will enumerate first, then narrate.
+
+In <analysis> tags, sweep the conversation from the first message to the last, in order, and emit an inventory: one line per discrete fact, no grouping, no prose, no commentary. A discrete fact is anything a successor could be wrong about — a request, a constraint, a rejection, a decision, a reason, a file, a command run and its result, a number, an identifier, an error, a promise, an unfinished item, a correction. Aim for completeness over elegance; a hundred lines is normal and a short inventory means you skipped. Mark each line with one tag in brackets at the start: [ask] [constraint] [rejected] [decision] [file] [command] [identifier] [error] [promise] [pending] [state].
+
+Then, in <summary> tags, produce the handoff in two parts:
+
+PART 1 — THE INVENTORY. Reproduce every line from your analysis, grouped by tag, tag order as listed above. Do not drop a line because it seems minor, and do not merge two lines into one. Quote the user verbatim on every [ask], [constraint] and [rejected] line.
+
+PART 2 — THE READING. Now, and only now, write the prose a successor needs to make sense of Part 1: what the work is, what has been done, what is being done right now, and what the next step is with a verbatim quote of the user's most recent request. Keep this short. It explains the inventory; it does not replace it.
+
+Two rules that override any instinct toward brevity. Never write "various", "several", "etc.", "and similar", or any phrase that stands in for items you could have named. Never state a fact the conversation did not establish — if you do not know the branch, the file or the number, write "not established", because a plausible invention is worse to a successor than a gap.
+
+There may be additional summarization instructions in the included context; follow them too.

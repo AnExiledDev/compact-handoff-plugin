@@ -114,6 +114,29 @@ const MAX_TOOL_TEXT_CHARS = 600;
 
 /** What a fork is asked when the probe names nothing: the handoff itself. */
 /**
+ * The manifest's `userConfig`, as `register` was handed it. Every setting here
+ * was an environment variable first and both spellings still work, the
+ * manifest's winning: a config-menu row is the discoverable half, and the
+ * variable is what a cron line already exports around the session.
+ */
+let options = {};
+
+/**
+ * One `userConfig` value as a non-empty string, or `undefined` so that `??`
+ * falls through to the variable. Stringified, because every parser below takes
+ * the text `$.env.get` returns and a declared number or boolean has to read
+ * the same way to them. A number row left at `0` counts as unset, which is why
+ * each numeric default is `0` and the real default lives in the constant.
+ */
+const opt = (key) => {
+    const value = options[key];
+
+    if (value === undefined || value === null || value === "" || value === 0) return undefined;
+
+    return String(value).trim() || undefined;
+};
+
+/**
  * The compaction instruction, and the bench's winner over four rounds.
  *
  * Rounds 1 to 3 varied the wording of the engine's own summariser prompt, which
@@ -202,7 +225,9 @@ import {
     withoutScratchpad,
 } from "./lib.js";
 
-export const register = (on) => {
+export const register = (on, pluginOptions) => {
+    options = pluginOptions ?? {};
+
     on("session.start", async ($, e, next) => {
         await $.tool.register({
             name: "force_compact",
@@ -630,7 +655,7 @@ export const register = (on) => {
  * empty table, so nothing at the fold can read the manifest. `test/module.test.js`
  * asserts it against `.claude-plugin/plugin.json` so the two cannot drift.
  */
-export const PLUGIN_VERSION = "0.9.0";
+export const PLUGIN_VERSION = "0.10.0";
 
 /** How long one subscriber may run before the compaction goes on without it. */
 const DEFAULT_SEAM_TIMEOUT_MS = 90_000;
@@ -739,7 +764,7 @@ const seamOutcome = (answer) => {
 };
 
 const collectSeam = async ($, started) => {
-    const capMs = capOf(await $.env.get("COMPACT_HANDOFF_SEAM_TIMEOUT_MS"), DEFAULT_SEAM_TIMEOUT_MS);
+    const capMs = capOf(opt("seamTimeoutMs") ?? (await $.env.get("COMPACT_HANDOFF_SEAM_TIMEOUT_MS")), DEFAULT_SEAM_TIMEOUT_MS);
 
     const results = await Promise.all(
         started.map(async (entry) => {
@@ -775,9 +800,9 @@ const restoreFiles = async ($, e, requests, { depth, totalChars }) => {
     // Three literal reads rather than one helper: the static scan lists the
     // variables a module reads, and it can only do that off a literal name.
     const caps = {
-        maxFiles: capOf(await $.env.get("COMPACT_HANDOFF_RESTORE_FILES"), RESTORE_MAX_FILES),
-        fileChars: capOf(await $.env.get("COMPACT_HANDOFF_RESTORE_FILE_CHARS"), RESTORE_FILE_CHARS),
-        totalChars: Math.min(capOf(await $.env.get("COMPACT_HANDOFF_RESTORE_TOTAL_CHARS"), RESTORE_TOTAL_CHARS), totalChars),
+        maxFiles: capOf(opt("restoreFiles") ?? (await $.env.get("COMPACT_HANDOFF_RESTORE_FILES")), RESTORE_MAX_FILES),
+        fileChars: capOf(opt("restoreFileChars") ?? (await $.env.get("COMPACT_HANDOFF_RESTORE_FILE_CHARS")), RESTORE_FILE_CHARS),
+        totalChars: Math.min(capOf(opt("restoreTotalChars") ?? (await $.env.get("COMPACT_HANDOFF_RESTORE_TOTAL_CHARS")), RESTORE_TOTAL_CHARS), totalChars),
     };
     const chosen = chooseRestores({ requests, candidates: restoreCandidates(e.messages), maxFiles: caps.maxFiles });
     const read = [];
@@ -1394,7 +1419,7 @@ const maybeRefresh = async ($, forced) => {
     // The fork writes the handoff inside the event now, so the standing
     // subagent is only worth its money where a fork has no warm transcript to
     // read. Off unless asked for; `refresh_handoff` still runs one by hand.
-    if (!forced && !isOn(await $.env.get("COMPACT_HANDOFF_REFRESH"))) {
+    if (!forced && !isOn(opt("refresh") ?? (await $.env.get("COMPACT_HANDOFF_REFRESH")))) {
         return;
     }
 
@@ -1496,7 +1521,7 @@ const refreshHandoff = async ($, messages) => {
 
     await $.fs.write(transcript, renderTranscript(messages));
 
-    const model = await $.env.get("COMPACT_HANDOFF_MODEL");
+    const model = opt("model") ?? (await $.env.get("COMPACT_HANDOFF_MODEL"));
 
     try {
         const agent = await handoffAgentType($);
@@ -2082,7 +2107,7 @@ const parseRun = (line) => {
  * under the user's home unless `COMPACT_HANDOFF_DATA_DIR` says otherwise.
  */
 const dataDir = async ($) => {
-    const override = ((await $.env.get("COMPACT_HANDOFF_DATA_DIR")) ?? "").trim();
+    const override = (opt("dataDir") ?? (await $.env.get("COMPACT_HANDOFF_DATA_DIR")) ?? "").trim();
 
     if (override !== "") {
         return override.replace(/\/+$/u, "");
@@ -2220,7 +2245,7 @@ const runLines = async ($, sessionId) => {
 const DEFAULT_MAX_USD = 10;
 
 const budgetCeiling = async ($) => {
-    const raw = Number.parseFloat((await $.env.get("COMPACT_HANDOFF_MAX_USD_PER_SESSION")) ?? "");
+    const raw = Number.parseFloat(opt("maxUsdPerSession") ?? (await $.env.get("COMPACT_HANDOFF_MAX_USD_PER_SESSION")) ?? "");
 
     return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_MAX_USD;
 };
@@ -2264,9 +2289,9 @@ const priceRun = (record, { commitmentsUsd, commitmentsBasis }) => {
  * static scan reads them.
  */
 const handoffCeilingFor = async ($) => {
-    const override = Number.parseInt((await $.env.get("COMPACT_HANDOFF_MAX_CHARS")) ?? "", 10);
-    const fraction = Number.parseFloat((await $.env.get("COMPACT_HANDOFF_MAX_FRACTION")) ?? "");
-    const capTokens = Number.parseInt((await $.env.get("COMPACT_HANDOFF_MAX_TOKENS")) ?? "", 10);
+    const override = Number.parseInt(opt("maxChars") ?? (await $.env.get("COMPACT_HANDOFF_MAX_CHARS")) ?? "", 10);
+    const fraction = Number.parseFloat(opt("maxFraction") ?? (await $.env.get("COMPACT_HANDOFF_MAX_FRACTION")) ?? "");
+    const capTokens = Number.parseInt(opt("maxTokens") ?? (await $.env.get("COMPACT_HANDOFF_MAX_TOKENS")) ?? "", 10);
     const window = (await safely($, () => $.session.usage()))?.context?.window;
 
     return handoffCeiling({ window, override, fraction, capTokens });
@@ -2493,10 +2518,10 @@ const safely = async ($, read) => {
 };
 
 /** The bench tools, off unless this is the bench. */
-const isDev = async ($) => isOn(await $.env.get("COMPACT_HANDOFF_DEV"));
+const isDev = async ($) => isOn(opt("dev") ?? (await $.env.get("COMPACT_HANDOFF_DEV")));
 
 /** Whether a subagent's own compaction is handled here rather than passed through. */
-const handlesSubagents = async ($) => isOn(await $.env.get("COMPACT_HANDOFF_SUBAGENTS"));
+const handlesSubagents = async ($) => isOn(opt("subagents") ?? (await $.env.get("COMPACT_HANDOFF_SUBAGENTS")));
 
 /** The plugin's own version, off the manifest the runtime loaded it from. */
 const pluginVersion = async ($) => {
@@ -2507,12 +2532,12 @@ const pluginVersion = async ($) => {
     }
 };
 
-const isLive = async ($) => isOn(await $.env.get("COMPACT_HANDOFF_LIVE"));
+const isLive = async ($) => isOn(opt("live") ?? (await $.env.get("COMPACT_HANDOFF_LIVE")));
 
 const isOn = (value) => ["1", "true", "yes", "on"].includes((value ?? "").trim().toLowerCase());
 
 const refreshMs = async ($) => {
-    const raw = Number.parseInt((await $.env.get("COMPACT_HANDOFF_REFRESH_MS")) ?? "", 10);
+    const raw = Number.parseInt(opt("refreshMs") ?? (await $.env.get("COMPACT_HANDOFF_REFRESH_MS")) ?? "", 10);
 
     return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_REFRESH_MS;
 };

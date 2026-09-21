@@ -596,6 +596,14 @@ refused — and the live check above covers the third.
 
 ## Settings
 
+Every one of these is also a row in `/plugin`, under this plugin's
+configuration: `live`, `dataDir`, `model`, `maxChars`, `maxFraction`,
+`maxTokens`, `restoreFiles`, `restoreFileChars`, `restoreTotalChars`,
+`maxUsdPerSession`, `seamTimeoutMs`, `subagents`, `dev`, `refresh` and
+`refreshMs`. A row set there wins over the matching variable; left empty (or
+`0`, for a number), the variable is read as it always was, which is what a
+cron line or a one-off shell invocation already sets.
+
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `COMPACT_HANDOFF_LIVE` | off | Off, it rehearses and the engine still compacts. On, it answers the event and the engine's summariser never runs. |

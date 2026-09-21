@@ -1,11 +1,103 @@
 {
   "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
   "name": "compact-handoff",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "Replaces the engine's compaction with a subagent's handoff, and measures whether it can be one",
   "types": "./types/compact-handoff.d.ts",
   "author": {
     "name": "AnExiledDev",
     "email": "696222+AnExiledDev@users.noreply.github.com"
+  },
+  "userConfig": {
+    "live": {
+      "type": "boolean",
+      "title": "Live",
+      "description": "Off, it rehearses and the engine still compacts. On, it answers the event and the engine's summariser never runs.",
+      "default": false
+    },
+    "dataDir": {
+      "type": "string",
+      "title": "Data directory",
+      "description": "Where handoffs, rows and transcripts are kept. Empty uses ~/.claude/compact-handoff.",
+      "default": ""
+    },
+    "model": {
+      "type": "string",
+      "title": "Model",
+      "description": "The model the commitments pass runs on, an alias (haiku) or a full id. Empty uses the session's.",
+      "default": ""
+    },
+    "maxChars": {
+      "type": "number",
+      "title": "Absolute ceiling (characters)",
+      "description": "Overrides the two below. 0 leaves them in charge. Never clamped: setting it is a deliberate act.",
+      "default": 0
+    },
+    "maxFraction": {
+      "type": "string",
+      "title": "Context share",
+      "description": "The share of the context window a handoff may take. Empty uses 0.25; anything outside (0, 1] falls back to it.",
+      "default": ""
+    },
+    "maxTokens": {
+      "type": "number",
+      "title": "Token ceiling",
+      "description": "The most a handoff may be whatever the window. 0 uses 150000; clamped to 200000.",
+      "default": 0
+    },
+    "restoreFiles": {
+      "type": "number",
+      "title": "Restored files",
+      "description": "How many files the summariser may have restored after the handoff. 0 uses 5.",
+      "default": 0
+    },
+    "restoreFileChars": {
+      "type": "number",
+      "title": "Per-file ceiling",
+      "description": "The most of one restored file that comes back, in characters. 0 uses 20000.",
+      "default": 0
+    },
+    "restoreTotalChars": {
+      "type": "number",
+      "title": "Restored total ceiling",
+      "description": "The most all restored files may add together, in characters. 0 uses 100000.",
+      "default": 0
+    },
+    "maxUsdPerSession": {
+      "type": "string",
+      "title": "Session budget (USD)",
+      "description": "Past this, compactions fall back to the engine and record overBudget. Empty uses 10.",
+      "default": ""
+    },
+    "seamTimeoutMs": {
+      "type": "number",
+      "title": "Seam timeout (ms)",
+      "description": "How long one raised seam tool may run before the compaction goes on without it. 0 uses 90000.",
+      "default": 0
+    },
+    "subagents": {
+      "type": "boolean",
+      "title": "Answer subagent compactions",
+      "description": "Off, a subagent's compaction is passed through with a row saying so. On, it is answered like any other.",
+      "default": false
+    },
+    "dev": {
+      "type": "boolean",
+      "title": "Measurement tools",
+      "description": "Registers the four measurement tools.",
+      "default": false
+    },
+    "refresh": {
+      "type": "boolean",
+      "title": "Fallback handoff",
+      "description": "Keeps a fallback handoff on disk for sessions a fork cannot serve (headless).",
+      "default": false
+    },
+    "refreshMs": {
+      "type": "number",
+      "title": "Refresh gap (ms)",
+      "description": "Shortest gap between two refreshes, and never sooner than 20 new messages. 0 uses 600000.",
+      "default": 0
+    }
   }
 }

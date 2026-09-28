@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import {
+    abArmFor,
     applySizeGuard,
     assistantTurns,
     commitmentsFrom,
@@ -1425,5 +1426,55 @@ describe("what a fork was charged to read, against the session it forked from", 
         assert.equal(forkInputOf(null, { tokens: 164_273 }).matchesContext, null);
         assert.equal(forkInputOf(cold, null).matchesContext, null);
         assert.equal(forkInputOf(cold, { tokens: 0 }).matchesContext, null);
+    });
+});
+
+/**
+ * The A/B split is by session, not by compaction: a session that alternated
+ * would hand a handoff the engine's summary to build on, and the arm a
+ * compaction sat in would stop being the only thing that differed.
+ */
+describe("which arm of the A/B split a session is in", () => {
+    const ids = Array.from({ length: 2000 }, (_, i) => `session-${i}-${(i * 7919) % 1000}`);
+
+    it("is off when no share is set, or the share is not a fraction", () => {
+        for (const share of [undefined, null, "", "0", "abc", "-0.5", "1.5", "NaN"]) {
+            assert.equal(abArmFor("session-1", share), null, `share ${share}`);
+        }
+    });
+
+    it("keeps a session in one arm on every compaction", () => {
+        const first = abArmFor("5f1c2d9e-aaaa-bbbb-cccc-0123456789ab", "0.5");
+
+        for (let i = 0; i < 5; i += 1) {
+            assert.deepEqual(abArmFor("5f1c2d9e-aaaa-bbbb-cccc-0123456789ab", "0.5"), first);
+        }
+    });
+
+    it("leaves every session to the engine at a share of 1", () => {
+        assert.ok(ids.every((id) => abArmFor(id, "1").arm === "stock"));
+    });
+
+    it("leaves close to the share of sessions to the engine", () => {
+        const stock = ids.filter((id) => abArmFor(id, "0.3").arm === "stock").length / ids.length;
+
+        assert.ok(stock > 0.25 && stock < 0.35, `stock share ${stock}`);
+    });
+
+    // Raising the share moves sessions from handoff to stock and never back,
+    // so widening the experiment does not reshuffle the sessions already in it.
+    it("keeps a stock session stock when the share grows", () => {
+        const atLow = ids.filter((id) => abArmFor(id, "0.2").arm === "stock");
+
+        assert.ok(atLow.length > 0);
+        assert.ok(atLow.every((id) => abArmFor(id, "0.5").arm === "stock"));
+    });
+
+    it("says what it was decided on", () => {
+        const arm = abArmFor("session-1", "0.25");
+
+        assert.equal(arm.share, 0.25);
+        assert.ok(arm.bucket >= 0 && arm.bucket < 1);
+        assert.equal(arm.arm, arm.bucket < 0.25 ? "stock" : "handoff");
     });
 });

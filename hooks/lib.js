@@ -412,7 +412,7 @@ export const approxTokens = (text) => Math.ceil(text.length / 4);
  * which reports whole numbers; the engine's own figure is the fallback for a
  * reading that carries no window to divide by.
  */
-export const windowReading = ({ at, session, turn, context, messages, opener }) => {
+export const windowReading = ({ at, session, turn, context, messages, opener, arm = null }) => {
     const tokens = context?.tokens ?? null;
     const window = context?.window ?? null;
     const share = (of) => (of === null || window === null || window === 0 ? null : Math.round((of / window) * 1000) / 10);
@@ -426,6 +426,7 @@ export const windowReading = ({ at, session, turn, context, messages, opener }) 
         turn,
         first: turn === 1,
         phase: PHASE_OF[opener?.kind ?? "none"],
+        arm,
         compaction: opener?.n ?? 0,
         tokens,
         window,
@@ -1339,6 +1340,10 @@ export const fallbackReasonFor = (record, disposition) => {
         return "rehearsal: COMPACT_HANDOFF_LIVE is unset, so the engine's own compaction stands";
     }
 
+    if (disposition === "abStock") {
+        return "A/B: this session is in the stock arm (COMPACT_HANDOFF_AB_STOCK_SHARE), so the engine compacted it";
+    }
+
     if (disposition === "abortedFallback") {
         return "aborted: the engine gave up on the dispatch before the handoff was ready";
     }
@@ -1484,11 +1489,12 @@ export const workDone = (messages) => {
  * the new conversation starts in a transcript that also holds every window
  * before it.
  */
-export const monitorSeed = ({ session, n, at, kind, ordinal, from, messages }) => ({
+export const monitorSeed = ({ session, n, at, kind, arm = null, ordinal, from, messages }) => ({
     session,
     n,
     at,
     kind,
+    arm,
     ordinal,
     from,
     ...workDone(messages),
@@ -1500,6 +1506,62 @@ const isPersonTurn = (message) =>
     (message.toolResults ?? []).length === 0 &&
     (message.text ?? "").trim() !== "" &&
     originOf(message) === "person";
+
+/**
+ * The engine's own summary in the conversation its compaction returned: the
+ * continuation turn that opens it, or null when it carries none.
+ */
+export const stockSummaryOf = (messages) => {
+    const opener = (Array.isArray(messages) ? messages : []).find(
+        (message) => message.role === "user" && (message.toolResults ?? []).length === 0 && originOf(message) === "continuation",
+    );
+
+    return opener === undefined ? null : (opener.text ?? "");
+};
+
+/**
+ * Which arm of the live A/B split a session is in, or null when the split is
+ * off: no share set, or one outside (0, 1].
+ *
+ * Assigned per session, never per compaction. A session that alternated would
+ * hand its next handoff the engine's summary to build on (or the reverse), so
+ * the arm would stop being the only thing that differed. The bucket is a hash
+ * of the session id rather than a coin kept on disk: it survives a reload and
+ * a restart with nothing stored, and a session below a share is below every
+ * larger one, so widening the split never moves a session back to the handoff.
+ */
+/**
+ * @param {string | null | undefined} sessionId
+ * @param {string | number | null | undefined} share
+ * @returns {{ arm: "handoff" | "stock", share: number, bucket: number } | null}
+ */
+export const abArmFor = (sessionId, share) => {
+    const fraction = Number.parseFloat(String(share ?? ""));
+
+    if (!Number.isFinite(fraction) || fraction <= 0 || fraction > 1) {
+        return null;
+    }
+
+    const bucket = fnv1a(String(sessionId ?? "")) / 2 ** 32;
+
+    return { arm: bucket < fraction ? "stock" : "handoff", share: fraction, bucket: Math.round(bucket * 1e6) / 1e6 };
+};
+
+/**
+ * 32-bit FNV-1a: spreads UUIDs evenly, and needs nothing the runtime might lack.
+ *
+ * @param {string} text
+ */
+const fnv1a = (text) => {
+    let hash = 0x811c9dc5;
+
+    for (let i = 0; i < text.length; i += 1) {
+        hash ^= text.charCodeAt(i);
+        hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+
+    return hash;
+};
 
 /** The opener this monitor was armed for, or null when the transcript does not hold it. */
 const openerWatched = (monitor, openers) => {
@@ -1560,6 +1622,7 @@ export const observePost = (monitor, messages) => {
         n: monitor.n,
         at: monitor.at,
         kind: monitor.kind ?? "handoff",
+        arm: monitor.arm ?? null,
         anchored,
         turnsObserved: turns,
         firstUserMessage,

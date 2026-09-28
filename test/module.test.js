@@ -1568,3 +1568,174 @@ describe("a handoff that asks to be corrected", () => {
         }
     });
 });
+
+/**
+ * The live A/B split: a share of sessions left to the engine's own compaction,
+ * logged the same way as a handoff so the two can be compared row for row.
+ */
+describe("a session the A/B split leaves to the engine", () => {
+    const engineSummary = [continuationTurn(), userTurn("Fix the build.")];
+    const engineUsage = { input_tokens: 40_000, output_tokens: 3_000, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
+
+    /** `next` for the engine's compaction, with what core reports about it. */
+    const engineNext = () => {
+        const next = stockNext(engineSummary);
+        const answer = next;
+        const wrapped = (input) => ({ ...answer(input), tokensBefore: 150_000, tokensAfter: 9_000, usage: engineUsage });
+
+        wrapped.calls = next.calls;
+        wrapped.signal = next.signal;
+
+        return wrapped;
+    };
+
+    const abHost = (env, forks) =>
+        sharedHost({
+            env,
+            model: {
+                fork: async () => {
+                    forks.push(1);
+
+                    return answered("THE FORK'S SUMMARY", warmForkUsage);
+                },
+            },
+        });
+
+    const compactOnce = async (env) => {
+        const runtime = await registered();
+        const forks = [];
+        const host = abHost(env, forks);
+
+        host.as("A", before);
+        await runtime.dispatch("session.start", host.$, {});
+        await runtime.dispatch("turn.complete", host.$, turnComplete());
+
+        const answer = await runtime.dispatch("session.compact", host.$, compaction({ messages: before }), engineNext());
+
+        host.as("A", [...before, ...answer.messages, userTurn("Carry on.")]);
+        await runtime.dispatch("turn.complete", host.$, turnComplete());
+
+        return { host, answer, forks };
+    };
+
+    it("lets the engine compact without forking, and logs what the engine did", async () => {
+        const { host, answer, forks } = await compactOnce({ COMPACT_HANDOFF_LIVE: "1", COMPACT_HANDOFF_AB_STOCK_SHARE: "1" });
+
+        try {
+            const row = lastRow(host);
+
+            assert.deepEqual(answer.messages, engineSummary);
+            assert.equal(forks.length, 0);
+            assert.equal(row.disposition, "abStock");
+            assert.equal(row.outcome, "stock");
+            assert.equal(row.ab.arm, "stock");
+            assert.equal(row.ab.share, 1);
+            assert.equal(row.depth, 1);
+            assert.equal(row.tokensBefore, 150_000);
+            assert.equal(row.tokensAfter, 9_000);
+            assert.deepEqual(row.usage, engineUsage);
+            assert.ok(row.cost.totalUsd > 0);
+            assert.equal(row.stockSummaryChars, continuationTurn().text.length);
+            assert.match(row.fallbackReason, /A\/B/u);
+            assert.equal(host.files.get(row.files[".summary.md"]), continuationTurn().text);
+            assert.ok(row.files[".transcript.md"]);
+        } finally {
+            host.stopTimers();
+        }
+    });
+
+    it("watches the ten turns after it, and tags the window rows with the arm", async () => {
+        const { host } = await compactOnce({ COMPACT_HANDOFF_LIVE: "1", COMPACT_HANDOFF_AB_STOCK_SHARE: "1" });
+
+        try {
+            const post = postFile(host);
+            const rows = host.rowsIn("window.jsonl");
+
+            assert.match(post.path, /\/sessions\/A\/001-/u);
+            assert.equal(post.kind, "stock");
+            assert.equal(post.arm, "stock");
+            assert.equal(post.anchored, true);
+            assert.equal(post.firstUserMessage, "Carry on.");
+            assert.deepEqual(
+                rows.map(({ turn, phase, arm }) => [turn, phase, arm]),
+                [
+                    [1, "fresh", "stock"],
+                    [1, "stock-compact", "stock"],
+                ],
+            );
+        } finally {
+            host.stopTimers();
+        }
+    });
+
+    it("hands off as usual in the other arm, and says which arm it was", async () => {
+        // A share this small leaves session "A" in the handoff arm.
+        const { host, forks } = await compactOnce({ COMPACT_HANDOFF_LIVE: "1", COMPACT_HANDOFF_AB_STOCK_SHARE: "0.000001" });
+
+        try {
+            const row = lastRow(host);
+
+            assert.equal(row.disposition, "replaced");
+            assert.equal(row.ab.arm, "handoff");
+            assert.equal(forks.length, 1);
+            assert.equal(postFile(host).arm, "handoff");
+            assert.deepEqual(
+                host.rowsIn("window.jsonl").map(({ arm }) => arm),
+                ["handoff", "handoff"],
+            );
+        } finally {
+            host.stopTimers();
+        }
+    });
+
+    it("records no arm when the split is off", async () => {
+        const { host } = await compactOnce({ COMPACT_HANDOFF_LIVE: "1" });
+
+        try {
+            assert.equal(lastRow(host).ab, null);
+            assert.equal(postFile(host).arm, null);
+            assert.deepEqual(
+                host.rowsIn("window.jsonl").map(({ arm }) => arm),
+                [null, null],
+            );
+        } finally {
+            host.stopTimers();
+        }
+    });
+
+    // A rehearsal already leaves every compaction to the engine, so a split
+    // there would label sessions that were all treated the same.
+    it("records no arm in a rehearsal", async () => {
+        const { host } = await compactOnce({ COMPACT_HANDOFF_AB_STOCK_SHARE: "1" });
+
+        try {
+            assert.equal(lastRow(host).disposition, "rehearsed");
+            assert.equal(lastRow(host).ab, null);
+        } finally {
+            host.stopTimers();
+        }
+    });
+
+    it("counts a stock session's second compaction as its second", async () => {
+        const runtime = await registered();
+        const host = abHost({ COMPACT_HANDOFF_LIVE: "1", COMPACT_HANDOFF_AB_STOCK_SHARE: "1" }, []);
+
+        try {
+            host.as("A", before);
+            await runtime.dispatch("session.start", host.$, {});
+            await runtime.dispatch("session.compact", host.$, compaction({ messages: before }), engineNext());
+            host.as("A", [...before, ...engineSummary, userTurn("Carry on.")]);
+            await runtime.dispatch("session.compact", host.$, compaction({ messages: engineSummary }), engineNext());
+
+            assert.deepEqual(
+                host.rowsIn("index.jsonl").map(({ depth, prev }) => [depth, prev]),
+                [
+                    [1, null],
+                    [2, 1],
+                ],
+            );
+        } finally {
+            host.stopTimers();
+        }
+    });
+});

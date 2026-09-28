@@ -156,6 +156,17 @@ For ten person turns after a compaction, `turn.complete` rewrites `NNN-<iso>.pos
 
 The watch finds where the new conversation starts by the opener the compaction put in, counted in the whole transcript, and stops `anchored: false` rather than guess when that opener is not there. Every record written before 0.11.5 is unusable and the summariser sets them aside: the watch sliced the whole session from the replacement's length, so a record said 510 to 894 turns, 32 to 63 re-run commands and an empty first message. The monitor lives in module memory like the turn count, so a reload mid-watch ends it, and the file keeps what it last had.
 
+### The live A/B split
+
+Set `abStockShare` in `/plugin` (or `COMPACT_HANDOFF_AB_STOCK_SHARE`) to a fraction, with live on, and that share of sessions is left to the engine's own compaction while the rest get the handoff. `0.5` gives the most data per week; `0.2` keeps most sessions on the handoff. Clear it to end the split.
+
+- **Assigned per session, never per compaction.** A session that alternated would hand its next handoff the engine's summary to build on, so the arm would stop being the only difference. The arm is a hash of the session id, so it survives a reload or restart with nothing stored, and raising the share only moves sessions from handoff to stock.
+- **The stock arm is logged like a handoff.** Its row (`disposition: abStock`, `outcome: stock`) is filed under `sessions/<id>/` with the pre-compaction transcript, the engine's summary as `.summary.md`, `tokensBefore`, `tokensAfter`, `stockSummaryChars`, the engine's `usage` and a priced `cost`. The fork never runs in that arm; the seam is still raised, so a subscriber behaves the same in both.
+- **Every record says its arm.** Compaction rows carry `ab: {arm, share, bucket}` (null when the split is off), `post.json` carries `arm`, and every `window.jsonl` reading carries `arm`, before the first compaction as well as after, so the arms can be checked for balance before anything differs.
+- **Read it with** `python3 bench/summarise_runs.py --ab`: per arm, sessions, compactions, how many got their assigned arm, elapsed, cost, summary size, context before and at turn 1 after, turns until the next compaction, and the ten-turn watch (turns to first tool, re-ran commands, re-read files, handoff tools used, compacted again). It groups by assigned arm, so a handoff that fell back still counts against the handoff. `--ab-export ab.jsonl` writes one joined line per compaction, with the file paths, for digging past the table.
+
+A rehearsal (live off) has no split: every compaction there is already the engine's.
+
 ### Reading one row
 
 A row says what the compaction did and, when it did not do it, why. The fields
@@ -163,7 +174,7 @@ that matter for that second case:
 
 | field | when | what it says |
 |---|---|---|
-| `disposition` | always | `replaced`, `rehearsed`, `fellBack`, `passedThrough`, `abortedFallback`, `skipped` (the engine tried to compact this plugin's own fork loop and was declined). Historical rows only: `overBudget`, written by 0.10.0 and earlier when a session had spent past its USD ceiling. That ceiling is gone, and those rows still read back through every tool |
+| `disposition` | always | `replaced`, `rehearsed`, `abStock` (the A/B split left this session to the engine), `fellBack`, `passedThrough`, `abortedFallback`, `skipped` (the engine tried to compact this plugin's own fork loop and was declined). Historical rows only: `overBudget`, written by 0.10.0 and earlier when a session had spent past its USD ceiling. That ceiling is gone, and those rows still read back through every tool |
 | `engine` | always | the Claude Code version, from `$.session.version()` since 0.11.5, with `CLAUDE_CODE_VERSION` the fallback. Null on nearly every earlier row, because that variable is unset in an ordinary session |
 | `fallbackReason` | every disposition but `replaced` | one line naming why, e.g. `noHandoff: no handoff has been written yet (fork nothing-to-fork: the fork found no warm main-thread transcript)` |
 | `forkOutcome`, `forkDetail` | every row whose fork was not handed up | why the fork's own answer was not used, and the fallback went to the handoff on disk. On engine 2.1.280 and later an unanswered fork records the engine's own `reason`: `nothing-to-fork` (no warm transcript yet), `api-error` (the detail carries the HTTP status and error kind), `empty-reply` or `aborted`, and the spend of any that made a request stays in `usage`. `timeout` is a fork that had not answered after five minutes: the compaction stops waiting and falls back, but the engine gives a plugin no way to cancel a fork, so the request runs on and still spends, and its answer is dropped when it arrives (that spend is on no row). `mismatch` is an answer refused by the `forkInput` check below, `threw` anything unexpected. Rows from 0.10.0 and earlier say `cold` where they now say `nothing-to-fork` (or `threw`, on engine 2.1.280 and later) |
@@ -551,7 +562,7 @@ refused — and the live check above covers the third.
 
 ## Settings
 
-Every one of these is also a row in `/plugin`, under this plugin's configuration: `live`, `dataDir`, `model`, `maxChars`, `maxFraction`, `maxTokens`, `restoreFiles`, `restoreFileChars`, `restoreTotalChars`, `seamTimeoutMs`, `subagents`, `dev`, `refresh` and `refreshMs`. A row set there wins over the matching variable; left empty (or `0`, for a number), the variable is read as it always was, which is what a cron line or a one-off shell invocation already sets. The four on/off rows (`live`, `subagents`, `dev`, `refresh`) declare no default, so a row nobody touched stays unset and the variable decides, while a row switched off is a setting and stays off whatever the variable says. Through 0.10.0 they declared `false`, which the engine filled in as though it had been set, and `COMPACT_HANDOFF_LIVE=1` was never read.
+Every one of these is also a row in `/plugin`, under this plugin's configuration: `live`, `dataDir`, `model`, `maxChars`, `maxFraction`, `maxTokens`, `restoreFiles`, `restoreFileChars`, `restoreTotalChars`, `seamTimeoutMs`, `abStockShare`, `subagents`, `dev`, `refresh` and `refreshMs`. A row set there wins over the matching variable; left empty (or `0`, for a number), the variable is read as it always was, which is what a cron line or a one-off shell invocation already sets. The four on/off rows (`live`, `subagents`, `dev`, `refresh`) declare no default, so a row nobody touched stays unset and the variable decides, while a row switched off is a setting and stays off whatever the variable says. Through 0.10.0 they declared `false`, which the engine filled in as though it had been set, and `COMPACT_HANDOFF_LIVE=1` was never read.
 
 There is no spend ceiling. Every main-thread compaction goes to the fork whatever the session has already spent. Up to 0.10.0 a session that crossed $10 fell back to the engine for every later compaction; `maxUsdPerSession` and `COMPACT_HANDOFF_MAX_USD_PER_SESSION` were how that ceiling was set, and both are now ignored, so an old config naming either one does nothing.
 
@@ -567,6 +578,7 @@ There is no spend ceiling. Every main-thread compaction goes to the fork whateve
 | `COMPACT_HANDOFF_RESTORE_FILE_CHARS` | `20000` | The most of one restored file that comes back; the rest is clipped with a note saying how much. |
 | `COMPACT_HANDOFF_RESTORE_TOTAL_CHARS` | `100000` | The most all restored files may add together, and never more than the ceiling above leaves free after the handoff. |
 | `COMPACT_HANDOFF_SEAM_TIMEOUT_MS` | `90000` | How long one raised seam tool may run before the compaction goes on without it. Read only when something is subscribed. |
+| `COMPACT_HANDOFF_AB_STOCK_SHARE` | unset | The live A/B split: the share of sessions left to the engine's own compaction, `0.5` for an even split. Unset, `0` or anything outside (0, 1] is no split. Read only while live is on. See "The live A/B split" above. |
 | `COMPACT_HANDOFF_SUBAGENTS` | off | Off, a subagent's compaction is passed through with a row saying so. On, it is answered like any other. |
 | `COMPACT_HANDOFF_DEV` | off | Registers the four measurement tools. |
 | `COMPACT_HANDOFF_REFRESH` | off | Keeps a fallback handoff on disk for sessions a fork cannot serve (headless). |
@@ -790,11 +802,12 @@ so the ambient config dir authenticates the call with nothing copied at all.
 
 ## Tests
 
-Two suites, two runners, and both have to pass:
+Three suites, and all three have to pass:
 
 ```
 bun test                # the module's own functions, against a stub $
 claude plugin test .    # the plugin loaded into a real engine
+python3 -m unittest bench/test_summarise_runs.py   # the A/B report's join
 ```
 
 The hooks module is also typechecked against the engine's own declarations:

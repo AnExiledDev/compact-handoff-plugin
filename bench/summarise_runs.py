@@ -7,6 +7,8 @@ what a person actually wants to know after a week of it running:
     python3 bench/summarise_runs.py
     python3 bench/summarise_runs.py --days 7
     python3 bench/summarise_runs.py --data-dir /somewhere
+    python3 bench/summarise_runs.py --ab                  # the live A/B split only
+    python3 bench/summarise_runs.py --ab-export ab.jsonl  # one joined row per A/B compaction
 
 How many compactions a day, what they cost per session and per day, which parts
 failed and how often, how deep the lineages went, whether the session after a
@@ -436,6 +438,179 @@ def print_baseline(rows):
     print("  re-ran and re-read are means per compaction; turns count what the person typed")
 
 
+def read_window(root):
+    """Every per-turn occupancy reading, oldest first."""
+    path = os.path.join(root, "window.jsonl")
+
+    if not os.path.isfile(path):
+        return []
+
+    readings = []
+
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                readings.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+    readings.sort(key=lambda reading: reading.get("at") or "")
+
+    return readings
+
+
+def window_spans(readings):
+    """Each window a session lived in, keyed (session, compaction n).
+
+    A window is every reading between one compaction and the next. `closed`
+    says a later compaction ended it, so its turn count is the whole window's
+    and not just the part seen so far.
+    """
+    spans = {}
+    latest = {}
+
+    for reading in readings:
+        session, n = reading.get("session"), reading.get("compaction") or 0
+        span = spans.setdefault((session, n), {"arm": reading.get("arm"), "phase": reading.get("phase"), "turns": 0, "first": None, "closed": False})
+
+        span["turns"] += 1
+
+        if span["first"] is None and reading.get("turn") == 1:
+            span["first"] = reading.get("tokens")
+
+        latest[session] = max(latest.get(session, 0), n)
+
+    for (session, n), span in spans.items():
+        span["closed"] = latest[session] > n
+
+    return spans
+
+
+def ab_rows(rows, root):
+    """One joined record per A/B compaction: the row, its watch, its window."""
+    spans = window_spans(read_window(root))
+    joined = []
+
+    for row in rows:
+        ab = row.get("ab")
+
+        if not isinstance(ab, dict) or row.get("agentId"):
+            continue
+
+        post = post_json(row) or {}
+        anchored = post.get("anchored") is True
+        span = spans.get((row.get("sessionId"), row.get("depth") or 0), {})
+
+        joined.append(
+            {
+                "at": row.get("at"),
+                "session": row.get("sessionId"),
+                "arm": ab.get("arm"),
+                "share": ab.get("share"),
+                "disposition": row.get("disposition"),
+                "applied": "handoff" if row.get("disposition") == "replaced" else "stock",
+                "trigger": row.get("trigger"),
+                "depth": row.get("depth"),
+                "plugin": row.get("plugin"),
+                "engine": row.get("engine"),
+                "elapsedMs": row.get("elapsedMs"),
+                "costUsd": usd(row),
+                "summaryChars": row.get("handoffChars") if row.get("disposition") == "replaced" else row.get("stockSummaryChars"),
+                "tokensBefore": ((row.get("forkContext") or {}).get("context") or {}).get("tokens") or row.get("tokensBefore"),
+                "tokensAfterFirstTurn": span.get("first"),
+                "turnsInWindow": span.get("turns"),
+                "windowClosed": span.get("closed"),
+                "watched": anchored,
+                "turnsObserved": post.get("turnsObserved") if anchored else None,
+                "turnsToFirstToolCall": post.get("turnsToFirstToolCall") if anchored else None,
+                "reRan": len(post.get("reRunCommands") or []) if anchored else None,
+                "reRead": len(post.get("reReadFiles") or []) if anchored else None,
+                "usedHandoffTool": bool(post.get("handoffToolsCalled")) if anchored else None,
+                "compactedAgain": post.get("compactedAgain") if anchored else None,
+                "files": row.get("files"),
+            }
+        )
+
+    return joined
+
+
+def print_ab(rows, root):
+    """The live A/B split: sessions assigned by hash, compared arm by arm.
+
+    Grouped by the arm a session was assigned, not the compaction it got: a
+    handoff that fell back is still a handoff-arm compaction, because dropping
+    it would flatter the handoff arm with only the runs that worked. The
+    `applied` column says how many got what they were assigned.
+    """
+    print("\nLive A/B split (assigned by session; COMPACT_HANDOFF_AB_STOCK_SHARE)")
+
+    joined = ab_rows(rows, root)
+
+    if not joined:
+        print("  no A/B compactions recorded: set abStockShare (or COMPACT_HANDOFF_AB_STOCK_SHARE) with live on")
+        return
+
+    shares = sorted({str(record["share"]) for record in joined})
+    print(f"  share(s) in these rows: {', '.join(shares)}")
+
+    def median(records, key, scale=1, fmt="{:.1f}"):
+        values = [record[key] for record in records if isinstance(record.get(key), (int, float)) and not isinstance(record.get(key), bool)]
+
+        return fmt.format(statistics.median(values) / scale) if values else "-"
+
+    def mean(records, key):
+        values = [record[key] for record in records if isinstance(record.get(key), (int, float)) and not isinstance(record.get(key), bool)]
+
+        return f"{statistics.fmean(values):.2f}" if values else "-"
+
+    def rate(records, key):
+        values = [record[key] for record in records if isinstance(record.get(key), bool)]
+
+        return f"{100 * sum(values) / len(values):.0f}%" if values else "-"
+
+    table = [
+        ("sessions", lambda records: str(len({record["session"] for record in records}))),
+        ("compactions", lambda records: str(len(records))),
+        ("got its assigned arm", lambda records: f"{sum(1 for record in records if record['applied'] == record['arm'])}/{len(records)}"),
+        ("median elapsed (s)", lambda records: median(records, "elapsedMs", 1000)),
+        ("median cost (USD)", lambda records: median(records, "costUsd", fmt="{:.3f}")),
+        ("total cost (USD)", lambda records: f"{sum(record['costUsd'] or 0 for record in records):.2f}"),
+        ("median summary (chars)", lambda records: median(records, "summaryChars", fmt="{:.0f}")),
+        ("median context before (tokens)", lambda records: median(records, "tokensBefore", fmt="{:.0f}")),
+        ("median context, turn 1 after", lambda records: median(records, "tokensAfterFirstTurn", fmt="{:.0f}")),
+        ("median turns to next compaction", lambda records: median([r for r in records if r["windowClosed"]], "turnsInWindow", fmt="{:.0f}")),
+        ("watched ten turns", lambda records: str(sum(1 for record in records if record["watched"]))),
+        ("median turns to first tool", lambda records: median([r for r in records if r["watched"]], "turnsToFirstToolCall")),
+        ("mean re-ran commands", lambda records: mean([r for r in records if r["watched"]], "reRan")),
+        ("mean re-read files", lambda records: mean([r for r in records if r["watched"]], "reRead")),
+        ("used a handoff tool", lambda records: rate(records, "usedHandoffTool")),
+        ("compacted again in ten turns", lambda records: rate(records, "compactedAgain")),
+    ]
+    arms = {arm: [record for record in joined if record["arm"] == arm] for arm in ("handoff", "stock")}
+
+    print(f"  {'':<34}{'handoff':>12}{'stock':>12}")
+
+    for label, measure in table:
+        print(f"  {label:<34}" + "".join(f"{measure(arms[arm]) if arms[arm] else '-':>12}" for arm in ("handoff", "stock")))
+
+    print("  lower is better for re-ran, re-read, turns to first tool and context after; higher for turns to next compaction.")
+
+    fewest = min(len({record["session"] for record in records}) for records in arms.values())
+
+    if fewest < 30:
+        print(f"  {fewest} session(s) in the smaller arm: read any gap as noise until both arms pass about 30.")
+
+
+def export_ab(rows, root, path):
+    joined = ab_rows(rows, root)
+
+    with open(path, "w", encoding="utf-8") as handle:
+        for record in joined:
+            handle.write(json.dumps(record) + "\n")
+
+    print(f"wrote {len(joined)} A/B compaction(s) to {path}")
+
+
 def print_feedback(rows):
     print("\nFeedback left on a handoff")
 
@@ -459,6 +634,8 @@ def main():
     ap.add_argument("--data-dir", default=None, help="Overrides COMPACT_HANDOFF_DATA_DIR.")
     ap.add_argument("--days", type=int, default=0, help="Only the N most recent days that have rows.")
     ap.add_argument("--session", default=None, help="Only this session id.")
+    ap.add_argument("--ab", action="store_true", help="Print only the live A/B split.")
+    ap.add_argument("--ab-export", default=None, metavar="PATH", help="Write one joined JSON line per A/B compaction to PATH.")
     args = ap.parse_args()
 
     root = data_dir(args.data_dir)
@@ -479,6 +656,14 @@ def main():
         print("no rows match that filter")
         return 0
 
+    if args.ab_export:
+        export_ab(rows, root, args.ab_export)
+        return 0
+
+    if args.ab:
+        print_ab(rows, root)
+        return 0
+
     versions = Counter(f"{row.get('plugin') or '?'} on engine {row.get('engine') or 'unknown'}" for row in rows)
 
     print(f"{len(rows)} compaction(s) under {root}")
@@ -492,6 +677,7 @@ def main():
     print_depths(rows)
     print_post(rows)
     print_baseline(rows)
+    print_ab(rows, root)
     print_feedback(rows)
 
     return 0

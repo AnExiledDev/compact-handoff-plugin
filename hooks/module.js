@@ -227,6 +227,7 @@ import {
     restoreRow,
 } from "./restore.js";
 import {
+    abArmFor,
     applySizeGuard,
     assistantTurns,
     commitmentsFrom,
@@ -248,6 +249,7 @@ import {
     pinSkipCounts,
     priorHandoffIn,
     sectionOf,
+    stockSummaryOf,
     priceUsage,
     renderCommitments,
     lookupRecord,
@@ -521,6 +523,10 @@ export const register = (on, pluginOptions) => {
             pinnedSkipped: pinSkipCounts(e.messages),
             plugin: await pluginVersion($),
             engine: await engineVersion($),
+            // The arm of the live A/B split this session is in, or null when
+            // the split is off. Set below, once the compaction is known to be
+            // the main conversation's own.
+            ab: /** @type {{ arm: "handoff" | "stock", share: number, bucket: number } | null} */ (null),
         };
 
         // The fork this plugin is waiting on is itself a query loop, and the
@@ -549,6 +555,12 @@ export const register = (on, pluginOptions) => {
             await finish($, record, "passedThrough");
 
             return next(e);
+        }
+
+        record.ab = await assignedArm($, record.sessionId);
+
+        if (record.ab?.arm === "stock") {
+            return compactStock($, e, next, record, startedAt);
         }
 
         // Another plugin's work starts here, before anything is awaited, so it
@@ -716,7 +728,7 @@ export const register = (on, pluginOptions) => {
  * empty table, so nothing at the fold can read the manifest. `test/module.test.js`
  * asserts it against `.claude-plugin/plugin.json` so the two cannot drift.
  */
-export const PLUGIN_VERSION = "0.11.5";
+export const PLUGIN_VERSION = "0.12.0";
 
 /** How long one subscriber may run before the compaction goes on without it. */
 const DEFAULT_SEAM_TIMEOUT_MS = 90_000;
@@ -2638,7 +2650,16 @@ const logged = async ($, tool, args, text) => {
 /** Starts watching a compaction: where the new conversation begins, and the work the old one did. */
 const armMonitor = (record, { kind, ordinal, from, before }) => {
     watches.set(record.sessionId, {
-        ...monitorSeed({ session: record.sessionId, n: record.depth, at: record.at, kind, ordinal, from, messages: before }),
+        ...monitorSeed({
+            session: record.sessionId,
+            n: record.depth,
+            at: record.at,
+            kind,
+            arm: record.ab?.arm ?? null,
+            ordinal,
+            from,
+            messages: before,
+        }),
         stem: stemOf(record),
         disposition: record.disposition,
     });
@@ -2676,6 +2697,73 @@ const armStock = (record, ordinal, before, result) => {
     if (opener !== -1) {
         armMonitor(record, { kind: "stock", ordinal, from: messages.length - opener, before });
     }
+};
+
+/**
+ * The share of sessions the live A/B split leaves to the engine's own
+ * compaction, as the setting or variable spells it. Unset is no split.
+ */
+const abShare = async ($) => opt("abStockShare") ?? (await $.env.get("COMPACT_HANDOFF_AB_STOCK_SHARE"));
+
+/**
+ * This session's arm of the split, or null. A rehearsal already leaves every
+ * compaction to the engine, so the split only exists while live is on.
+ */
+const assignedArm = async ($, sessionId) => ((await isLive($)) ? abArmFor(sessionId, await abShare($)) : null);
+
+/**
+ * A compaction the A/B split leaves to the engine: no fork, the engine's own
+ * summary, and a row that says what that summary was and what it cost, filed
+ * beside the handoffs so the two arms are logged the same way. The seam is
+ * still raised, so a subscriber's work does not differ between the arms.
+ */
+const compactStock = async ($, e, next, record, startedAt) => {
+    const seam = dispatchSeam($, e);
+    const ordinal = await openerOrdinal($, record);
+    const transcript = renderTranscript(e.messages);
+
+    record.depth = ordinal === null ? null : ordinal + 1;
+    record.prev = ordinal === null || ordinal === 0 ? null : ordinal;
+
+    let result;
+
+    try {
+        result = await next(e);
+    } catch (error) {
+        record.outcome = "threw";
+        record.detail = String(error).slice(0, 2000);
+        record.seam = await seam;
+        record.elapsedMs = Date.now() - startedAt;
+
+        await finish($, record, "abStock", { transcript });
+
+        throw error;
+    }
+
+    const summary = stockSummaryOf(result?.messages);
+
+    record.seam = await seam;
+    record.outcome = "stock";
+    record.usage = result?.usage ?? null;
+    record.tokensBefore = result?.tokensBefore ?? null;
+    record.tokensAfter = result?.tokensAfter ?? null;
+    record.messagesOut = Array.isArray(result?.messages) ? result.messages.length : null;
+    record.stockSummaryChars = summary === null ? null : summary.length;
+    record.elapsedMs = Date.now() - startedAt;
+    record.aborted = next.signal.aborted;
+
+    if (record.usage === null) {
+        record.cost = null;
+        record.costUnknownReason = "the engine reported no usage for its compaction";
+    } else {
+        priceRun(record, { commitmentsUsd: 0 });
+    }
+
+    await finish($, record, "abStock", { summary: summary ?? undefined, transcript });
+
+    armStock(record, ordinal, e.messages, result);
+
+    return result;
 };
 
 /**
@@ -2760,6 +2848,7 @@ const watchWindow = async ($) => {
         context: usage?.context ?? null,
         messages: messages === null ? null : messages.length,
         opener,
+        arm: (await safely($, () => assignedArm($, session)))?.arm ?? null,
     });
 
     await safely($, async () => appendLine($, `${await dataDir($)}/${WINDOW_LOG}`, JSON.stringify(row)));

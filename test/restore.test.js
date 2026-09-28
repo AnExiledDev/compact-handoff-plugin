@@ -10,6 +10,7 @@ import {
     restoreCandidates,
     restorePair,
     restoreRow,
+    shellMentions,
 } from "../hooks/restore.js";
 import { assistantTurn, use270, userTurn } from "./fixtures.js";
 
@@ -119,6 +120,54 @@ describe("chooseRestores", () => {
 
     it("says none when the session touched no file at all", async () => {
         assert.deepEqual(await chooseRestores({ requests: [], candidates: [] }), { files: [], source: "none", rejected: [] });
+    });
+
+    // A session that read a file with `cat` and rewrote it with a script touched
+    // it as surely as one that used Read and Edit; refusing it lost the file the
+    // work was about (compaction 3 of session 05512ce4, capture.ts).
+    describe("a file touched only through shell commands", () => {
+        const shell = shellMentions([
+            assistantTurn("look", [use270("Bash", { command: "cd /srv/ledger && cat src/commands/capture.ts; sed -n 1,80p AGENTS.md" })]),
+            assistantTurn("log", [use270("Bash", { command: "tail -3 /tmp/gate.log > /tmp/out.txt" })]),
+        ]);
+        const request = (path) => ({ path, from: null, to: null, reason: "" });
+
+        it("is restored when a command named it by a trailing part of its path", async () => {
+            const chosen = await chooseRestores({ requests: [request("/srv/ledger/src/commands/capture.ts")], candidates, shellMentions: shell });
+
+            assert.equal(chosen.source, "model");
+            assert.deepEqual(chosen.files, [{ path: "/srv/ledger/src/commands/capture.ts", from: null, to: null, reason: "", stored: null }]);
+            assert.deepEqual(chosen.rejected, []);
+        });
+
+        it("is restored under the absolute path the command used", async () => {
+            const chosen = await chooseRestores({ requests: [request("gate.log")], candidates, shellMentions: shell });
+
+            assert.deepEqual(chosen.files.map((file) => file.path), ["/tmp/gate.log"]);
+        });
+
+        it("is still refused when no command named anything that ends the path", async () => {
+            const chosen = await chooseRestores({ requests: [request("/srv/ledger/src/commands/deps.ts")], candidates, shellMentions: shell });
+
+            assert.deepEqual(chosen.rejected.map((rejection) => rejection.why), ["not read or written in this conversation"]);
+        });
+
+        it("is never offered by the recency fallback, which would restore stray logs", async () => {
+            const chosen = await chooseRestores({ requests: [], candidates: [], shellMentions: shell });
+
+            assert.equal(chosen.source, "none");
+        });
+
+        it("is still refused when it is gone from disk", async () => {
+            const chosen = await chooseRestores({
+                requests: [request("/srv/ledger/src/commands/capture.ts")],
+                candidates,
+                shellMentions: shell,
+                exists: async () => false,
+            });
+
+            assert.deepEqual(chosen.rejected.map((rejection) => rejection.why), ["no longer exists on disk"]);
+        });
     });
 
     // A worktree removed after its files were edited left the recency fallback

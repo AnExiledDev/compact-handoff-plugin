@@ -196,7 +196,7 @@ Two rules that override any instinct toward brevity. Never write "various", "sev
 
 There may be additional summarization instructions in the included context; follow them too.
 
-After the closing </summary> tag, add a <restore-files> block naming up to 5 files the next window should have open before it does anything: the file being edited, the spec or test it is being written against, the file the current step depends on. Only files this conversation actually read or wrote, by absolute path. One file per line, three fields separated by |: the absolute path, then either all or a line range like 120-260, then a one-line reason. Prefer a line range when only part of a large file matters. Do not name CLAUDE.md or AGENTS.md files; they come back on their own. Leave the block empty if nothing qualifies.
+After the closing </summary> tag, add a <restore-files> block naming up to 5 files the next window should have open before it does anything: the file being edited, the spec or test it is being written against, the file the current step depends on. Only files this conversation actually read or wrote, through any tool including shell commands, by absolute path. One file per line, three fields separated by |: the absolute path, then either all or a line range like 120-260, then a one-line reason. Prefer a line range when only part of a large file matters. Do not name CLAUDE.md or AGENTS.md files; they come back on their own. Leave the block empty if nothing qualifies.
 <restore-files>
 /abs/path/to/file.ts | 40-120 | the function being changed
 </restore-files>`;
@@ -210,6 +210,7 @@ import {
     fitRestores,
     parseRestoreRequests,
     restoreCandidates,
+    shellMentions,
     restorePair,
     restoreRow,
 } from "./restore.js";
@@ -676,7 +677,7 @@ export const register = (on, pluginOptions) => {
  * empty table, so nothing at the fold can read the manifest. `test/module.test.js`
  * asserts it against `.claude-plugin/plugin.json` so the two cannot drift.
  */
-export const PLUGIN_VERSION = "0.11.1";
+export const PLUGIN_VERSION = "0.11.2";
 
 /** How long one subscriber may run before the compaction goes on without it. */
 const DEFAULT_SEAM_TIMEOUT_MS = 90_000;
@@ -828,6 +829,7 @@ const restoreFiles = async ($, e, requests, { depth, totalChars }) => {
     const chosen = await chooseRestores({
         requests,
         candidates: restoreCandidates(e.messages),
+        shellMentions: shellMentions(e.messages),
         maxFiles: caps.maxFiles,
         exists: (path) => existsOnDisk($, path),
     });

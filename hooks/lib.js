@@ -444,7 +444,7 @@ const ledgerBody = (rows, depth = 3) => {
         out.push(`${hash} Output that reads as a failure (${failed.length})`, "");
 
         for (const row of failed) {
-            out.push(`- \`${row.target}\``);
+            out.push(`- ${callLabel(row)}`);
             out.push(`  - ${row.outcome}${row.detail === "" ? "" : `: ${row.detail}`}`);
         }
 
@@ -458,6 +458,19 @@ const ledgerBody = (rows, depth = 3) => {
     }
 
     return out;
+};
+
+/**
+ * A failed call as the ledger lists it. A shell command is its own label; any
+ * other tool is named, with its target when it has one, so an EnterWorktree
+ * error does not render as an empty code span.
+ */
+const callLabel = (row) => {
+    if (row.target === "") {
+        return row.name;
+    }
+
+    return row.name === "Bash" ? `\`${row.target}\`` : `${row.name} \`${row.target}\``;
 };
 
 /** What the record supports about how a call ended, and nothing beyond it. */

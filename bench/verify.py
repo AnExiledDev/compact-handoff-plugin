@@ -760,7 +760,10 @@ def check_instructions(args):
 
     row = fresh[0]
     parts = row.get("parts") or {}
-    ok = row.get("disposition") == "replaced" and isinstance(parts.get("ledger"), int)
+    # A fixture with no tool calls renders no ledger, and the part records
+    # "empty" rather than a length. Only a "failed: ..." note is a failure.
+    ledger = parts.get("ledger")
+    ok = row.get("disposition") == "replaced" and (isinstance(ledger, int) or ledger == "empty")
 
     return record(
         "instructions",

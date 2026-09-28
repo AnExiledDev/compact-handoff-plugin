@@ -136,17 +136,25 @@ const pathOf = (use) => {
  * The model chooses; the code only refuses. A path the session never touched
  * is refused because the model cannot have read it, a memory file because the
  * engine re-emits those itself, and anything past the cap because the cap is
- * the operator's. When nothing survives, the most recently touched files go
+ * the operator's. A file that is gone from disk is refused too: a worktree
+ * removed after its files were edited once left the fallback restoring nothing.
+ * When nothing survives, the most recently touched files that still exist go
  * instead, and `source` says which of the two happened so the rate can be
- * measured.
+ * measured. `exists` is the host's check, injected so this stays pure.
+ *
+ * @param {object} options
+ * @param {Array<{ path: string, from: number | null, to: number | null, reason: string }>} options.requests
+ * @param {Array<{ path: string, at: number, stored: string | null }>} options.candidates
+ * @param {number} [options.maxFiles]
+ * @param {(path: string) => Promise<boolean>} [options.exists]
  */
-export const chooseRestores = ({ requests, candidates, maxFiles = RESTORE_MAX_FILES }) => {
+export const chooseRestores = async ({ requests, candidates, maxFiles = RESTORE_MAX_FILES, exists = async () => true }) => {
     const files = [];
     const rejected = [];
 
     for (const request of requests) {
         const candidate = candidateFor(request.path, candidates);
-        const why = refusal(request.path, candidate, files, maxFiles);
+        const why = refusal(request.path, candidate, files, maxFiles) ?? (await goneFromDisk(candidate, exists));
 
         if (why !== null) {
             rejected.push({ path: request.path, why });
@@ -160,19 +168,34 @@ export const chooseRestores = ({ requests, candidates, maxFiles = RESTORE_MAX_FI
         return { files, source: "model", rejected };
     }
 
-    const fallback = candidates
-        .filter((candidate) => !MEMORY_FILE.test(candidate.path))
-        .slice(0, maxFiles)
-        .map((candidate) => ({
+    const fallback = [];
+
+    for (const candidate of candidates) {
+        if (fallback.length >= maxFiles) {
+            break;
+        }
+
+        if (MEMORY_FILE.test(candidate.path) || !(await exists(candidate.path))) {
+            continue;
+        }
+
+        fallback.push({
             path: candidate.path,
             from: null,
             to: null,
             reason: "most recently touched; the summary named no usable file",
             stored: candidate.stored,
-        }));
+        });
+    }
 
     return { files: fallback, source: fallback.length === 0 ? "none" : "recency", rejected };
 };
+
+/**
+ * @param {{ path: string }} candidate
+ * @param {(path: string) => Promise<boolean>} exists
+ */
+const goneFromDisk = async (candidate, exists) => ((await exists(candidate.path)) ? null : "no longer exists on disk");
 
 const candidateFor = (path, candidates) =>
     candidates.find((candidate) => candidate.path === path) ??

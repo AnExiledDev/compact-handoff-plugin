@@ -227,6 +227,7 @@ import {
     isPinnable,
     ledgerRows,
     lineageLine,
+    nameOf,
     monitorSeed,
     observePost,
     pinSkipCounts,
@@ -675,7 +676,7 @@ export const register = (on, pluginOptions) => {
  * empty table, so nothing at the fold can read the manifest. `test/module.test.js`
  * asserts it against `.claude-plugin/plugin.json` so the two cannot drift.
  */
-export const PLUGIN_VERSION = "0.11.0";
+export const PLUGIN_VERSION = "0.11.1";
 
 /** How long one subscriber may run before the compaction goes on without it. */
 const DEFAULT_SEAM_TIMEOUT_MS = 90_000;
@@ -824,7 +825,12 @@ const restoreFiles = async ($, e, requests, { depth, totalChars }) => {
         fileChars: capOf(opt("restoreFileChars") ?? (await $.env.get("COMPACT_HANDOFF_RESTORE_FILE_CHARS")), RESTORE_FILE_CHARS),
         totalChars: Math.min(capOf(opt("restoreTotalChars") ?? (await $.env.get("COMPACT_HANDOFF_RESTORE_TOTAL_CHARS")), RESTORE_TOTAL_CHARS), totalChars),
     };
-    const chosen = chooseRestores({ requests, candidates: restoreCandidates(e.messages), maxFiles: caps.maxFiles });
+    const chosen = await chooseRestores({
+        requests,
+        candidates: restoreCandidates(e.messages),
+        maxFiles: caps.maxFiles,
+        exists: (path) => existsOnDisk($, path),
+    });
     const read = [];
 
     for (const file of chosen.files) {
@@ -851,6 +857,20 @@ const restoreFiles = async ($, e, requests, { depth, totalChars }) => {
             ms: Date.now() - startedAt,
         },
     };
+};
+
+/**
+ * Whether a file is still there; an unanswerable check counts as yes, so the read decides.
+ *
+ * @param {import('claude-code').EngineInterface} $
+ * @param {string} path
+ */
+const existsOnDisk = async ($, path) => {
+    try {
+        return await $.fs.exists(path);
+    } catch {
+        return true;
+    }
 };
 
 const readRestore = async ($, file, fileChars) => {
@@ -1168,8 +1188,14 @@ const COMMITMENTS_MS = 120_000;
 /** The ceiling on the whole assembly, after which the summary ships by itself. */
 const PARTS_MS = 130_000;
 
-/** The model the commitments pass runs on, measured at $0.14 a compaction. */
-const COMMITMENT_MODEL = "claude-sonnet-5";
+/**
+ * The model the commitments pass runs on. Opus, because the pass is judgement:
+ * on Sonnet 5 it filed a step handed to the user as the assistant's own unkept
+ * promise, and one question under two kinds. Operator, 2026-09-28
+ * (op:2026-09-28-0603-c95a): "Let's use opus 5.5 as that will likely not make
+ * the same mistakes."
+ */
+const COMMITMENT_MODEL = "claude-opus-5-5";
 
 /** The most the commitments reply may run to; the engine's own ceiling for `$.model.complete`. */
 const COMMITMENT_MAX_TOKENS = 8192;
@@ -1268,8 +1294,10 @@ const liveState = async ($) => {
     const [branch, root, dirty, prs, log, model, agents] = await Promise.all([
         readCommand($, ["git", "rev-parse", "--abbrev-ref", "HEAD"]),
         readCommand($, ["git", "rev-parse", "--show-toplevel"]),
-        readCommand($, ["git", "status", "--short"]),
-        readCommand($, ["gh", "pr", "list", "--state", "open", "--limit", "10", "--json", "number,headRefName"]),
+        // A submodule holding only untracked files (another session's worktrees)
+        // is not a change anyone here made; tracked edits inside one still show.
+        readCommand($, ["git", "status", "--short", "--ignore-submodules=untracked"]),
+        readCommand($, ["gh", "pr", "list", "--state", "open", "--limit", "10", "--json", "number,headRefName,title"]),
         readCommand($, ["git", "log", "--oneline", "-5"]),
         safely($, () => $.session.model()),
         safely($, () => $.agent.list()),
@@ -1290,7 +1318,7 @@ const liveState = async ($) => {
     }
 
     if (prs !== null) {
-        rows.push(`| open PRs | ${summarisePrs(prs, branch)} |`);
+        rows.push(`| open PRs, whole repo | ${summarisePrs(prs, branch)} |`);
     }
 
     // A subagent still running when the conversation compacts reports into a
@@ -1478,6 +1506,8 @@ Rules that decide the hard cases:
 - Do not report intentions about the far future ("eventually we could"), only things the assistant took on.
 - Do not invent turn numbers. Every row carries the turn the quoted sentence actually appears in.
 - Quote the assistant's own words. A paraphrase is worthless here: the next session needs to recognise the promise.
+- Only what the assistant took on itself counts. A step it handed to the user ("your next step: restart and run /compact", "try it and tell me") is the user's, not an unkept commitment, even when the conversation ends before the user does it. A promise the assistant made to act once the user does something ("then ask me and I'll check it") IS a commitment; report it once, and say in the note that it waits on the user.
+- One finding, one row. A question put to the user that was never answered is UNANSWERED and nothing else; do not also report it as UNKEPT.
 - A problem the assistant identified and said needed a fix, a filter, a cap, a strategy or a design, where no fix, filter, cap, strategy or design appears later, is UNKEPT. Naming a problem and moving on is the most common shape this takes.
 - A commitment to check a list of things, where only some of them are checked, is UNKEPT for the remainder. Say which ones.
 
@@ -1766,7 +1796,7 @@ const renderToolUse = (use) => {
     const outcome =
         typeof use.text === "string" && use.text !== "" ? `\n  -> ${clip(use.text)}` : "";
 
-    return `- ${use.name}(${input})${use.isError === true ? " ERROR" : ""}${outcome}`;
+    return `- ${nameOf(use)}(${input})${use.isError === true ? " ERROR" : ""}${outcome}`;
 };
 
 const clip = (raw) => {

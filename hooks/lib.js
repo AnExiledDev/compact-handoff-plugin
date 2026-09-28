@@ -667,7 +667,33 @@ export const commitmentsFrom = (reply) => {
         });
     }
 
-    return found.filter((row) => row.quote.toLowerCase() !== "none");
+    return dedupeFindings(found.filter((row) => row.quote.toLowerCase() !== "none"));
+};
+
+/**
+ * Which kind wins when the pass files one sentence under two. A question the
+ * user never answered is also, loosely, something the assistant still owes,
+ * and a live 0.11.0 handoff listed it both ways; the narrower kind says more.
+ */
+const KIND_RANK = { corrected: 0, unanswered: 1, unkept: 2 };
+
+/** @param {string} quote */
+const quoteKey = (quote) => quote.toLowerCase().replace(/\s+/gu, " ").replace(/[\s.,;:!?]+$/u, "").trim();
+
+/** One row per quoted sentence, in first-seen order, under its most specific kind. */
+const dedupeFindings = (found) => {
+    const kept = new Map();
+
+    for (const row of found) {
+        const key = quoteKey(row.quote);
+        const prior = kept.get(key);
+
+        if (prior === undefined || KIND_RANK[row.kind] < KIND_RANK[prior.kind]) {
+            kept.set(key, row);
+        }
+    }
+
+    return [...kept.values()];
 };
 
 export const renderCommitments = (findings) => {
@@ -970,7 +996,14 @@ const round6 = (n) => Math.round(n * 1e6) / 1e6;
  * Small shared helpers.
  * ------------------------------------------------------------------ */
 
-/** The open PRs, with the one on this branch called out. */
+/** Longest PR title shown in the state table. */
+export const PR_TITLE_CHARS = 60;
+
+/**
+ * The repository's open PRs by number and title, with the one on this branch
+ * called out. They are the whole repo's, not this session's; the title is what
+ * lets the next session tell the two apart.
+ */
 export const summarisePrs = (json, branch) => {
     let prs = [];
 
@@ -984,9 +1017,19 @@ export const summarisePrs = (json, branch) => {
         return "none open";
     }
 
-    return prs
-        .map((pr) => `#${pr.number}${pr.headRefName === branch ? " (this branch)" : ""}`)
-        .join(", ");
+    return prs.map((pr) => `#${pr.number}${prTitle(pr.title)}${pr.headRefName === branch ? " (this branch)" : ""}`).join("; ");
+};
+
+/** A title fit for one table cell: no pipe to split it, clipped to a glance. */
+/** @param {unknown} title */
+const prTitle = (title) => {
+    if (typeof title !== "string" || title.trim() === "") {
+        return "";
+    }
+
+    const flat = title.replace(/[|\n]+/gu, " ").replace(/\s+/gu, " ").trim();
+
+    return ` ${flat.length <= PR_TITLE_CHARS ? flat : `${flat.slice(0, PR_TITLE_CHARS - 3)}...`}`;
 };
 
 export const clipTo = (text, limit) => (text.length <= limit ? text : `${text.slice(0, limit)}[...]`);

@@ -26,16 +26,8 @@ Six parts. Only the first is a model summarising a conversation.
    compaction. Until 0.2.0 every earlier compaction's rows were merged in too,
    and by the tenth compaction of one session that was 65k of an 82k-character
    handoff, a quarter of a 200k window spent re-reading history every turn.
-3. **Session state**, read live from `git` and `gh` as the handoff is written:
-   branch, working tree, uncommitted files, open PRs, the last five commits, the
-   session's model, and any agents still running. It describes the moment of
-   compaction and nothing else. A row that cannot be read is left out rather
-   than guessed at.
-4. **Commitments and open questions**, from one `claude -p` pass over the
-   assistant's own turns. The fact it looks for is an absence: "let me check X"
-   is easy to find, but what matters is that nothing after it ever checked X,
-   and no pattern sees that. Two rounds of prompt wording could not move that
-   class of fact; one model call moved it from 35.7% to 73.8%.
+3. **Session state**, read live from `git` and `gh` as the handoff is written: branch, working tree, uncommitted files, the repository's open PRs by number and title (the whole repo's, not only this session's), the last five commits, the session's model, and any agents still running. A submodule holding nothing but untracked files is not listed as a change. It describes the moment of compaction and nothing else. A row that cannot be read is left out rather than guessed at.
+4. **Commitments and open questions**, from one model pass over the assistant's own turns, on `claude-opus-5-5` since 0.11.1 (Sonnet 5 before). The fact it looks for is an absence: "let me check X" is easy to find, but what matters is that nothing after it ever checked X, and no pattern sees that. Two rounds of prompt wording could not move that class of fact; one model call moved it from 35.7% to 73.8%. A step handed to the user is not counted as the assistant's, and one sentence is reported once, under its most specific kind.
 5. **Every user turn, verbatim**, selected by the engine's own `handle` and
    handed back as its words alone, so nothing is rebuilt from a paraphrase.
    Until 0.7.0 the turn went back *with* its handle, which hands the engine's
@@ -55,27 +47,7 @@ Six parts. Only the first is a model summarising a conversation.
    its instruction bundle once, and the first real turn cost 58k tokens
    where 0.6.0 had cost 124k. (`withHandles` is a field of the forced-run
    record `compact_force` writes to `runs.jsonl`, not of the index row.)
-6. **The files the next window should have open**, chosen by the summariser
-   (0.3.0). Claude Code's own compaction re-attaches up to five of the most
-   recently read files, and that path never runs when a hook answers the
-   event, so until 0.3.0 a handoff came back with none. Now the fork ends its
-   summary with a `<restore-files>` block naming up to five files, each by
-   absolute path with `all` or a line range and a reason. The code only
-   refuses: a path the session never read or wrote, a `CLAUDE.md` or
-   `AGENTS.md` (the engine re-emits those itself), a duplicate, anything past
-   the cap. When nothing usable was named, the most recently touched files go
-   instead and the row says `source: "recency"`. Each file is re-read through
-   the real Read tool, so a file edited mid-session comes back current; a read
-   that is denied, errors or takes over 20 seconds falls back to the text of
-   the transcript's last Read of it (`source: "stored"`). Each one is handed up
-   as a real `Read` tool_use and its tool_result, not a narration of one, so
-   the next window treats it exactly as a file it read. Per file 20,000
-   characters, 100,000 in all, both clipped rather than dropped past the file
-   cap and dropped past the total, and never past the size guard's ceiling.
-   Every cap is a setting below, and `record.restore` carries what would be
-   needed to move one: source, requested, restored, every rejection and why,
-   and per file the lines, chars, approximate tokens, clipped chars and
-   milliseconds. `handoff_status` sums them under `restores`.
+6. **The files the next window should have open**, chosen by the summariser (0.3.0). Claude Code's own compaction re-attaches up to five of the most recently read files, and that path never runs when a hook answers the event, so until 0.3.0 a handoff came back with none. Now the fork ends its summary with a `<restore-files>` block naming up to five files, each by absolute path with `all` or a line range and a reason. The code only refuses: a path the session never read or wrote, a `CLAUDE.md` or `AGENTS.md` (the engine re-emits those itself), a duplicate, anything past the cap, and since 0.11.1 a file no longer on disk (`no longer exists on disk`). When nothing usable was named, the most recently touched files that still exist go instead and the row says `source: "recency"`. Each file is re-read through the real Read tool, so a file edited mid-session comes back current; a read that is denied, errors or takes over 20 seconds falls back to the text of the transcript's last Read of it (`source: "stored"`). Each one is handed up as a real `Read` tool_use and its tool_result, not a narration of one, so the next window treats it exactly as a file it read. Per file 20,000 characters, 100,000 in all, both clipped rather than dropped past the file cap and dropped past the total, and never past the size guard's ceiling. Every cap is a setting below, and `record.restore` carries what would be needed to move one: source, requested, restored, every rejection and why, and per file the lines, chars, approximate tokens, clipped chars and milliseconds. `handoff_status` sums them under `restores`.
 
 Parts 2 to 4 are gathered concurrently and every one of them may fail. A part
 that throws, times out or comes back empty is left out and named in the row; the
@@ -584,7 +556,7 @@ There is no spend ceiling. Every main-thread compaction goes to the fork whateve
 | --- | --- | --- |
 | `COMPACT_HANDOFF_LIVE` | off | Off, it rehearses and the engine still compacts. On, it answers the event and the engine's summariser never runs. |
 | `COMPACT_HANDOFF_DATA_DIR` | `~/.claude/compact-handoff` | Where handoffs, rows and transcripts are kept. |
-| `COMPACT_HANDOFF_MODEL` | the session's | The model the commitments pass runs on. An alias (`haiku`) or a full id. |
+| `COMPACT_HANDOFF_MODEL` | the session's | The model the handoff-writing fork runs on. An alias (`haiku`) or a full id. The commitments pass does not read it; it is fixed at `claude-opus-5-5`. |
 | `COMPACT_HANDOFF_MAX_CHARS` | unset | An absolute ceiling in characters that overrides the two settings below. Never clamped, because setting it is a deliberate act; past 800000 characters (the 200k-token safe cap) the row records `overSafeCapChars` and `overSafeCapTokens` rather than refusing. The summary is never trimmed, at any size. |
 | `COMPACT_HANDOFF_MAX_FRACTION` | `0.25` | The share of the context window a handoff may take, at four characters a token. Values outside (0, 1] fall back to the default. |
 | `COMPACT_HANDOFF_MAX_TOKENS` | `150000` | The most a handoff may be in tokens whatever the window, so a million-token window does not hand a quarter of a million up. Clamped to `200000`. The ceiling is min(fraction × window, this) × 4 characters, and `400000` characters when the window cannot be read. |

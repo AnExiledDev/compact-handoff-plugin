@@ -1563,6 +1563,19 @@ const fnv1a = (text) => {
     return hash;
 };
 
+/**
+ * The last reading of a watch that another compaction is about to replace.
+ *
+ * The transcript it is read over does not hold the new opener yet, so
+ * `observePost` cannot see the compaction that ends the watch; an anchored
+ * watch was compacted again by definition.
+ */
+export const closedByCompaction = (monitor, messages) => {
+    const observed = observePost(monitor, messages);
+
+    return { ...observed, compactedAgain: observed.anchored, done: true };
+};
+
 /** The opener this monitor was armed for, or null when the transcript does not hold it. */
 const openerWatched = (monitor, openers) => {
     const opener = openers[monitor.ordinal] ?? null;

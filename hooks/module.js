@@ -230,6 +230,7 @@ import {
     abArmFor,
     applySizeGuard,
     assistantTurns,
+    closedByCompaction,
     commitmentsFrom,
     commitmentsOutcome,
     costOf,
@@ -559,6 +560,12 @@ export const register = (on, pluginOptions) => {
 
         record.ab = await assignedArm($, record.sessionId);
 
+        // A subagent's compaction is another conversation; the main session's
+        // watch is not ended by it.
+        if (record.agentId === null) {
+            await safely($, () => closeWatch($, record.sessionId));
+        }
+
         if (record.ab?.arm === "stock") {
             return compactStock($, e, next, record, startedAt);
         }
@@ -728,7 +735,7 @@ export const register = (on, pluginOptions) => {
  * empty table, so nothing at the fold can read the manifest. `test/module.test.js`
  * asserts it against `.claude-plugin/plugin.json` so the two cannot drift.
  */
-export const PLUGIN_VERSION = "0.12.0";
+export const PLUGIN_VERSION = "0.12.1";
 
 /** How long one subscriber may run before the compaction goes on without it. */
 const DEFAULT_SEAM_TIMEOUT_MS = 90_000;
@@ -2852,6 +2859,28 @@ const watchWindow = async ($) => {
     });
 
     await safely($, async () => appendLine($, `${await dataDir($)}/${WINDOW_LOG}`, JSON.stringify(row)));
+};
+
+/**
+ * Writes the watch a compaction is about to replace, before it is lost.
+ *
+ * A watch is only written at the end of a turn, so without this a compaction
+ * that comes before the first turn ends leaves the previous one with no record,
+ * and the quickest re-compaction is the one "compacted again" never counts.
+ */
+const closeWatch = async ($, session) => {
+    const monitor = watches.get(session);
+
+    if (monitor === undefined) {
+        return;
+    }
+
+    watches.delete(session);
+
+    const observed = closedByCompaction(monitor, await $.session.messages());
+    const dir = await runDir($, monitor.session, monitor.disposition);
+
+    await $.fs.write(`${dir}/${monitor.stem}.post.json`, `${JSON.stringify(observed, null, 2)}\n`);
 };
 
 /**

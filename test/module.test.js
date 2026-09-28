@@ -2,8 +2,9 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
+import { priceUsage } from "../hooks/lib.js";
 import { PLUGIN_VERSION } from "../hooks/module.js";
-import { assistantTurn, fakeApi, fakeRuntime, passThrough, userTurn } from "./fixtures.js";
+import { answered, assistantTurn, fakeApi, fakeRuntime, noUsage, passThrough, userTurn } from "./fixtures.js";
 
 // `node --check` reads module.js as a script and never sees an `await` in a
 // non-async arrow; 0.2.0 shipped one and only `claude plugin validate` caught
@@ -382,7 +383,7 @@ describe("a subscriber on the seam", () => {
                 await withDeadline(seamIsRunning, "the seam");
                 forkSawTheSeam = true;
 
-                return { text: "A handoff.", usage: { input_tokens: 1 } };
+                return answered("A handoff.", { input_tokens: 1 });
             },
         };
 
@@ -482,26 +483,6 @@ describe("a subscriber on the seam", () => {
             host.stopTimers();
         }
     });
-
-    it("is not raised once the session is over its budget", async () => {
-        const runtime = await seamRegistered();
-        const host = seamHost({ env: { COMPACT_HANDOFF_MAX_USD_PER_SESSION: "0" } });
-        const noun = await seamNoun(runtime, host.$);
-
-        await noun.beforeCompact({ tool: SEAM_TOOL, name: "memory-handoff" });
-
-        try {
-            await runtime.dispatch("session.compact", host.$, compaction(), compactNext());
-
-            const row = lastRow(host);
-
-            assert.equal(row.disposition, "overBudget");
-            assert.equal(row.seam, undefined);
-            assert.equal(seamRaises(host).length, 0);
-        } finally {
-            host.stopTimers();
-        }
-    });
 });
 
 /* ------------------------------------------------------------------ *
@@ -563,7 +544,7 @@ describe("a fork charged for a fraction of the session's context", () => {
             env: { COMPACT_HANDOFF_LIVE: "1" },
             files: { "/plugin/.runs/latest.md": "THE HANDOFF ON DISK" },
             messages: [userTurn("go"), assistantTurn("done")],
-            model: { fork: async () => ({ text: "A SUMMARY OF SOME OTHER CONVERSATION", usage }) },
+            model: { fork: async () => answered("A SUMMARY OF SOME OTHER CONVERSATION", usage) },
             session: { usage: async () => ({ context: { tokens: 164_273, window: 200_000, percent: 82 } }) },
         });
 
@@ -628,5 +609,522 @@ describe("a fork charged for a fraction of the session's context", () => {
         );
 
         assert.equal(host.rowsIn("index.jsonl").at(-1).forkInput, null);
+    });
+});
+
+/* ------------------------------------------------------------------ *
+ * The model calls, read as the result unions engine 2.1.280 resolves.
+ * ------------------------------------------------------------------ */
+
+/** A fork that read this conversation: charged for at least the 12k context the fixture reports. */
+const warmForkUsage = {
+    input_tokens: 10,
+    output_tokens: 400,
+    cache_read_input_tokens: 12_000,
+    cache_creation_input_tokens: 0,
+};
+
+/**
+ * The commitments pass has to see its reply, or the handoff ships without the
+ * one section a reading cannot produce. A string check read every result object
+ * as an empty reply, so the section vanished and nothing on the row said why.
+ */
+describe("the commitments pass, read as the result the engine resolves", () => {
+    const COMMITMENT = "UNKEPT | T2 | I will rerun the gate | no later run appears";
+
+    /** A live session whose fork answers, so the assembled handoff is handed up. */
+    const committingHost = (complete) =>
+        seamHost({
+            env: { COMPACT_HANDOFF_LIVE: "1" },
+            messages: [userTurn("go"), assistantTurn("I will rerun the gate.")],
+            model: { fork: async () => answered("THE FORK'S SUMMARY", warmForkUsage), complete },
+        });
+
+    it("carries an answered reply's commitments into the handoff, priced from the reply's own usage", async () => {
+        const runtime = await seamRegistered();
+        const passUsage = {
+            input_tokens: 1_000_000,
+            output_tokens: 1000,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        };
+        const host = committingHost(async () => answered(COMMITMENT, passUsage));
+
+        try {
+            const answer = await runtime.dispatch("session.compact", host.$, compaction(), compactNext());
+            const parts = lastRow(host).parts;
+            const handedUp = JSON.stringify(answer.messages);
+
+            assert.ok(handedUp.includes("I will rerun the gate"), "the commitment reached the handoff");
+            assert.equal(parts.commitmentsReplyChars, COMMITMENT.length);
+            assert.equal(parts.commitmentsRows, 1);
+            // A million input tokens is what the API counted; four characters a
+            // token over this prompt would price a few thousand.
+            assert.equal(parts.commitmentsCostUsd, priceUsage(passUsage, parts.commitmentsModel).usd);
+            assert.match(parts.commitmentsCostBasis, /^measured/u);
+        } finally {
+            host.stopTimers();
+        }
+    });
+
+    it("hands the handoff up without the section when the pass went unanswered, and says why", async () => {
+        const runtime = await seamRegistered();
+        const host = committingHost(async () => ({
+            isAnswered: false,
+            reason: "api-error",
+            status: 529,
+            error: "overloaded",
+            usage: noUsage(),
+        }));
+
+        try {
+            const answer = await runtime.dispatch("session.compact", host.$, compaction(), compactNext());
+            const row = lastRow(host);
+            const handedUp = JSON.stringify(answer.messages);
+
+            assert.equal(row.disposition, "replaced");
+            assert.ok(handedUp.includes("THE FORK'S SUMMARY"));
+            assert.ok(!handedUp.includes("Commitments and open questions"));
+            assert.equal(row.parts.commitmentsReplyChars, 0);
+            assert.equal(row.parts.commitmentsUnanswered, "api-error");
+            assert.equal(row.parts.commitmentsStatus, 529);
+        } finally {
+            host.stopTimers();
+        }
+    });
+});
+
+/**
+ * A fork resolves a named reason when it has no reply, never null. Each one is
+ * a fallback to the handoff on disk that the row names, and never a TypeError
+ * the row can only call `threw`.
+ */
+describe("a fork the engine left unanswered", () => {
+    const spent = { input_tokens: 90_000, output_tokens: 12, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
+    const arms = [
+        { isAnswered: false, reason: "nothing-to-fork" },
+        { isAnswered: false, reason: "api-error", status: 500, error: "server_error", usage: noUsage() },
+        { isAnswered: false, reason: "empty-reply", usage: spent },
+        { isAnswered: false, reason: "aborted", usage: noUsage() },
+    ];
+
+    for (const arm of arms) {
+        it(`records ${arm.reason} and falls back to the handoff on disk`, async () => {
+            const runtime = await registered();
+            const host = fakeApi({
+                env: { COMPACT_HANDOFF_LIVE: "1" },
+                files: { "/plugin/.runs/latest.md": "THE HANDOFF ON DISK" },
+                messages: [userTurn("go"), assistantTurn("done")],
+                model: { fork: async () => arm },
+            });
+
+            host.store.set("ready", { messages: 2, at: new Date().toISOString() });
+
+            const answer = await runtime.dispatch("session.compact", host.$, compaction(), passThrough());
+            const row = lastRow(host);
+
+            assert.equal(row.forkOutcome, arm.reason);
+            assert.equal(row.outcome, "handoff");
+            assert.ok(JSON.stringify(answer.messages).includes("THE HANDOFF ON DISK"));
+        });
+    }
+
+    // The request was made and paid for even though nothing came back.
+    it("keeps what an unanswered fork spent on the row", async () => {
+        const runtime = await registered();
+        const host = fakeApi({ model: { fork: async () => arms[2] } });
+
+        await runtime.dispatch("session.compact", host.$, compaction(), passThrough());
+
+        assert.equal(lastRow(host).usage.input_tokens, 90_000);
+    });
+});
+
+/**
+ * A fork that never comes back must not hold the person's compaction for as
+ * long as the request runs. Past its bound the compaction falls back to the
+ * handoff on disk, and whatever the fork answers afterwards is dropped.
+ */
+describe("a fork that runs past its bound", () => {
+    // `clock.sleep` resolves at once here, so the bound expires the moment the
+    // fork is raised; the real clock is left to the fork alone.
+    const fallbackHost = (fork) => {
+        const host = fakeApi({
+            env: { COMPACT_HANDOFF_LIVE: "1" },
+            files: { "/plugin/.runs/latest.md": "THE HANDOFF ON DISK" },
+            messages: [userTurn("go"), assistantTurn("done")],
+            model: { fork },
+        });
+
+        host.store.set("ready", { messages: 2, at: new Date().toISOString() });
+
+        return host;
+    };
+
+    it("falls back to the handoff on disk and records a timeout", async () => {
+        const runtime = await registered();
+        const host = fallbackHost(() => new Promise(() => {}));
+
+        const answer = await withDeadline(
+            runtime.dispatch("session.compact", host.$, compaction(), passThrough()),
+            "the compaction",
+        );
+        const row = lastRow(host);
+
+        assert.equal(row.forkOutcome, "timeout");
+        assert.equal(row.outcome, "handoff");
+        assert.ok(JSON.stringify(answer.messages).includes("THE HANDOFF ON DISK"));
+    });
+
+    it("drops what the fork answers after the bound", async () => {
+        const runtime = await registered();
+        const lateReply = answered("THE LATE FORK", warmForkUsage);
+        const host = fallbackHost(() => new Promise((resolve) => void setTimeout(() => resolve(lateReply), 30)));
+
+        const answer = await runtime.dispatch("session.compact", host.$, compaction(), passThrough());
+
+        await new Promise((resolve) => void setTimeout(resolve, 90));
+
+        const written = [...host.files.values(), ...host.appends.map((entry) => entry.line)].join("\n");
+
+        assert.equal(host.rowsIn("index.jsonl").length, 1);
+        assert.equal(lastRow(host).forkOutcome, "timeout");
+        assert.ok(!JSON.stringify(answer.messages).includes("THE LATE FORK"));
+        assert.ok(!written.includes("THE LATE FORK"), "nothing the late fork said was written");
+    });
+});
+
+/* ------------------------------------------------------------------ *
+ * The settings, as the engine hands them to `register`.
+ * ------------------------------------------------------------------ */
+
+const manifestSettings = () =>
+    JSON.parse(readFileSync(new URL("../.claude-plugin/plugin.json", import.meta.url), "utf8")).userConfig;
+
+/**
+ * `register`'s options the way the engine builds them: what the person stored
+ * for each declared field, else that field's declared default, and no key at
+ * all for a field with neither.
+ */
+const engineOptions = (stored = {}) => {
+    const options = {};
+
+    for (const [key, field] of Object.entries(manifestSettings())) {
+        const value = stored[key] ?? field.default;
+
+        if (value !== undefined) {
+            options[key] = value;
+        }
+    }
+
+    return options;
+};
+
+/**
+ * Every setting was an environment variable first, and a setting nobody touched
+ * has to leave the variable in charge. A declared default the module reads as
+ * set silently overrides the variable for everyone who never opened the menu.
+ */
+describe("a setting nobody touched leaves its environment variable in charge", () => {
+    const registeredWith = async (options) => {
+        const runtime = fakeRuntime();
+
+        (await import("../hooks/module.js")).register(runtime.on, options);
+
+        return runtime;
+    };
+
+    const dispositionOf = async (options, env) => {
+        const runtime = await registeredWith(options);
+        const host = seamHost({
+            env,
+            messages: [userTurn("go"), assistantTurn("done")],
+            model: { fork: async () => answered("THE FORK'S SUMMARY", warmForkUsage) },
+        });
+
+        try {
+            await runtime.dispatch("session.compact", host.$, compaction(), compactNext());
+
+            return lastRow(host).disposition;
+        } finally {
+            host.stopTimers();
+        }
+    };
+
+    it("answers the compaction when live is unset and COMPACT_HANDOFF_LIVE is on", async () => {
+        assert.equal(await dispositionOf(engineOptions(), { COMPACT_HANDOFF_LIVE: "1" }), "replaced");
+    });
+
+    it("rehearses when live is set off, whatever the variable says", async () => {
+        assert.equal(await dispositionOf(engineOptions({ live: false }), { COMPACT_HANDOFF_LIVE: "1" }), "rehearsed");
+    });
+
+    it("answers the compaction when live is set on and no variable is", async () => {
+        assert.equal(await dispositionOf(engineOptions({ live: true }), {}), "replaced");
+    });
+
+    it("declares no default the module would read as a setting", () => {
+        const masking = Object.entries(manifestSettings())
+            .filter(([, field]) => "default" in field && field.default !== "" && field.default !== 0)
+            .map(([key]) => key);
+
+        assert.deepEqual(masking, []);
+    });
+});
+
+/**
+ * A session's spend is not a reason to stop handing off. The sessions that
+ * compact most are the long ones, which are the ones that most need a good
+ * handoff, and a sum across compactions cut them off exactly there.
+ */
+describe("a session that has already spent more than $10 on handoffs", () => {
+    const sessionLog = "/home/nobody/.claude/compact-handoff/sessions/session-under-test/runs.jsonl";
+
+    /** Earlier rows summing to $13.50, the last one refused as overBudget by an older plugin. */
+    const expensiveHistory = () =>
+        [
+            { depth: 1, disposition: "replaced", cost: { totalUsd: 4.5 } },
+            { depth: 2, disposition: "replaced", cost: { totalUsd: 4.5 } },
+            { depth: 3, disposition: "replaced", cost: { totalUsd: 4.5 } },
+            {
+                depth: 4,
+                disposition: "overBudget",
+                outcome: "overBudget",
+                spentUsd: 13.5,
+                ceilingUsd: 10,
+                cost: { totalUsd: 0 },
+                fallbackReason: "overBudget: $13.50 spent this session against a $10.00 ceiling",
+            },
+        ]
+            .map((row) => JSON.stringify(row))
+            .join("\n");
+
+    it("still forks on the next compaction", async () => {
+        const runtime = await registered();
+        let forks = 0;
+        const host = seamHost({
+            files: { [sessionLog]: expensiveHistory() },
+            messages: [userTurn("go"), assistantTurn("done")],
+            model: {
+                fork: async () => {
+                    forks += 1;
+
+                    // Read over the whole 12k-token context the fixture holds,
+                    // so the answer is this conversation's and is handed up.
+                    return answered("A handoff.", { input_tokens: 10, cache_read_input_tokens: 12_000 });
+                },
+            },
+        });
+
+        try {
+            await runtime.dispatch("session.compact", host.$, compaction(), compactNext());
+
+            const row = lastRow(host);
+
+            assert.equal(forks, 1);
+            assert.notEqual(row.disposition, "overBudget");
+            assert.equal(row.outcome, "handoff");
+        } finally {
+            host.stopTimers();
+        }
+    });
+
+    it("reads back through handoff_status, old overBudget row and all, with no ceiling in it", async () => {
+        const runtime = await registered();
+        const host = fakeApi({ files: { [sessionLog]: expensiveHistory() } });
+
+        const answer = await runtime.dispatch("tool.call", host.$, { tool: "mcp__compact-handoff__handoff_status" });
+        const status = JSON.parse(answer.result);
+
+        assert.equal(status.spentUsd, 13.5);
+        assert.equal(status.last.disposition, "overBudget");
+        assert.equal(status.runs.length, 4);
+        assert.equal("ceilingUsd" in status, false);
+    });
+
+    it("lists the old overBudget row through handoff_list", async () => {
+        const runtime = await registered();
+        const host = fakeApi({ files: { [sessionLog]: expensiveHistory() } });
+
+        const answer = await runtime.dispatch("tool.call", host.$, { tool: "mcp__compact-handoff__handoff_list" });
+        const listed = JSON.parse(answer.result);
+
+        assert.deepEqual(
+            listed.map((row) => row.disposition),
+            ["replaced", "replaced", "replaced", "overBudget"],
+        );
+    });
+});
+
+/**
+ * The engine runs `$.model.fork` as a query loop over the main thread's
+ * transcript plus the fork prompt, and checks that loop for auto-compaction
+ * like any other. When the main thread crossed its threshold by less than the
+ * prompt's size, the fork loop is over it too, so the engine dispatches a
+ * second `session.compact` carrying the fork loop's `agentId` while this
+ * plugin's own compaction is still waiting on the fork. Passing that one
+ * through lets the engine summarise the fork loop, and the fork then answers
+ * over the summary: charged for a fraction of the context, a cold fork.
+ *
+ * The fake fork does what the engine does: it dispatches the nested
+ * compaction through the same hooks, then answers over the engine's summary
+ * when it was passed through, or over the whole conversation when skipped.
+ */
+describe("the plugin's own fork, compacted by the engine while the compaction waits on it", () => {
+    const conversation = [userTurn("go"), assistantTurn("done")];
+    const context = { tokens: 67_500, window: 100_000, percent: 67 };
+    const overSummary = {
+        input_tokens: 21_000,
+        output_tokens: 3000,
+        cache_read_input_tokens: 4000,
+        cache_creation_input_tokens: 0,
+    };
+    const overConversation = {
+        input_tokens: 1500,
+        output_tokens: 3000,
+        cache_read_input_tokens: 66_000,
+        cache_creation_input_tokens: 0,
+    };
+
+    /** A live session whose fork meets the nested compaction, and a subagent's beside it if asked. */
+    const nestingHost = (runtime, { subagentCompacts = false } = {}) => {
+        const seen = { prompt: null, own: null, subagent: null };
+        const host = fakeApi({
+            env: { COMPACT_HANDOFF_LIVE: "1" },
+            files: { "/plugin/.runs/latest.md": "THE HANDOFF ON DISK" },
+            messages: conversation,
+            session: { usage: async () => ({ context }) },
+            // The fork's wall-clock bound races `clock.sleep`, which the
+            // fixture resolves at once; this fork awaits the nested dispatch,
+            // so it has to be given a clock that never runs out.
+            clock: { sleep: () => new Promise(() => {}) },
+            model: {
+                fork: async ({ prompt }) => {
+                    seen.prompt = prompt;
+
+                    if (subagentCompacts) {
+                        seen.subagent = await runtime.dispatch(
+                            "session.compact",
+                            host.$,
+                            {
+                                trigger: "auto",
+                                agentId: "agent-7",
+                                messages: [userTurn("survey the repo"), assistantTurn("reading")],
+                                instructions: "",
+                            },
+                            passThrough(),
+                        );
+                    }
+
+                    seen.own = await runtime.dispatch(
+                        "session.compact",
+                        host.$,
+                        {
+                            trigger: "auto",
+                            agentId: "fork-loop",
+                            messages: [...conversation, userTurn(prompt)],
+                            instructions: "",
+                        },
+                        passThrough(),
+                    );
+
+                    return seen.own?.passedThrough === true
+                        ? { isAnswered: true, text: "A HANDOFF OF THE ENGINE'S SUMMARY", usage: overSummary }
+                        : { isAnswered: true, text: "A HANDOFF OF THE WHOLE CONVERSATION", usage: overConversation };
+                },
+            },
+        });
+
+        return { host, seen };
+    };
+
+    const autoCompaction = () => ({ trigger: "auto", agentId: null, messages: conversation, instructions: "" });
+
+    const rowOf = (host, agentId) => host.rowsIn("index.jsonl").find((row) => row.agentId === agentId);
+
+    it("declines the fork loop's compaction, so the fork reads the whole conversation and is handed up", async () => {
+        const runtime = await registered();
+        const { host, seen } = nestingHost(runtime);
+
+        const answer = await runtime.dispatch("session.compact", host.$, autoCompaction(), passThrough());
+        const main = rowOf(host, null);
+        const forkLoop = rowOf(host, "fork-loop");
+
+        assert.equal(typeof seen.own?.skip, "string", "the nested compaction is declined, not passed through");
+        assert.equal(forkLoop.outcome, "ownFork");
+        assert.equal(forkLoop.disposition, "skipped");
+        assert.equal(main.forkInput.matchesContext, true);
+        assert.equal(main.forkOutcome, undefined);
+        assert.equal(main.outcome, "handoff");
+        assert.ok(JSON.stringify(answer.messages).includes("A HANDOFF OF THE WHOLE CONVERSATION"));
+    });
+
+    it("still passes a genuine subagent's compaction through while the fork is in flight", async () => {
+        const runtime = await registered();
+        const { host, seen } = nestingHost(runtime, { subagentCompacts: true });
+
+        await runtime.dispatch("session.compact", host.$, autoCompaction(), passThrough());
+
+        const subagent = rowOf(host, "agent-7");
+
+        assert.equal(seen.subagent?.passedThrough, true, "the engine's own compaction ran for the subagent");
+        assert.equal(subagent.outcome, "subagent");
+        assert.equal(subagent.disposition, "passedThrough");
+    });
+
+    it("declines the fork loop's compaction when the person gave /compact instructions too", async () => {
+        const runtime = await registered();
+        const { host, seen } = nestingHost(runtime);
+        const instructed = { ...autoCompaction(), trigger: "manual", instructions: "keep the migration plan" };
+
+        await runtime.dispatch("session.compact", host.$, instructed, passThrough());
+
+        assert.ok(seen.prompt.endsWith("keep the migration plan"), "the instructions ride on the fork prompt");
+        assert.equal(typeof seen.own?.skip, "string");
+        assert.equal(rowOf(host, "fork-loop").outcome, "ownFork");
+    });
+
+    it("tells the person only about the real compaction, never the declined fork loop", async () => {
+        const runtime = await registered();
+        const { host } = nestingHost(runtime);
+
+        await runtime.dispatch("session.compact", host.$, autoCompaction(), passThrough());
+
+        assert.equal(host.toasts.length, 1);
+        assert.match(host.toasts[0].text, /replaced/);
+    });
+
+    it("reports the real compaction as the last one even when the fork loop is declined after it", async () => {
+        const runtime = await registered();
+        // The fixture's exec does not append, so the session's log is seeded
+        // the way a fork loop still over the threshold leaves it.
+        const runs = [
+            { at: "2026-09-28T03:00:00.000Z", agentId: null, outcome: "handoff", disposition: "replaced", depth: 1 },
+            { at: "2026-09-28T03:00:01.000Z", agentId: "fork-loop", outcome: "ownFork", disposition: "skipped", depth: 1 },
+        ];
+        const sessionLog = "/home/nobody/.claude/compact-handoff/sessions/session-under-test/runs.jsonl";
+        const host = fakeApi({ files: { [sessionLog]: runs.map((row) => JSON.stringify(row)).join("\n") } });
+
+        const answer = await runtime.dispatch("tool.call", host.$, { tool: "mcp__compact-handoff__handoff_status" });
+        const status = JSON.parse(answer.result);
+
+        assert.equal(status.last.disposition, "replaced");
+    });
+
+    it("never declines a main-thread compaction whose transcript quotes the fork prompt", async () => {
+        const runtime = await registered();
+        const first = nestingHost(runtime);
+
+        await runtime.dispatch("session.compact", first.host.$, autoCompaction(), passThrough());
+
+        const host = fakeApi();
+        const next = passThrough();
+        const quoted = { trigger: "manual", agentId: null, messages: [userTurn(first.seen.prompt), assistantTurn("ok")], instructions: "" };
+
+        const answer = await runtime.dispatch("session.compact", host.$, quoted, next);
+
+        assert.equal(typeof first.seen.prompt, "string");
+        assert.notEqual(lastRow(host).outcome, "ownFork");
+        assert.equal(answer?.skip, undefined);
     });
 });

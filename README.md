@@ -18,27 +18,7 @@ By the same author: [changelogs.core-directive.com](https://changelogs.core-dire
 
 Six parts. Only the first is a model summarising a conversation.
 
-1. **The summary**, written by a fork of the session itself. The fork is asked
-   to enumerate before it narrates: a tagged one-line-per-fact inventory of the
-   whole conversation first, the prose reading second. That is the whole trick.
-   Prose makes the writer choose what is interesting, and the fact nobody finds
-   interesting is the one the next session needed. Through 0.4.x the fork was
-   asked with Claude Code's own nine-section summariser instruction plus a Work
-   ledger section; against the same 82-fact answer key, graded blind, the
-   inventory prompt carries 70.0% where that one carried 63.0%, and it is the
-   only arm whose worst run beat the old prompt's best.
-   The fork is also asked to reason in `<analysis>` tags before it writes, and
-   **since 0.4.2 that block is dropped before the handoff is assembled**. It is
-   still asked for, because the arm that reasons first is the one the bench
-   picked and Round 3 measured that taking work away from this model backfires;
-   it is thrown away afterwards instead. Across the 31 handoffs stored on the
-   machine it was written on, it ran 14% of the summary's characters on average
-   and 46% at its worst, and it is deliberation rather than findings: it plans
-   the summary, and it corrects itself mid-paragraph, which the next window has
-   no way to read as discarded. The `<summary>` wrapper tags go with it.
-   `analysisChars` on the row says how much was dropped. A block the model never
-   closed is left alone unless a summary follows it, because a reply cut off
-   inside the scratchpad has nothing else in it.
+1. **The summary**, written by a fork of the session itself. The fork is asked to enumerate before it narrates: a tagged one-line-per-fact inventory of the whole conversation first, the prose reading second. That is the whole trick. Prose makes the writer choose what is interesting, and the fact nobody finds interesting is the one the next session needed. Through 0.4.x the fork was asked with Claude Code's own nine-section summariser instruction plus a Work ledger section; against the same 82-fact answer key, graded blind, the inventory prompt carries 70.0% where that one carried 63.0%, and it is the only arm whose worst run beat the old prompt's best. Through 0.10.0 the fork wrote that inventory twice, first in `<analysis>` tags that were dropped before the handoff was assembled, then again as the summary's first part. Now it writes it once, straight into the summary. Over the same answer key that carried 69.4% against 67.7%, which is inside the grader's noise, and it took about a third fewer output tokens (16,777 against 24,756) and 182 s per fork against 257 s. The fork is also told to answer in one reply, call no tools and leave the session's task alone, because it inherits the session's tools and a denied tool call doesn't end it, it turns into another request that gets billed too. One fork that kept working on the session's task billed 144,745 output tokens over 24 minutes. An `<analysis>` block a model writes anyway is still dropped, along with the `<summary>` wrapper tags, and `analysisChars` on the row says how much was dropped. A block the model never closed is left alone unless a summary follows it, because a reply cut off inside the scratchpad has nothing else in it.
 2. **The tool ledger**, read off the messages, not recalled: files written,
    every shell command in order, and the ones whose output reads as a failure.
    **Nothing here is an exit code**, because the transcript does not store one,
@@ -209,16 +189,17 @@ that matter for that second case:
 
 | field | when | what it says |
 |---|---|---|
-| `disposition` | always | `replaced`, `rehearsed`, `fellBack`, `passedThrough`, `overBudget`, `abortedFallback` |
-| `fallbackReason` | every disposition but `replaced` | one line naming why, e.g. `noHandoff: no handoff has been written yet (fork cold: the fork found no warm main-thread transcript)` |
-| `cost` | always | `{forkUsd, commitmentsUsd, commitmentsBasis, totalUsd, cacheReadWaivedUsd, basis, forkUsage, model, priced, pricesTaken}`, or `null`. Since 0.4.1 cache reads are stored in `forkUsage.cacheRead` and priced into `cacheReadWaivedUsd` at list, and never added to `forkUsd` or `totalUsd`, because on a subscription they cost nothing; `basis` says so. Rows from 0.4.0 and earlier charged them. `commitmentsBasis` is `estimate: chars/4, no cache` since 0.4.0, `none` when no commitments pass ran, `measured` on rows from 0.3.0 and earlier |
+| `disposition` | always | `replaced`, `rehearsed`, `fellBack`, `passedThrough`, `abortedFallback`, `skipped` (the engine tried to compact this plugin's own fork loop and was declined). Historical rows only: `overBudget`, written by 0.10.0 and earlier when a session had spent past its USD ceiling. That ceiling is gone, and those rows still read back through every tool |
+| `fallbackReason` | every disposition but `replaced` | one line naming why, e.g. `noHandoff: no handoff has been written yet (fork nothing-to-fork: the fork found no warm main-thread transcript)` |
+| `forkOutcome`, `forkDetail` | every row whose fork was not handed up | why the fork's own answer was not used, and the fallback went to the handoff on disk. On engine 2.1.280 and later an unanswered fork records the engine's own `reason`: `nothing-to-fork` (no warm transcript yet), `api-error` (the detail carries the HTTP status and error kind), `empty-reply` or `aborted`, and the spend of any that made a request stays in `usage`. `timeout` is a fork that had not answered after five minutes: the compaction stops waiting and falls back, but the engine gives a plugin no way to cancel a fork, so the request runs on and still spends, and its answer is dropped when it arrives (that spend is on no row). `mismatch` is an answer refused by the `forkInput` check below, `threw` anything unexpected. Rows from 0.10.0 and earlier say `cold` where they now say `nothing-to-fork` (or `threw`, on engine 2.1.280 and later) |
+| `cost` | always | `{forkUsd, commitmentsUsd, commitmentsBasis, totalUsd, cacheReadWaivedUsd, basis, forkUsage, model, priced, pricesTaken}`, or `null`. Since 0.4.1 cache reads are stored in `forkUsage.cacheRead` and priced into `cacheReadWaivedUsd` at list, and never added to `forkUsd` or `totalUsd`, because on a subscription they cost nothing; `basis` says so. Rows from 0.4.0 and earlier charged them. `commitmentsBasis` is `measured: the usage the result reported` after 0.10.0, `estimate: chars/4, no cache` from 0.4.0 (and since, on a result that arrives with no usage), `none` when no commitments pass ran, `measured` on rows from 0.3.0 and earlier |
 | `maxHandoff` | every `replaced` and `rehearsed` row | the handoff ceiling the size guard used and how it was arrived at: `{window, fraction, capTokens, chars, decider}`, where `decider` is `fraction`, `cap`, `default: window unknown` or `override`; an override past the safe cap adds `overSafeCapChars` and `overSafeCapTokens` saying by how much |
 | `forkInput` | every row, `null` on the rows that never forked | what the fork was charged to read against what the session holds: `{sent, cacheRead, contextTokens, matchesContext}`. `sent` is input plus cache read plus cache write, which is the whole conversation for a warm fork and a prefix for a cold one; `matchesContext` is false when `sent` falls more than a fifth short of `contextTokens`, and that is the reading that refuses the fork's answer (`forkOutcome: "mismatch"`). Added in 0.6.0 |
 | `forkContext` | every row that forked | what the session looked like the instant before `$.model.fork`: `{context, model, messages, msSinceLastFork, subagentRanThisTurn}`, where `context` is the whole `$.session.usage().context` object (`tokens`, `window`, `percent`) and `msSinceLastFork` is `null` on a session's first fork |
-| `parts` | every `replaced` and `rehearsed` row | per-part sizes and timings; for the commitments pass, `commitmentsVia`, `commitmentsModel`, `commitmentsPromptChars`, `commitmentsReplyChars`, `commitmentsTokensEstimated`, `commitmentsCostUsd`, `commitmentsCostBasis`, and since 0.4.0 `commitmentsRows` (how many rows came back) with `commitmentsHitCap` and `commitmentsHitCapReason` (`length` or `truncated row`) saying whether the reply stopped at the 8192-token output cap |
-| `seam` | every row this plugin handled itself | `{subscribers, results}`, where each result is `{name, outcome, elapsedMs}` and `outcome` is `ok`, `threw` or `timedOut`; `{subscribers: 0}` alone when nothing subscribed. Absent on `passedThrough` and `overBudget` rows, which never reach the seam |
+| `parts` | every `replaced` and `rehearsed` row | per-part sizes and timings; for the commitments pass, `commitmentsVia`, `commitmentsModel`, `commitmentsPromptChars`, `commitmentsReplyChars`, `commitmentsTokensEstimated` (null when the cost is measured), `commitmentsCostUsd`, `commitmentsCostBasis`, after 0.10.0 `commitmentsUnanswered` (the engine's `reason` when the call came back with no reply) and `commitmentsStatus` (the HTTP status on an `api-error`, null when no response arrived), and since 0.4.0 `commitmentsRows` (how many rows came back) with `commitmentsHitCap` and `commitmentsHitCapReason` (`length` or `truncated row`) saying whether the reply stopped at the 8192-token output cap |
+| `seam` | every row this plugin handled itself | `{subscribers, results}`, where each result is `{name, outcome, elapsedMs}` and `outcome` is `ok`, `threw` or `timedOut`; `{subscribers: 0}` alone when nothing subscribed. Absent on `passedThrough` and `skipped` rows, which never reach the seam, and on the historical `overBudget` rows of 0.10.0 and earlier |
 | `costUnknownReason` | when `cost` is `null` | why it could not be priced. A run is never priced at 0 because its usage was missing |
-| `costNote` | when nothing was spent | `no model call was made`. A pass-through and a refusal over budget cost a real zero, which is not the same as unknown |
+| `costNote` | when nothing was spent | `no model call was made`. A pass-through costs a real zero, which is not the same as unknown |
 | `overCeiling` | always | the size guard could not fit the replacement, because the handoff itself is larger than the ceiling and is never trimmed |
 | `restore` | every `replaced` and `rehearsed` row | `{source, requested, restored, rejected, files, chars, approxTokens, caps, ms}`; `source` is `model`, `recency` or `none`, and each file's `source` is `fresh`, `stored`, `failed` or `dropped` |
 
@@ -499,10 +480,7 @@ What the seam will and will not do to you:
 - A raise still pending after `COMPACT_HANDOFF_SEAM_TIMEOUT_MS` (default
   `90000`) is abandoned. Nothing here can cancel one, so it is left running, its
   answer is ignored and the compaction goes on.
-- Nothing is raised on a compaction this plugin only passes through. A
-  subagent's compaction and a session already over its budget are handed back to
-  the engine before the seam is reached, and those rows carry no `seam` field at
-  all.
+- Nothing is raised on a compaction this plugin only passes through. A subagent's compaction is handed back to the engine before the seam is reached, and its row carries no `seam` field at all.
 - With nobody subscribed the seam is one array copy and the row says
   `seam: { subscribers: 0 }`. No environment read, no timer, no cost.
 
@@ -598,13 +576,9 @@ refused — and the live check above covers the third.
 
 ## Settings
 
-Every one of these is also a row in `/plugin`, under this plugin's
-configuration: `live`, `dataDir`, `model`, `maxChars`, `maxFraction`,
-`maxTokens`, `restoreFiles`, `restoreFileChars`, `restoreTotalChars`,
-`maxUsdPerSession`, `seamTimeoutMs`, `subagents`, `dev`, `refresh` and
-`refreshMs`. A row set there wins over the matching variable; left empty (or
-`0`, for a number), the variable is read as it always was, which is what a
-cron line or a one-off shell invocation already sets.
+Every one of these is also a row in `/plugin`, under this plugin's configuration: `live`, `dataDir`, `model`, `maxChars`, `maxFraction`, `maxTokens`, `restoreFiles`, `restoreFileChars`, `restoreTotalChars`, `seamTimeoutMs`, `subagents`, `dev`, `refresh` and `refreshMs`. A row set there wins over the matching variable; left empty (or `0`, for a number), the variable is read as it always was, which is what a cron line or a one-off shell invocation already sets. The four on/off rows (`live`, `subagents`, `dev`, `refresh`) declare no default, so a row nobody touched stays unset and the variable decides, while a row switched off is a setting and stays off whatever the variable says. Through 0.10.0 they declared `false`, which the engine filled in as though it had been set, and `COMPACT_HANDOFF_LIVE=1` was never read.
+
+There is no spend ceiling. Every main-thread compaction goes to the fork whatever the session has already spent. Up to 0.10.0 a session that crossed $10 fell back to the engine for every later compaction; `maxUsdPerSession` and `COMPACT_HANDOFF_MAX_USD_PER_SESSION` were how that ceiling was set, and both are now ignored, so an old config naming either one does nothing.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
@@ -617,7 +591,6 @@ cron line or a one-off shell invocation already sets.
 | `COMPACT_HANDOFF_RESTORE_FILES` | `5` | How many files the summariser may have restored after the handoff. |
 | `COMPACT_HANDOFF_RESTORE_FILE_CHARS` | `20000` | The most of one restored file that comes back; the rest is clipped with a note saying how much. |
 | `COMPACT_HANDOFF_RESTORE_TOTAL_CHARS` | `100000` | The most all restored files may add together, and never more than the ceiling above leaves free after the handoff. |
-| `COMPACT_HANDOFF_MAX_USD_PER_SESSION` | `10` | Past this, compactions fall back to the engine and record `disposition: "overBudget"`. |
 | `COMPACT_HANDOFF_SEAM_TIMEOUT_MS` | `90000` | How long one raised seam tool may run before the compaction goes on without it. Read only when something is subscribed. |
 | `COMPACT_HANDOFF_SUBAGENTS` | off | Off, a subagent's compaction is passed through with a row saying so. On, it is answered like any other. |
 | `COMPACT_HANDOFF_DEV` | off | Registers the four measurement tools. |
@@ -701,6 +674,20 @@ None of the fourteen warm rows has such a partner.
 for a subagent's **or a fork's** own transcript". `notes/design/compact-handoff-cold-forks.md` in the
 `claude-investigations` repo holds the measurement and what it could not show.
 
+The partner is the fork itself. On engine 2.1.283 `$.model.fork` runs the
+ordinary query loop over the main thread's transcript plus the fork prompt,
+and that loop is checked for auto-compaction like any other. A session that
+crossed its threshold by less than the size of the fork prompt has a fork loop
+over the threshold too, so the engine compacts the fork loop, and a plugin
+that passed it through as a subagent had its fork answer over the engine's
+summary. This plugin now answers that compaction with `{ skip }` (the row says
+`outcome: "ownFork"`, `disposition: "skipped"`), and the fork reads the whole
+conversation. It knows the loop by the fork prompt in the loop's transcript,
+which a genuine subagent's never holds, so a subagent compacting at the same
+moment still passes through. `python3 bench/coldfork.py --unfixed` reproduces a
+cold fork in a sandboxed session on Haiku for about $0.50; without `--unfixed`
+the same run comes back warm and `replaced`.
+
 ## What was verified live
 
 Nine checks, each a real throwaway `claude` session driven through a pty with
@@ -738,15 +725,7 @@ is the first known limit below rather than an untested path.
 
 ### The commitments pass runs as nobody, and that is measured
 
-Since 0.4.0 the commitments appendix is one `$.model.complete` call: an API
-request the engine makes in process, with no session, no settings layers and
-no hooks around it, so nothing below can happen to it. The price of that is
-the cost. `$.model.complete` hands back the reply text and drops the usage the
-API returned, and what it spends never reaches `$.session.usage().cost`, so the
-row carries an estimate - prompt and reply at four characters a token, priced
-at the model's own rate, no cache terms - labelled `commitmentsCostBasis:
-"estimate: chars/4, no cache"`. It is never recorded as 0. The history that
-follows is kept because the trap is still real for anyone who spawns the CLI.
+Since 0.4.0 the commitments appendix is one `$.model.complete` call: an API request the engine makes in process, with no session, no settings layers and no hooks around it, so nothing below can happen to it. What it spends never reaches `$.session.usage().cost`, so the row prices it from the `usage` on the call's own result, labelled `commitmentsCostBasis: "measured: the usage the result reported"`. Before engine 2.1.280 the call returned the reply text alone and the row carried an estimate at four characters a token, labelled `"estimate: chars/4, no cache"`; a result that arrives with no usage still gets that. It is never recorded as 0. The history that follows is kept because the trap is still real for anyone who spawns the CLI.
 
 Until 0.3.0 the commitments appendix was a `claude -p` call, which is a full session and
 loads settings like any other, so every `UserPromptSubmit` hook on the machine
@@ -777,22 +756,8 @@ so the ambient config dir authenticates the call with nothing copied at all.
 
 ## Known limits
 
-- **A headless session (`-p` / SDK) gets nothing.** `$.model.fork` returns
-  `null` with no warm transcript, and `$.session.compact` refuses outright:
-  *"not available in a headless (-p / SDK) session yet"*. The disk fallback
-  behind `COMPACT_HANDOFF_REFRESH` exists for this and is off by default.
-- **A compaction that lands before any turn has finished forks cold, and that
-  is a real thing that happens.** The fork reads the main thread's cache-safe
-  snapshot, and there is none until a turn has completed in this process. Two
-  live shapes hit it. A session reopened with `--resume` and pushed over the
-  window before it has answered anything: measured at 144 ms, `fellBack` /
-  `noHandoff` / `forkOutcome: cold`. And a session whose very first substantial
-  turn crosses the window while that turn is still in flight: measured four
-  times on fresh sessions that compacted ten to fifteen messages in, same three
-  fields. Nothing is lost and nothing is silent - the engine's own summary is
-  what the session carries, and the row says exactly why. One completed turn is
-  enough to fix it, which is why the automatic path is not itself the problem:
-  check 2 above forks warm on a `trigger: auto` compaction at 61 messages.
+- **A headless session (`-p` / SDK) gets nothing.** `$.model.fork` answers `nothing-to-fork` with no warm transcript, and `$.session.compact` refuses outright: *"not available in a headless (-p / SDK) session yet"*. The disk fallback behind `COMPACT_HANDOFF_REFRESH` exists for this and is off by default.
+- **A compaction that lands before any turn has finished forks cold, and that is a real thing that happens.** The fork reads the main thread's cache-safe snapshot, and there is none until a turn has completed in this process. Two live shapes hit it. A session reopened with `--resume` and pushed over the window before it has answered anything: measured at 144 ms, `fellBack` / `noHandoff` / `forkOutcome: nothing-to-fork` (`cold` on rows from 0.10.0 and earlier). And a session whose very first substantial turn crosses the window while that turn is still in flight: measured four times on fresh sessions that compacted ten to fifteen messages in, same three fields. Nothing is lost and nothing is silent - the engine's own summary is what the session carries, and the row says exactly why. One completed turn is enough to fix it, which is why the automatic path is not itself the problem: check 2 above forks warm on a `trigger: auto` compaction at 61 messages.
 - **A restored file is text or nothing.** Images, PDFs and notebooks the
   session read cannot come back through this path; the row says `failed` with
   the Read tool's reason. The restored pairs are real tool blocks, so the
@@ -819,13 +784,8 @@ so the ambient config dir authenticates the call with nothing copied at all.
   nothing warns you. Anyone copying this pattern should use
   `--setting-sources ""` rather than a config dir, or at minimum spawn with a
   `cwd` that has no `.claude/` above it.
-- **The commitments cost is an estimate, not a measurement.** `$.model.complete`
-  returns text only and its spend is invisible to `$.session.usage()`, so
-  `cost.commitmentsUsd` is characters over four at the model's list price with
-  no cache terms, and `cost.commitmentsBasis` says so on every row. Rows from
-  0.3.0 and earlier carry the `claude -p` figure the CLI reported and read
-  `measured`. Summing a day's rows mixes the two; the basis field is how you
-  tell them apart.
+- **The commitments cost was an estimate from 0.4.0 to 0.10.0.** Its spend is invisible to `$.session.usage()`, and before engine 2.1.280 `$.model.complete` returned text only, so `cost.commitmentsUsd` on those rows is characters over four at the model's list price with no cache terms. After 0.10.0 it is priced from the usage on the result. Rows from 0.3.0 and earlier carry the `claude -p` figure the CLI reported. Summing a day's rows mixes the bases; `cost.commitmentsBasis` is how you tell them apart.
+- **Rows written on engine 2.1.280 to plugin 0.10.0 have no commitments.** The engine began resolving `$.model.complete` as a result object and the plugin still read a string, so every reply read as 0 characters (`parts.commitmentsReplyChars: 0`) and the section was dropped. The same change made an unanswered fork throw instead of falling back by name, so those rows say `forkOutcome: threw`.
 - **The commitments reply is capped at 8192 output tokens, and that is a
   behaviour change from `claude -p`.** `$.model.complete` takes a `maxTokens`
   of at most 8192 and stops there without saying so, where the CLI would run
@@ -861,6 +821,14 @@ Two suites, two runners, and both have to pass:
 bun test                # the module's own functions, against a stub $
 claude plugin test .    # the plugin loaded into a real engine
 ```
+
+The hooks module is also typechecked against the engine's own declarations:
+
+```
+bunx tsc -p jsconfig.json
+```
+
+`jsconfig.json` includes `.claude/types`, which is where `/plugin-types` writes `claude-code.d.ts`. That folder is gitignored because the declarations are Anthropic's and are rewritten by every engine release, so run `/plugin-types` in this checkout first, from the Claude Code version the plugin is meant to run on. Without it `import('claude-code')` resolves to nothing and `$` is untyped, which is how a change to what `$.model.complete` and `$.model.fork` resolve once went unnoticed. The functions that call the model carry `@param {import('claude-code').EngineInterface} $` so that the compiler reads those results as the engine declares them.
 
 `bunfig.toml` pins `[test] root = "test"`, and that is load-bearing rather than
 tidy. Bun's positional argument is a substring filter and not a directory, so

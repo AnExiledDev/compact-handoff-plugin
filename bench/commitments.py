@@ -136,7 +136,7 @@ def ask(prompt, model, timeout):
     able to report what this cost without guessing at it.
     """
     done = subprocess.run(
-        ["claude", "-p", "--model", model, "--output-format", "json",
+        ["claude", "-p", "--setting-sources", "", "--model", model, "--output-format", "json",
          "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}'],
         input=prompt,
         capture_output=True,

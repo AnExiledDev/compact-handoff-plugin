@@ -368,16 +368,14 @@ const SUMMARY_TAGS = /[ \t]*<\/?summary>[ \t]*\n?/gu;
 /**
  * The summary without the thinking that produced it.
  *
- * The fork is asked to reason in <analysis> tags before it writes, because the
- * arm that reasons first is the one the bench picked, and Round 3 showed that
- * taking work away from that model backfires. So the block is still asked for
- * and still written; it is dropped here instead, after the model has had the
- * benefit of writing it. Across the 31 handoffs stored on this box it was 14%
- * of the summary text on average and 46% at its worst, and it is first-person
- * deliberation rather than findings: it plans the summary, and it argues with
- * itself and corrects mid-paragraph, which the next window reads as prose.
- * Operator, 2026-09-15: "I think analysis just bloats it without much value
- * add."
+ * Through 0.10.0 the fork was asked to write its inventory in <analysis> tags
+ * first and then copy it into the summary, and the block was dropped here. The
+ * prompt no longer asks for it, so this strip is a defensive one now: a model
+ * that writes the block anyway still has it removed. When one does, it is
+ * first-person deliberation rather than findings: it plans the summary, and it
+ * argues with itself and corrects mid-paragraph, which the next window reads
+ * as prose. Operator, 2026-09-15: "I think analysis just bloats it without much
+ * value add."
  *
  * Two shapes are deliberate. A block the model never closed is left alone
  * unless a summary follows it, because a reply cut off inside the scratchpad
@@ -871,9 +869,9 @@ export const forkInputOf = (usage, context) => {
 /**
  * A usage record made from character counts, at four characters a token.
  *
- * `$.model.complete` returns text alone and drops the usage the API sent back,
- * so the commitments pass can only be estimated. The estimate is labelled as
- * one wherever it is recorded, and it has no cache terms because nothing here
+ * The commitments pass prices from the `usage` its result carries, and falls
+ * back to this only when a result arrives without one. The estimate is labelled
+ * as one wherever it is recorded, and it has no cache terms because nothing here
  * can know whether the prompt was served from cache.
  */
 export const estimatedUsage = (promptChars, replyChars) => ({
@@ -915,8 +913,8 @@ export const costOf = ({ forkUsage, forkModel, commitmentsUsd, commitmentsBasis 
  * A run that made no model call still has a cost, and that cost is zero.
  *
  * Distinct from an unpriceable run, which records `null` and a reason. A
- * subagent pass-through and a run refused over budget both spend nothing and
- * both know it, so summing a session's rows must not have to guess which.
+ * subagent pass-through spends nothing and knows it, so summing a session's
+ * rows must not have to guess.
  */
 export const costOfNothing = (model, note) => ({
     cost: {
@@ -946,13 +944,6 @@ export const fallbackReasonFor = (record, disposition) => {
 
     if (disposition === "passedThrough") {
         return "subagent: a subagent's own compaction, and COMPACT_HANDOFF_SUBAGENTS is unset";
-    }
-
-    if (disposition === "overBudget") {
-        const spent = typeof record.spentUsd === "number" ? record.spentUsd.toFixed(2) : "?";
-        const ceiling = typeof record.ceilingUsd === "number" ? record.ceilingUsd.toFixed(2) : "?";
-
-        return `overBudget: $${spent} spent this session against a $${ceiling} ceiling`;
     }
 
     if (disposition === "rehearsed") {

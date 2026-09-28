@@ -1,7 +1,7 @@
 {
   "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
   "name": "compact-handoff",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "description": "Replaces the engine's compaction with a subagent's handoff, and measures whether it can be one",
   "types": "./types/compact-handoff.d.ts",
   "author": {
@@ -12,8 +12,7 @@
     "live": {
       "type": "boolean",
       "title": "Live",
-      "description": "Off, it rehearses and the engine still compacts. On, it answers the event and the engine's summariser never runs.",
-      "default": false
+      "description": "Off, it rehearses and the engine still compacts. On, it answers the event and the engine's summariser never runs."
     },
     "dataDir": {
       "type": "string",
@@ -63,12 +62,6 @@
       "description": "The most all restored files may add together, in characters. 0 uses 100000.",
       "default": 0
     },
-    "maxUsdPerSession": {
-      "type": "string",
-      "title": "Session budget (USD)",
-      "description": "Past this, compactions fall back to the engine and record overBudget. Empty uses 10.",
-      "default": ""
-    },
     "seamTimeoutMs": {
       "type": "number",
       "title": "Seam timeout (ms)",
@@ -78,20 +71,17 @@
     "subagents": {
       "type": "boolean",
       "title": "Answer subagent compactions",
-      "description": "Off, a subagent's compaction is passed through with a row saying so. On, it is answered like any other.",
-      "default": false
+      "description": "Off, a subagent's compaction is passed through with a row saying so. On, it is answered like any other."
     },
     "dev": {
       "type": "boolean",
       "title": "Measurement tools",
-      "description": "Registers the four measurement tools.",
-      "default": false
+      "description": "Registers the four measurement tools."
     },
     "refresh": {
       "type": "boolean",
       "title": "Fallback handoff",
-      "description": "Keeps a fallback handoff on disk for sessions a fork cannot serve (headless).",
-      "default": false
+      "description": "Keeps a fallback handoff on disk for sessions a fork cannot serve (headless)."
     },
     "refreshMs": {
       "type": "number",

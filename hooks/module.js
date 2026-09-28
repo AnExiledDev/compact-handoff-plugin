@@ -127,6 +127,9 @@ let options = {};
  * the text `$.env.get` returns and a declared number or boolean has to read
  * the same way to them. A number row left at `0` counts as unset, which is why
  * each numeric default is `0` and the real default lives in the constant.
+ * A boolean row declares no default at all: the engine fills a declared default
+ * in as though the person had set it, and `false` is a setting, so a declared
+ * `false` would keep the variable from ever being read.
  */
 const opt = (key) => {
     const value = options[key];
@@ -137,7 +140,7 @@ const opt = (key) => {
 };
 
 /**
- * The compaction instruction, and the bench's winner over four rounds.
+ * The compaction instruction, and the bench's winner over five rounds.
  *
  * Rounds 1 to 3 varied the wording of the engine's own summariser prompt, which
  * asks for nine numbered prose sections. Round 4 asked whether that inherited
@@ -154,22 +157,38 @@ const opt = (key) => {
  * against this one's 7.3. High variance is disqualifying for a prompt that gets
  * one attempt per compaction.
  *
- * It costs about 2,600 more output tokens than the prompt it replaces, roughly
- * 40% more, against a post-compaction floor measured at 54,600 to 66,058 tokens
- * in a real session. The handoff was never the expensive part of a restart.
+ * In round 4 it cost about 2,600 more output tokens than the prompt it
+ * replaced, roughly 40% more, against a post-compaction floor measured at
+ * 54,600 to 66,058 tokens in a real session.
+ *
+ * Round 5 took out the <analysis> block that round 4's version wrote the
+ * inventory in first. PART 1 was a copy of it, so every compaction wrote the
+ * inventory twice and paid for both. Written once, straight into the summary,
+ * over the same fixture and answer key, two forks per arm graded three times
+ * each: 69.4% recall (spread 5.5) against 67.7% (spread 6.8) for the two-copy
+ * prompt, inside the grader's 3.5-point noise, for 16,777 output tokens against
+ * 24,756 and 182 s against 257 s per fork. `withoutScratchpad` still strips the
+ * block if a model writes one anyway.
  *
  * The <restore-files> block below is appended mechanically and was not part of
  * the benched arm, the same way the Work ledger was appended to the old one.
+ *
+ * The one-reply, no-tools paragraph is there because a fork inherits the
+ * session's tools. A denied tool call does not end the fork, it becomes another
+ * request, and the engine sums the usage across them; a transcript that stops
+ * mid-task reads to the model like a turn in that task. One fork took the
+ * prompt that way, carried on the session's work and billed 144,745 output
+ * tokens over 24 minutes before it wrote a handoff.
  */
 const FORK_PROMPT = `Your task is to compact this conversation into a handoff for the next session. It is the only thing that survives.
 
+Answer in a single reply and call no tools; everything you need is already in the conversation. Do not continue, finish or act on the task the conversation was working on, even if it stopped mid-step. Your only job now is to write the handoff.
+
 Summaries lose facts because they are written as prose, and prose makes the writer choose what is interesting. You will not choose. You will enumerate first, then narrate.
 
-In <analysis> tags, sweep the conversation from the first message to the last, in order, and emit an inventory: one line per discrete fact, no grouping, no prose, no commentary. A discrete fact is anything a successor could be wrong about — a request, a constraint, a rejection, a decision, a reason, a file, a command run and its result, a number, an identifier, an error, a promise, an unfinished item, a correction. Aim for completeness over elegance; a hundred lines is normal and a short inventory means you skipped. Mark each line with one tag in brackets at the start: [ask] [constraint] [rejected] [decision] [file] [command] [identifier] [error] [promise] [pending] [state].
+In <summary> tags, produce the handoff in two parts:
 
-Then, in <summary> tags, produce the handoff in two parts:
-
-PART 1 — THE INVENTORY. Reproduce every line from your analysis, grouped by tag, tag order as listed above. Do not drop a line because it seems minor, and do not merge two lines into one. Quote the user verbatim on every [ask], [constraint] and [rejected] line.
+PART 1 — THE INVENTORY. Sweep the conversation from the first message to the last and emit an inventory: one line per discrete fact, no prose, no commentary. A discrete fact is anything a successor could be wrong about — a request, a constraint, a rejection, a decision, a reason, a file, a command run and its result, a number, an identifier, an error, a promise, an unfinished item, a correction. Aim for completeness over elegance; a hundred lines is normal and a short inventory means you skipped. Mark each line with one tag in brackets at the start: [ask] [constraint] [rejected] [decision] [file] [command] [identifier] [error] [promise] [pending] [state]. Group the lines by tag, in that tag order, keeping conversation order within each group. Do not drop a line because it seems minor, and do not merge two lines into one. Quote the user verbatim on every [ask], [constraint] and [rejected] line.
 
 PART 2 — THE READING. Now, and only now, write the prose a successor needs to make sense of Part 1: what the work is, what has been done, what is being done right now, and what the next step is with a verbatim quote of the user's most recent request. Keep this short. It explains the inventory; it does not replace it.
 
@@ -484,6 +503,21 @@ export const register = (on, pluginOptions) => {
             engine: ((await $.env.get("CLAUDE_CODE_VERSION")) ?? null) || null,
         };
 
+        // The fork this plugin is waiting on is itself a query loop, and the
+        // engine checks it for auto-compaction like any other. Passing it
+        // through lets the engine summarise it, and the fork then answers over
+        // that summary instead of this conversation: a cold fork. Declining it
+        // lets the fork read the real transcript.
+        if (isOwnForkLoop(e)) {
+            record.outcome = "ownFork";
+            record.detail = "the engine tried to compact this plugin's own handoff fork; declined so the fork reads the conversation";
+            record.elapsedMs = Date.now() - startedAt;
+
+            await finish($, record, "skipped");
+
+            return { skip: "compact-handoff's own handoff fork reads the conversation uncompacted" };
+        }
+
         // A subagent's compaction is a different conversation with a different
         // owner, and nothing here has been measured against one. Pass it
         // through with a row rather than reshape a transcript this plugin has
@@ -493,20 +527,6 @@ export const register = (on, pluginOptions) => {
             record.elapsedMs = Date.now() - startedAt;
 
             await finish($, record, "passedThrough");
-
-            return next(e);
-        }
-
-        const spent = await spentThisSession($);
-        const ceiling = await budgetCeiling($);
-
-        if (spent >= ceiling) {
-            record.outcome = "overBudget";
-            record.spentUsd = spent;
-            record.ceilingUsd = ceiling;
-            record.elapsedMs = Date.now() - startedAt;
-
-            await finish($, record, "overBudget");
 
             return next(e);
         }
@@ -655,7 +675,7 @@ export const register = (on, pluginOptions) => {
  * empty table, so nothing at the fold can read the manifest. `test/module.test.js`
  * asserts it against `.claude-plugin/plugin.json` so the two cannot drift.
  */
-export const PLUGIN_VERSION = "0.10.0";
+export const PLUGIN_VERSION = "0.11.0";
 
 /** How long one subscriber may run before the compaction goes on without it. */
 const DEFAULT_SEAM_TIMEOUT_MS = 90_000;
@@ -892,20 +912,28 @@ const capOf = (value, fallback) => {
 /**
  * The handoff, written inside the event by a fork of this very session.
  *
- * `$.model.fork` runs one tool-less completion over the main thread's own
+ * `$.model.fork` runs one completion over the main thread's own
  * cache-safe transcript snapshot, which is how the engine's own compaction
  * reads a conversation, so nothing has to be marshalled in and the prompt
  * cache is already warm. It is a host op, and a host op's time in flight does
  * not count against the ten second dispatch budget: measured at 21768 ms from
  * `turn.complete`, not aborted.
  *
- * Null means no warm transcript (a cold session, or a headless one), which is
- * what the handoff on disk is kept for.
+ * The fork resolves `ModelForkResult`, the union engine 2.1.280 introduced.
+ * Engines before it resolved the reply or null, and that shape is not read any
+ * more: the plugin targets 2.1.280 and later, and a dual-shape shim would hide
+ * the next change the way the null check hid this one. An unanswered fork is a
+ * named outcome (`nothing-to-fork`, which is no warm transcript and what the
+ * handoff on disk is kept for, then `api-error`, `empty-reply` and `aborted`),
+ * and the caller falls back on it like any other. So is a fork that runs past
+ * `FORK_TIMEOUT_MS`, as `timeout`.
  *
  * A reply is not proof that the fork read this conversation. Some forks come
  * back having been charged for a fraction of the session's context (#690), and
  * the reply reads like any other summary, so `record.forkInput` is compared
  * against the context and a short one is refused here rather than handed up.
+ *
+ * @param {import('claude-code').EngineInterface} $
  */
 const forkHandoff = async ($, e, record) => {
     const asked = typeof e.instructions === "string" && e.instructions.trim() !== ""
@@ -914,10 +942,26 @@ const forkHandoff = async ($, e, record) => {
 
     record.forkContext = await forkContext($, e);
 
-    const reply = await $.model.fork({ prompt: asked });
+    let reply;
 
-    if (reply === null) {
-        return { outcome: "cold", detail: "the fork found no warm main-thread transcript" };
+    try {
+        reply = await withTimeout($, $.model.fork({ prompt: asked }), FORK_TIMEOUT_MS, "the fork");
+    } catch (error) {
+        if (error instanceof TimeoutError) {
+            return { outcome: "timeout", detail: error.message };
+        }
+
+        throw error;
+    }
+
+    if (!reply.isAnswered) {
+        // Every arm but `nothing-to-fork` made a request, and what it spent
+        // stays on the row after the fallback replaces its answer.
+        if (reply.reason !== "nothing-to-fork") {
+            record.usage = reply.usage;
+        }
+
+        return { outcome: reply.reason, detail: unansweredForkDetail(reply) };
     }
 
     record.forkInput = forkInputOf(reply.usage, record.forkContext?.context ?? null);
@@ -952,6 +996,57 @@ const forkHandoff = async ($, e, record) => {
         usage: reply.usage,
         detail: "",
     };
+};
+
+/**
+ * How long a compaction waits on its fork before it falls back to the handoff
+ * on disk.
+ *
+ * Five minutes, from the index this plugin writes: across 58 warm forks since
+ * 0.6.0 the median took about two minutes, the 95th percentile under four, and
+ * one alone ran past five (about 25 minutes, with the person waiting on it the
+ * whole time). A fork that is still going at five minutes is far more likely
+ * to be the stuck one than a slow good one, and the forks this bound cuts most
+ * often are the short ones the `forkInput` check refuses anyway.
+ *
+ * The bound gives the person their session back. It does not stop the spend:
+ * `$.model.fork` takes a `prompt` and nothing else (no signal, no `timeoutMs`,
+ * unlike `$.model.complete`), and its `aborted` arm fires only when the turn's
+ * own dispatch is aborted, so there is no way to cancel the request from here.
+ * The abandoned fork runs to its end, and whatever it answers is dropped.
+ */
+const FORK_TIMEOUT_MS = 300_000;
+
+/**
+ * Why a fork came back without a reply, in the words the row keeps.
+ *
+ * @param {Exclude<import('claude-code').ModelForkResult, { isAnswered: true }>} reply
+ * @returns {string}
+ */
+const unansweredForkDetail = (reply) => {
+    switch (reply.reason) {
+        case "nothing-to-fork":
+            return "the fork found no warm main-thread transcript";
+        case "api-error":
+            return `the fork's request failed: ${reply.error}, status ${reply.status ?? "none, no response arrived"}`;
+        case "empty-reply":
+            return "the fork replied with no text";
+        case "aborted":
+            return "the fork was cut off by the turn's abort";
+        default:
+            return unreachable(reply);
+    }
+};
+
+/**
+ * A union arm no case above handles. The `never` makes a new arm in the
+ * engine's declarations a type error here rather than a silent fallthrough.
+ *
+ * @param {never} value
+ * @returns {never}
+ */
+const unreachable = (value) => {
+    throw new Error(`an arm nothing handles: ${JSON.stringify(value)}`);
 };
 
 /**
@@ -1136,14 +1231,30 @@ const attempt = async ($, notes, name, build) => {
     }
 };
 
-/** The promise, or a throw naming what ran long. Never a hung compaction. */
+/**
+ * The promise, or a throw naming what ran long. Never a hung compaction.
+ *
+ * @template T
+ * @param {import('claude-code').EngineInterface} $
+ * @param {Promise<T>} promise
+ * @param {number} ms
+ * @param {string} what
+ * @returns {Promise<T>}
+ */
 const withTimeout = ($, promise, ms, what) =>
     Promise.race([
         promise,
         $.clock.sleep(ms).then(() => {
-            throw new Error(`${what} timed out after ${ms}ms`);
+            throw new TimeoutError(`${what} timed out after ${ms}ms`);
         }),
     ]);
+
+/**
+ * What `withTimeout` throws, so a caller can tell a bound that expired from a
+ * call that failed. Its name stays `Error`, so the text every existing row
+ * records for a timeout reads exactly as it did.
+ */
+class TimeoutError extends Error {}
 
 /**
  * Session state, read from git and `gh` right now rather than recalled.
@@ -1256,11 +1367,20 @@ const readCommand = async ($, argv) => {
  * nobody is kept below under "A4" because the trap it describes is still real
  * for anyone spawning the CLI.
  *
- * The cost is an ESTIMATE. `$.model.complete` returns the text alone and
- * drops the usage the API sent back, and nothing it spends reaches
- * `$.session.usage().cost`, so the number recorded is the prompt and reply at
- * four characters a token, priced at the model's own rate with no cache terms,
- * and it is labelled as such on the row. It is never recorded as 0.
+ * The call resolves `ModelCompleteResult`, the union engine 2.1.280
+ * introduced. Engines before it resolved the reply as a bare string, and that
+ * shape is not read any more: every reply on 2.1.280 read as 0 characters
+ * because the string check never matched, so a dual-shape shim would only hide
+ * the next change the same way. An unanswered result renders no section and
+ * the row names its `reason`, with `status` on an `api-error`.
+ *
+ * The cost is priced from the `usage` the result carries, which every arm has.
+ * Nothing the call spends reaches `$.session.usage().cost`, so this is the only
+ * record of it. When a result arrives without `usage`, the prompt and reply are
+ * priced at four characters a token with no cache terms instead, and the row's
+ * basis says which one it was. It is never recorded as 0.
+ *
+ * @param {import('claude-code').EngineInterface} $
  */
 const commitmentsSection = async ($, messages, notes) => {
     const turns = assistantTurns(messages);
@@ -1285,13 +1405,18 @@ const commitmentsSection = async ($, messages, notes) => {
         COMMITMENTS_MS,
         "commitments",
     );
-    const text = typeof reply === "string" ? reply : "";
-    const priced = priceUsage(estimatedUsage(prompt.length, text.length), COMMITMENT_MODEL);
+    const text = reply.isAnswered ? reply.text : "";
+
+    if (!reply.isAnswered) {
+        notes.commitmentsUnanswered = reply.reason;
+
+        if (reply.reason === "api-error") {
+            notes.commitmentsStatus = reply.status;
+        }
+    }
 
     notes.commitmentsReplyChars = text.length;
-    notes.commitmentsTokensEstimated = priced.tokens ?? null;
-    notes.commitmentsCostUsd = priced.usd;
-    notes.commitmentsCostBasis = priced.usd === null ? `unpriced: ${priced.reason}` : "estimate: chars/4, no cache";
+    Object.assign(notes, commitmentsCost(reply.usage, prompt.length, text.length));
 
     // `$.model.complete` stops at its output cap without saying so; the row says.
     const outcome = commitmentsOutcome(text, COMMITMENT_MAX_TOKENS);
@@ -1301,6 +1426,26 @@ const commitmentsSection = async ($, messages, notes) => {
     notes.commitmentsHitCapReason = outcome.hitCapReason;
 
     return renderCommitments(commitmentsFrom(text));
+};
+
+/**
+ * What the commitments call cost, from the usage it reported or, failing that,
+ * from its size, and which of the two the row is reading.
+ *
+ * @param {import('claude-code').ModelUsage | undefined} usage
+ * @param {number} promptChars
+ * @param {number} replyChars
+ */
+const commitmentsCost = (usage, promptChars, replyChars) => {
+    const isMeasured = usage !== undefined && usage !== null;
+    const priced = priceUsage(isMeasured ? usage : estimatedUsage(promptChars, replyChars), COMMITMENT_MODEL);
+    const basis = isMeasured ? "measured: the usage the result reported" : "estimate: chars/4, no cache";
+
+    return {
+        commitmentsTokensEstimated: isMeasured ? null : (priced.tokens ?? null),
+        commitmentsCostUsd: priced.usd,
+        commitmentsCostBasis: priced.usd === null ? `unpriced: ${priced.reason}` : basis,
+    };
 };
 
 /**
@@ -1719,10 +1864,10 @@ const probeBudget = async ($, e, signal) => {
             const asked = typeof e.prompt === "string" && e.prompt.trim() !== "" ? e.prompt : FORK_PROMPT;
             const reply = await $.model.fork({ prompt: asked });
 
-            record.outcome = reply === null ? "null" : "answered";
-            record.forkChars = reply === null ? 0 : reply.text.length;
-            record.usage = reply === null ? null : reply.usage;
-            record.head = clip(reply === null ? "" : reply.text);
+            record.outcome = reply.isAnswered ? "answered" : reply.reason;
+            record.forkChars = reply.isAnswered ? reply.text.length : 0;
+            record.usage = "usage" in reply ? reply.usage : null;
+            record.head = clip(reply.isAnswered ? reply.text : "");
         } else {
             const seconds = typeof e.seconds === "number" && e.seconds > 0 ? Math.floor(e.seconds) : 30;
             const ran = await $.process.run(["sleep", String(seconds)], { timeoutMs: (seconds + 30) * 1000 });
@@ -1767,8 +1912,8 @@ const runVariant = async ($, { label, replicates }, signal) => {
         try {
             const reply = await $.model.fork({ prompt: asked });
 
-            if (reply === null) {
-                record.outcome = "cold";
+            if (!reply.isAnswered) {
+                record.outcome = reply.reason;
             } else {
                 const file = `${AB_OUT}/${label}-${stamp}-${n}.md`;
 
@@ -1836,7 +1981,6 @@ const readRuns = async ($, e) => {
         dataDir: await dataDir($),
         depth: rows.reduce((deepest, row) => Math.max(deepest, row.depth ?? 0), 0),
         spentUsd: Number((await spentThisSession($)).toFixed(4)),
-        ceilingUsd: await budgetCeiling($),
         handoff: await handoffState($),
         // Whether `$.agent.register` took this session. A false reading is not a
         // failure: the spawn falls back to general-purpose with the standing
@@ -1844,7 +1988,9 @@ const readRuns = async ($, e) => {
         agent: (await safely($, () => $.store.get(HANDOFF_AGENT_KEY))) ?? null,
         lookups: await lookupTotals($),
         restores: restoreTotals(rows),
-        last: rows[rows.length - 1] ?? null,
+        // A fork loop the engine keeps checking can be declined after the
+        // compaction it belongs to has written its row.
+        last: rows.findLast((row) => row.outcome !== "ownFork") ?? null,
         runs: rows.slice(-limit),
         diagnostics: (await isDev($)) ? (await diagnosticLines($)).slice(-limit).map(parseRun) : undefined,
     };
@@ -2159,6 +2305,12 @@ const finish = async ($, record, disposition, artifacts = {}) => {
         record.storeFailed = String(error).slice(0, 300);
     }
 
+    // A declined fork loop is bookkeeping inside a compaction still running;
+    // a toast for it reads as that compaction having been skipped.
+    if (record.outcome === "ownFork") {
+        return;
+    }
+
     $.ui.toast(`compaction ${disposition} in ${Math.round((record.elapsedMs ?? 0) / 1000)}s (${record.outcome})`, {
         timeoutMs: 8000,
     });
@@ -2169,7 +2321,7 @@ const finish = async ($, record, disposition, artifacts = {}) => {
  * model's summary on its own, the conversation as it stood *before* the
  * compaction, the row as data, and the row appended to two logs.
  *
- * The per-session log is what `handoff_status` and the budget read; the global
+ * The per-session log is what `handoff_status` reads; the global
  * one is what the bench reads. Both are append-only.
  */
 const storeRun = async ($, record, disposition, artifacts) => {
@@ -2238,17 +2390,8 @@ const runLines = async ($, sessionId) => {
 };
 
 /* ------------------------------------------------------------------ *
- * What a compaction is allowed to cost, and what it did cost.
+ * What a compaction did cost.
  * ------------------------------------------------------------------ */
-
-/** What one session may spend on handoffs before the engine gets its compactions back. */
-const DEFAULT_MAX_USD = 10;
-
-const budgetCeiling = async ($) => {
-    const raw = Number.parseFloat(opt("maxUsdPerSession") ?? (await $.env.get("COMPACT_HANDOFF_MAX_USD_PER_SESSION")) ?? "");
-
-    return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_MAX_USD;
-};
 
 /** What this plugin has spent on this session, summed off its own rows. */
 const spentThisSession = async ($) => {
@@ -2519,6 +2662,18 @@ const safely = async ($, read) => {
 
 /** The bench tools, off unless this is the bench. */
 const isDev = async ($) => isOn(opt("dev") ?? (await $.env.get("COMPACT_HANDOFF_DEV")));
+
+/**
+ * Whether a compaction is of this plugin's own fork loop: not the main thread,
+ * and carrying the fork prompt as a user turn. A genuine subagent's transcript
+ * never holds it. Read off the event rather than an in-flight flag, because
+ * `$.store` is shared by every session and would mark another session's
+ * subagent too.
+ */
+const isOwnForkLoop = (e) =>
+    e.agentId !== null &&
+    e.agentId !== undefined &&
+    e.messages.some((message) => message.role === "user" && (message.text ?? "").trimStart().startsWith(FORK_PROMPT.trim()));
 
 /** Whether a subagent's own compaction is handled here rather than passed through. */
 const handlesSubagents = async ($) => isOn(opt("subagents") ?? (await $.env.get("COMPACT_HANDOFF_SUBAGENTS")));

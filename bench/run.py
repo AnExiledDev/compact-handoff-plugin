@@ -81,6 +81,26 @@ def spawn(session, log_path):
     return child
 
 
+def accept_trust(child):
+    """Answer the folder-trust prompt a never-trusted cwd opens with.
+
+    Trust is kept per exact path, so every fresh worktree asks again, and the
+    prompt's default is "No, exit": the first arm's words land on it, the
+    session quits, and the run reports zero records instead of failing. The
+    words are drawn with cursor moves between them, hence the loose match.
+    """
+    try:
+        asked = child.expect([r"trust\S{0,12}this\S{0,12}folder", pexpect.TIMEOUT], timeout=20)
+    except pexpect.EOF:
+        return
+
+    if asked == 0:
+        pump(child, 3)
+        child.send("\x1b[B")
+        pump(child, 1)
+        child.send("\r")
+
+
 def pump(child, seconds):
     end = time.time() + seconds
 
@@ -136,6 +156,7 @@ def main():
     stage(args.labels)
 
     child = spawn(args.session, args.log)
+    accept_trust(child)
     pump(child, 45 if args.session else 15)
 
     for label in args.labels:

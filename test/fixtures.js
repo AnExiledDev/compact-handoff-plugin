@@ -149,6 +149,17 @@ export const fakeRuntime = () => {
     };
 };
 
+/** A `ModelUsage` with all four counts at zero, as a call that spent nothing reports it. */
+export const noUsage = () => ({
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_read_input_tokens: 0,
+    cache_creation_input_tokens: 0,
+});
+
+/** What `$.model.complete` and `$.model.fork` resolve when the model answered. */
+export const answered = (text, usage) => ({ isAnswered: true, text, usage });
+
 /** The `next` a dispatch carries: answers, and remembers that it was reached. */
 export const passThrough = () => {
     const next = (input) => {
@@ -232,14 +243,19 @@ export const fakeApi = (overrides = {}) => {
                 return answerCall(input);
             },
         },
-        // A fork that answers nothing is the default, because most tests want
-        // the fallback path; a test steering one passes `overrides.model`.
+        // A fork with nothing to fork is the default, because most tests want
+        // the fallback path; a test steering one passes `overrides.model`. Both
+        // answer the result unions engine 2.1.280 resolves, never a bare string
+        // or null.
         model: {
-            fork: async () => null,
-            complete: async () => null,
+            fork: async () => ({ isAnswered: false, reason: "nothing-to-fork" }),
+            complete: async () => ({ isAnswered: false, reason: "empty-reply", usage: noUsage() }),
             ...overrides.model,
         },
         ui: { toast: (text, options) => void toasts.push({ text, options }), log: () => {} },
+        // sleep resolves at once, so anything racing it (the fork's time bound)
+        // loses unless it settles synchronously; override it for a fork fake
+        // that awaits real work.
         clock: { now: () => Promise.resolve(Date.now()), sleep: async () => {}, ...overrides.clock },
     };
 

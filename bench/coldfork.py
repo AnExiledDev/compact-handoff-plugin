@@ -56,6 +56,9 @@ WINDOW = 100_000
 # `P7 = B4 - 13000` in 2.1.283: the proactive threshold sits this far under the
 # effective window the debug line reports.
 THRESHOLD_GAP = 13_000
+# A `--plugin-dir` plugin is `<name>@inline`, and the engine also reads its
+# options under the bare name.
+LIVE_OPTION = {"pluginConfigs": {"compact-handoff": {"options": {"live": True}}}}
 # The string that only exists in the plugin once the fix is in.
 FIX_MARKER = "isOwnForkLoop"
 
@@ -395,6 +398,10 @@ def spawn(scratch, plugin, model):
 
     argv = [
         "--setting-sources", "",
+        # The manifest's `live` default of false reaches the module as a set
+        # value and outranks COMPACT_HANDOFF_LIVE, so live goes in as the
+        # plugin option too. Flag settings load even with no setting sources.
+        "--settings", json.dumps(LIVE_OPTION),
         "--plugin-dir", plugin,
         "--plugin-dir", scratch.probe_dir,
         "--model", model,

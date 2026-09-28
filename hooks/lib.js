@@ -270,10 +270,29 @@ export const lineageOf = (text) => {
     return { session, n: Number(n), prev: prev === "none" ? null : Number(prev) };
 };
 
+/**
+ * The lineage of a message that IS a handoff, or null.
+ *
+ * A handoff opens with its marker. The same marker also turns up inside a
+ * tool result (`handoff_lookup`, a Read of a stored `.md`, a grep, the
+ * README's own example), and counting one of those as a handoff put a
+ * session's depth back to whatever the quoted handoff said and ended the
+ * post-compaction watch the moment a session read its history.
+ */
+export const handoffLineageOf = (message) => {
+    const text = (message.text ?? "").trimStart();
+
+    if ((message.toolResults ?? []).length > 0 || LINEAGE_SHAPE.exec(text)?.index !== 0) {
+        return null;
+    }
+
+    return lineageOf(text);
+};
+
 /** The most recent handoff already sitting in the conversation, if any. */
 export const priorHandoffIn = (messages) => {
     for (let index = messages.length - 1; index >= 0; index -= 1) {
-        const lineage = lineageOf(messages[index].text);
+        const lineage = handoffLineageOf(messages[index]);
 
         if (lineage !== null) {
             return { index, lineage };
@@ -281,6 +300,35 @@ export const priorHandoffIn = (messages) => {
     }
 
     return null;
+};
+
+/**
+ * Every place a compaction started a new conversation, oldest first: a handoff
+ * this plugin wrote (`kind: "handoff"`, `n` from its lineage) or the engine's
+ * own continuation summary (`kind: "stock"`, `n` its position among openers).
+ *
+ * `$.session.messages()` answers the whole session, every window since the
+ * first, so this is how a reading finds the window it is actually in.
+ */
+export const openersIn = (messages) => {
+    const openers = [];
+
+    messages.forEach((message, index) => {
+        const lineage = handoffLineageOf(message);
+        const chars = (message.text ?? "").length;
+
+        if (lineage !== null) {
+            openers.push({ kind: "handoff", index, n: lineage.n, chars });
+        } else if (
+            message.role === "user" &&
+            (message.toolResults ?? []).length === 0 &&
+            originOf(message) === "continuation"
+        ) {
+            openers.push({ kind: "stock", index, n: openers.length + 1, chars });
+        }
+    });
+
+    return openers;
 };
 
 /* ------------------------------------------------------------------ *
@@ -364,30 +412,33 @@ export const approxTokens = (text) => Math.ceil(text.length / 4);
  * which reports whole numbers; the engine's own figure is the fallback for a
  * reading that carries no window to divide by.
  */
-export const windowReading = ({ at, session, turn, context, messages, handoff }) => {
+export const windowReading = ({ at, session, turn, context, messages, opener }) => {
     const tokens = context?.tokens ?? null;
     const window = context?.window ?? null;
     const share = (of) => (of === null || window === null || window === 0 ? null : Math.round((of / window) * 1000) / 10);
     // The same four-characters-a-token estimate `approxTokens` uses, over a
     // count rather than the text itself.
-    const handoffTokens = handoff === null ? null : Math.ceil(handoff.chars / 4);
+    const handoffTokens = opener === null ? null : Math.ceil(opener.chars / 4);
 
     return {
         at,
         session,
         turn,
         first: turn === 1,
-        phase: handoff === null ? "fresh" : "post-compact",
-        compaction: handoff?.n ?? 0,
+        phase: PHASE_OF[opener?.kind ?? "none"],
+        compaction: opener?.n ?? 0,
         tokens,
         window,
         percent: share(tokens) ?? context?.percent ?? null,
         messages,
-        handoffChars: handoff?.chars ?? null,
+        handoffChars: opener?.chars ?? null,
         handoffTokens,
         handoffPercent: share(handoffTokens),
     };
 };
+
+/** A window's phase by the kind of compaction that opened it, if any. */
+const PHASE_OF = { none: "fresh", handoff: "post-compact", stock: "stock-compact" };
 
 /** A whole scratchpad, the common case: the model closed the tag. */
 const CLOSED_ANALYSIS = /<analysis>([\s\S]*?)<\/analysis>[ \t]*\n?/gu;
@@ -499,6 +550,28 @@ const writersByFile = (rows) => {
 
         for (const path of row.writes ?? []) {
             note(path, "Bash");
+        }
+    }
+
+    return foldRelativePaths(written);
+};
+
+/**
+ * A shell command names a file relative to wherever it ran, and Write and Edit
+ * name the same file absolutely, so one file was listed twice. A relative path
+ * folds into the one absolute path it is the tail of; when none or several
+ * are, it stays as written, because the cwd it ran in is not on the row.
+ */
+const foldRelativePaths = (written) => {
+    const absolute = [...written.keys()].filter((path) => path.startsWith("/") || path.startsWith("~"));
+
+    for (const [path, tools] of written) {
+        const tail = `/${path.replace(/^\.\//u, "")}`;
+        const matches = absolute.filter((candidate) => candidate.endsWith(tail));
+
+        if (!absolute.includes(path) && matches.length === 1) {
+            tools.forEach((tool) => written.get(matches[0]).add(tool));
+            written.delete(path);
         }
     }
 
@@ -729,7 +802,7 @@ export const shellWrites = (command) => {
     }
 
     for (const match of command.matchAll(OPEN_FOR_WRITE)) {
-        if (isRunAsCode(command, match.index)) {
+        if (isInterpreted(command, match.index) && isRunAsCode(command, match.index)) {
             found.push(match[2]);
         }
     }
@@ -745,6 +818,29 @@ export const shellWrites = (command) => {
     }
 
     return unique(found.filter((path) => PATH_SHAPED.test(path) && !SHELL_EXPANDED.test(path) && !NOT_WORK.test(path)));
+};
+
+/** A program that runs the script it is handed. */
+const INTERPRETER = /(?:^|[\s;&|({])(?:python[\d.]*|node|bun|deno|ruby|perl)(?:\s|$)/u;
+
+/** A heredoc opener, `<<'EOF'` or `<<-EOF`, capturing its delimiter. */
+const HEREDOC = /<<-?[ \t]*(['"]?)(\w+)\1/gu;
+
+/**
+ * Whether the text at `index` is handed to an interpreter at all. Inside a
+ * heredoc still open at that point, it is when the line that opened the heredoc
+ * runs one; outside, when its own line does. A PR body written with
+ * `cat <<'EOF'` that quotes `open('x','w')` is prose going into a file, and
+ * reading it as a write listed a file nothing wrote.
+ */
+const isInterpreted = (command, index) => {
+    const before = command.slice(0, index);
+    const opener = [...before.matchAll(HEREDOC)]
+        .filter((match) => !new RegExp(`\\n[ \\t]*${match[2]}[ \\t]*(?:\\n|$)`, "u").test(before.slice(match.index)))
+        .at(-1);
+    const upTo = opener === undefined ? before.length : opener.index;
+
+    return INTERPRETER.test(before.slice(before.lastIndexOf("\n", upTo - 1) + 1, upTo));
 };
 
 /** A flag whose argument is a script the interpreter runs: `python3 -c`, `node -e`. */
@@ -1342,7 +1438,7 @@ export const sectionOf = (text, name) => {
  * What the session does with the handoff, watched for ten turns.
  * ------------------------------------------------------------------ */
 
-/** How many turns after a compaction are watched before the file is written. */
+/** How many person turns after a compaction are watched before the watch ends. */
 export const POST_TURNS = 10;
 
 /** How much of the first post-compaction message is kept verbatim. */
@@ -1379,28 +1475,61 @@ export const workDone = (messages) => {
     return { commands: unique(commands), reads: unique(reads) };
 };
 
-/** What a compaction hands the watcher: where the new conversation starts, and what the old one already did. */
-export const monitorSeed = ({ session, n, at, from, messages }) => ({
+/**
+ * What a compaction hands the watcher.
+ *
+ * `ordinal` is how many openers the whole session held before this compaction,
+ * so the one it adds is `openersIn(...)[ordinal]`; `from` is how many messages
+ * the replacement put in, counted from that opener. Together they say where
+ * the new conversation starts in a transcript that also holds every window
+ * before it.
+ */
+export const monitorSeed = ({ session, n, at, kind, ordinal, from, messages }) => ({
     session,
     n,
     at,
+    kind,
+    ordinal,
     from,
     ...workDone(messages),
 });
 
+/** A user turn the person typed, as opposed to a tool result or the harness talking. */
+const isPersonTurn = (message) =>
+    message.role === "user" &&
+    (message.toolResults ?? []).length === 0 &&
+    (message.text ?? "").trim() !== "" &&
+    originOf(message) === "person";
+
+/** The opener this monitor was armed for, or null when the transcript does not hold it. */
+const openerWatched = (monitor, openers) => {
+    const opener = openers[monitor.ordinal] ?? null;
+    const kind = monitor.kind === "stock" ? "stock" : "handoff";
+
+    if (opener === null || opener.kind !== kind || (kind === "handoff" && opener.n !== monitor.n)) {
+        return null;
+    }
+
+    return opener;
+};
+
 /**
- * What the session did with the handoff, recomputed from scratch each turn.
+ * What the session did after a compaction, recomputed from scratch each turn.
  *
- * Nothing here calls a model. Every line is a count or a copy: a re-run command
- * is one whose text matches a pre-compaction command exactly, a re-read is a
- * whole-file read of a file that was already read whole. Recomputing rather
- * than accumulating means a tick that is missed or runs twice says the same
- * thing.
+ * Nothing here calls a model. Every line is a count or a copy: a turn is one
+ * the person typed, a re-run command is one whose text matches a
+ * pre-compaction command exactly, a re-read is a whole-file read of a file that
+ * was already read whole. Recomputing rather than accumulating means a tick
+ * that is missed or runs twice says the same thing. A transcript that does not
+ * hold the opener this was armed for is `anchored: false` and ends the watch
+ * rather than guess where the new conversation starts.
  */
 export const observePost = (monitor, messages) => {
-    const compactedAgain =
-        messages.length < monitor.from || (priorHandoffIn(messages)?.lineage.n ?? monitor.n) > monitor.n;
-    const slice = messages.slice(monitor.from);
+    const openers = openersIn(messages);
+    const opener = openerWatched(monitor, openers);
+    const anchored = opener !== null;
+    const compactedAgain = anchored && openers.length > monitor.ordinal + 1;
+    const slice = anchored ? messages.slice(opener.index + monitor.from) : [];
     const after = workDone(slice);
 
     let turns = 0;
@@ -1409,15 +1538,10 @@ export const observePost = (monitor, messages) => {
     const handoffToolsCalled = [];
 
     for (const message of slice) {
-        if (message.role === "user" && firstUserMessage === null && originOf(message) === "person") {
-            firstUserMessage = clipTo(message.text ?? "", POST_MESSAGE_CHARS);
+        if (isPersonTurn(message)) {
+            turns += 1;
+            firstUserMessage ??= clipTo(message.text, POST_MESSAGE_CHARS);
         }
-
-        if (message.role !== "assistant") {
-            continue;
-        }
-
-        turns += 1;
 
         for (const use of message.toolUses ?? []) {
             const name = nameOf(use);
@@ -1435,6 +1559,8 @@ export const observePost = (monitor, messages) => {
     return {
         n: monitor.n,
         at: monitor.at,
+        kind: monitor.kind ?? "handoff",
+        anchored,
         turnsObserved: turns,
         firstUserMessage,
         turnsToFirstToolCall,
@@ -1442,6 +1568,6 @@ export const observePost = (monitor, messages) => {
         reReadFiles: after.reads.filter((file) => monitor.reads.includes(file)),
         handoffToolsCalled: unique(handoffToolsCalled),
         compactedAgain,
-        done: compactedAgain || turns >= POST_TURNS,
+        done: !anchored || compactedAgain || turns >= POST_TURNS,
     };
 };

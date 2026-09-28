@@ -452,21 +452,19 @@ export const lookupRecord = ({ at, sessionId, tool, args, text }) => ({
 
 /** The subsections a set of rows renders to: files written, failures, shell commands. */
 const ledgerBody = (rows, { full, n }) => {
-    const toolWrites = rows.filter((row) => WRITE_TOOLS.has(row.name));
-    const shellWritten = rows.flatMap((row) => (row.writes ?? []).map((path) => `- Bash \`${path}\``));
+    const written = writersByFile(rows);
     const shells = rows.filter((row) => row.name === "Bash");
     const failed = rows.filter((row) => row.outcome !== "ok" && row.outcome !== "no result in transcript");
-    const writeCount = toolWrites.length + shellWritten.length;
     const out = [
-        `${count(rows.length, "tool call")}: ${count(writeCount, "file write")}, ${count(shells.length, "shell command")}.`,
+        `${count(rows.length, "tool call")} (${count(shells.length, "shell command")}), ${count(written.size, "file")} written.`,
         "Read off the transcript rather than recalled. **The transcript stores no exit",
         "code**, so the outcome of a command is what its output supports and no more.",
         "",
     ];
 
-    if (writeCount > 0) {
-        out.push(`### Files written (${count(writeCount, "call")})`, "");
-        out.push(...unique([...toolWrites.map((row) => `- ${row.name} \`${row.target}\``), ...shellWritten]));
+    if (written.size > 0) {
+        out.push(`### Files written (${written.size})`, "");
+        out.push(...[...written].map(([path, tools]) => `- ${[...tools].join(", ")} \`${path}\``));
         out.push("");
     }
 
@@ -484,6 +482,28 @@ const ledgerBody = (rows, { full, n }) => {
 };
 
 const WRITE_TOOLS = new Set(["Write", "Edit", "NotebookEdit"]);
+
+/**
+ * Every file written, once, in the order first written, with each tool that
+ * wrote it. A file is counted once however many calls touched it: a count of
+ * calls beside a list of paths read as two numbers for one thing.
+ */
+const writersByFile = (rows) => {
+    const written = new Map();
+    const note = (path, tool) => written.set(path, (written.get(path) ?? new Set()).add(tool));
+
+    for (const row of rows) {
+        if (WRITE_TOOLS.has(row.name)) {
+            note(row.target, row.name);
+        }
+
+        for (const path of row.writes ?? []) {
+            note(path, "Bash");
+        }
+    }
+
+    return written;
+};
 
 /** Room kept for the ledger's own heading, the list's heading and the count line. */
 const SHELL_LIST_FRAME = 200;
@@ -709,7 +729,9 @@ export const shellWrites = (command) => {
     }
 
     for (const match of command.matchAll(OPEN_FOR_WRITE)) {
-        found.push(match[2]);
+        if (isRunAsCode(command, match.index)) {
+            found.push(match[2]);
+        }
     }
 
     for (const segment of segmentsOf(command)) {
@@ -723,6 +745,45 @@ export const shellWrites = (command) => {
     }
 
     return unique(found.filter((path) => PATH_SHAPED.test(path) && !SHELL_EXPANDED.test(path) && !NOT_WORK.test(path)));
+};
+
+/** A flag whose argument is a script the interpreter runs: `python3 -c`, `node -e`. */
+const SCRIPT_FLAG = /(?:^|\s)(?:-c|-e|--eval)\s*$/u;
+
+/**
+ * Whether the text at `index` is code that runs rather than a string some code
+ * only holds. On its own line it is code when no quote is left open before it,
+ * or when the one left open is the argument of `-c` or `-e`. A script that
+ * writes test cases holds `open('x','w')` inside a string, and reading that as
+ * a write listed a file nothing wrote.
+ */
+const isRunAsCode = (command, index) => {
+    const line = command.slice(command.lastIndexOf("\n", index - 1) + 1, index);
+    const opened = openQuoteIn(line);
+
+    return opened === -1 || SCRIPT_FLAG.test(line.slice(0, opened));
+};
+
+/** Where the quote still open at the end of `line` begins, or -1 when every quote closed. */
+const openQuoteIn = (line) => {
+    let quote = "";
+    let opened = -1;
+
+    for (let index = 0; index < line.length; index += 1) {
+        const char = line[index];
+
+        if (char === "\\" && quote !== "") {
+            index += 1;
+        } else if (quote === "" && (char === "'" || char === '"')) {
+            quote = char;
+            opened = index;
+        } else if (char === quote) {
+            quote = "";
+            opened = -1;
+        }
+    }
+
+    return opened;
 };
 
 /** Whether every command in a compound only looked, and none of them wrote. */

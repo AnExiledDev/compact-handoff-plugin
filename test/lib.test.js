@@ -94,8 +94,8 @@ describe("the two tool-use shapes", () => {
         it(`counts writes and shells from the ${label} shape`, () => {
             const text = renderLedger(ledgerRows(mixedConversation(make)));
 
-            assert.match(text, /6 tool calls: 1 file write, 4 shell commands\./u);
-            assert.match(text, /### Files written \(1 call\)/u);
+            assert.match(text, /6 tool calls \(4 shell commands\), 1 file written\./u);
+            assert.match(text, /### Files written \(1\)/u);
             assert.match(text, /### Every shell command, in order \(4\)/u);
         });
     }
@@ -424,12 +424,47 @@ describe("a file written through the shell is a file write", () => {
     it("is listed under Files written and counted in the header", () => {
         const text = renderLedger(shellWindow(["sed -i 's/a/b/' src/x.ts", "ls"]));
 
-        assert.match(text, /2 tool calls: 1 file write, 2 shell commands\./u);
-        assert.match(text, /### Files written \(1 call\)/u);
+        assert.match(text, /2 tool calls \(2 shell commands\), 1 file written\./u);
+        assert.match(text, /### Files written \(1\)/u);
         assert.match(text, /^- Bash `src\/x\.ts`$/mu);
     });
 
+    // A live 0.11.3 handoff said "42 tool calls: 17 file writes, 37 shell
+    // commands", 54 of 42, and headed a list of 14 files "(17 calls)": the
+    // shell writes were counted as calls on top of the Bash calls they came
+    // from, and a file written twice was counted twice and listed once.
+    it("counts files, not calls, and names each file once with every tool that wrote it", () => {
+        const rows = ledgerRows([
+            assistantTurn("x", [
+                use270("Write", { file_path: "/w/a.md", content: "a" }, { text: "ok" }),
+                use270("Edit", { file_path: "/w/a.md", old_string: "a", new_string: "b" }, { text: "ok" }),
+                use270("Bash", { command: "echo x > /w/a.md" }, { text: "" }),
+                use270("Edit", { file_path: "/w/b.js", old_string: "a", new_string: "b" }, { text: "ok" }),
+            ]),
+        ]);
+        const text = renderLedger(rows);
+
+        assert.match(text, /4 tool calls \(1 shell command\), 2 files written\./u);
+        assert.match(text, /### Files written \(2\)/u);
+        assert.match(text, /^- Write, Edit, Bash `\/w\/a\.md`$/mu);
+        assert.match(text, /^- Edit `\/w\/b\.js`$/mu);
+    });
+
+    // A live 0.11.3 handoff listed `Bash test/cli.test.ts` as written: the
+    // command was a script writing test cases, and one case was a string
+    // holding `open('test/cli.test.ts','w')`.
+    for (const command of [
+        "python3 - <<'EOF'\ncases = [\"open('test/cli.test.ts','w').write(s)\"]\nEOF",
+        "python3 - <<'EOF'\ns = '''x'''\n    \"python3 - <<'EOF'\\np='x'\\nopen('test/cli.test.ts','w').write(s)\\nEOF\",\nEOF",
+    ]) {
+        it(`does not read a write out of a string the script only holds: ${JSON.stringify(command.slice(0, 40))}`, () => {
+            assert.deepEqual(shellWrites(command), []);
+        });
+    }
+
     for (const [command, written] of [
+        ["python3 -c \"open('/tmp/x.json','w').write('{}')\"", ["/tmp/x.json"]],
+        ["node -e \"require('fs'); open('/tmp/n.txt','w')\"", ["/tmp/n.txt"]],
         ["sed -i 's/x/y/' hooks/module.js && bun test > /tmp/ch.log 2>&1", ["hooks/module.js"]],
         ["cat > /tmp/hookprobe/dump.sh <<EOF\necho hi\nEOF", ["/tmp/hookprobe/dump.sh"]],
         ["cp hooks/restore.js /tmp/restore.bak && sed -i 's/a/b/' hooks/restore.js", ["/tmp/restore.bak", "hooks/restore.js"]],

@@ -955,3 +955,133 @@ describe("a session that has already spent more than $10 on handoffs", () => {
         );
     });
 });
+
+/**
+ * The engine runs `$.model.fork` as a query loop over the main thread's
+ * transcript plus the fork prompt, and checks that loop for auto-compaction
+ * like any other. When the main thread crossed its threshold by less than the
+ * prompt's size, the fork loop is over it too, so the engine dispatches a
+ * second `session.compact` carrying the fork loop's `agentId` while this
+ * plugin's own compaction is still waiting on the fork. Passing that one
+ * through lets the engine summarise the fork loop, and the fork then answers
+ * over the summary: charged for a fraction of the context, a cold fork.
+ *
+ * The fake fork does what the engine does: it dispatches the nested
+ * compaction through the same hooks, then answers over the engine's summary
+ * when it was passed through, or over the whole conversation when skipped.
+ */
+describe("the plugin's own fork, compacted by the engine while the compaction waits on it", () => {
+    const conversation = [userTurn("go"), assistantTurn("done")];
+    const context = { tokens: 67_500, window: 100_000, percent: 67 };
+    const overSummary = {
+        input_tokens: 21_000,
+        output_tokens: 3000,
+        cache_read_input_tokens: 4000,
+        cache_creation_input_tokens: 0,
+    };
+    const overConversation = {
+        input_tokens: 1500,
+        output_tokens: 3000,
+        cache_read_input_tokens: 66_000,
+        cache_creation_input_tokens: 0,
+    };
+
+    /** A live session whose fork meets the nested compaction, and a subagent's beside it if asked. */
+    const nestingHost = (runtime, { subagentCompacts = false } = {}) => {
+        const seen = { prompt: null, own: null, subagent: null };
+        const host = fakeApi({
+            env: { COMPACT_HANDOFF_LIVE: "1" },
+            files: { "/plugin/.runs/latest.md": "THE HANDOFF ON DISK" },
+            messages: conversation,
+            session: { usage: async () => ({ context }) },
+            model: {
+                fork: async ({ prompt }) => {
+                    seen.prompt = prompt;
+
+                    if (subagentCompacts) {
+                        seen.subagent = await runtime.dispatch(
+                            "session.compact",
+                            host.$,
+                            {
+                                trigger: "auto",
+                                agentId: "agent-7",
+                                messages: [userTurn("survey the repo"), assistantTurn("reading")],
+                                instructions: "",
+                            },
+                            passThrough(),
+                        );
+                    }
+
+                    seen.own = await runtime.dispatch(
+                        "session.compact",
+                        host.$,
+                        {
+                            trigger: "auto",
+                            agentId: "fork-loop",
+                            messages: [...conversation, userTurn(prompt)],
+                            instructions: "",
+                        },
+                        passThrough(),
+                    );
+
+                    return seen.own?.passedThrough === true
+                        ? { isAnswered: true, text: "A HANDOFF OF THE ENGINE'S SUMMARY", usage: overSummary }
+                        : { isAnswered: true, text: "A HANDOFF OF THE WHOLE CONVERSATION", usage: overConversation };
+                },
+            },
+        });
+
+        return { host, seen };
+    };
+
+    const autoCompaction = () => ({ trigger: "auto", agentId: null, messages: conversation, instructions: "" });
+
+    const rowOf = (host, agentId) => host.rowsIn("index.jsonl").find((row) => row.agentId === agentId);
+
+    it("declines the fork loop's compaction, so the fork reads the whole conversation and is handed up", async () => {
+        const runtime = await registered();
+        const { host, seen } = nestingHost(runtime);
+
+        const answer = await runtime.dispatch("session.compact", host.$, autoCompaction(), passThrough());
+        const main = rowOf(host, null);
+        const forkLoop = rowOf(host, "fork-loop");
+
+        assert.equal(typeof seen.own?.skip, "string", "the nested compaction is declined, not passed through");
+        assert.equal(forkLoop.outcome, "ownFork");
+        assert.equal(forkLoop.disposition, "skipped");
+        assert.equal(main.forkInput.matchesContext, true);
+        assert.equal(main.forkOutcome, undefined);
+        assert.equal(main.outcome, "handoff");
+        assert.ok(JSON.stringify(answer.messages).includes("A HANDOFF OF THE WHOLE CONVERSATION"));
+    });
+
+    it("still passes a genuine subagent's compaction through while the fork is in flight", async () => {
+        const runtime = await registered();
+        const { host, seen } = nestingHost(runtime, { subagentCompacts: true });
+
+        await runtime.dispatch("session.compact", host.$, autoCompaction(), passThrough());
+
+        const subagent = rowOf(host, "agent-7");
+
+        assert.equal(seen.subagent?.passedThrough, true, "the engine's own compaction ran for the subagent");
+        assert.equal(subagent.outcome, "subagent");
+        assert.equal(subagent.disposition, "passedThrough");
+    });
+
+    it("never declines a main-thread compaction whose transcript quotes the fork prompt", async () => {
+        const runtime = await registered();
+        const first = nestingHost(runtime);
+
+        await runtime.dispatch("session.compact", first.host.$, autoCompaction(), passThrough());
+
+        const host = fakeApi();
+        const next = passThrough();
+        const quoted = { trigger: "manual", agentId: null, messages: [userTurn(first.seen.prompt), assistantTurn("ok")], instructions: "" };
+
+        const answer = await runtime.dispatch("session.compact", host.$, quoted, next);
+
+        assert.equal(typeof first.seen.prompt, "string");
+        assert.notEqual(lastRow(host).outcome, "ownFork");
+        assert.equal(answer?.skip, undefined);
+    });
+});

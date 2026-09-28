@@ -209,7 +209,7 @@ that matter for that second case:
 
 | field | when | what it says |
 |---|---|---|
-| `disposition` | always | `replaced`, `rehearsed`, `fellBack`, `passedThrough`, `abortedFallback`. Historical rows only: `overBudget`, written by 0.10.0 and earlier when a session had spent past its USD ceiling. That ceiling is gone, and those rows still read back through every tool |
+| `disposition` | always | `replaced`, `rehearsed`, `fellBack`, `passedThrough`, `abortedFallback`, `skipped` (the engine tried to compact this plugin's own fork loop and was declined). Historical rows only: `overBudget`, written by 0.10.0 and earlier when a session had spent past its USD ceiling. That ceiling is gone, and those rows still read back through every tool |
 | `fallbackReason` | every disposition but `replaced` | one line naming why, e.g. `noHandoff: no handoff has been written yet (fork nothing-to-fork: the fork found no warm main-thread transcript)` |
 | `forkOutcome`, `forkDetail` | every row whose fork was not handed up | why the fork's own answer was not used, and the fallback went to the handoff on disk. On engine 2.1.280 and later an unanswered fork records the engine's own `reason`: `nothing-to-fork` (no warm transcript yet), `api-error` (the detail carries the HTTP status and error kind), `empty-reply` or `aborted`, and the spend of any that made a request stays in `usage`. `timeout` is a fork that had not answered after five minutes: the compaction stops waiting and falls back, but the engine gives a plugin no way to cancel a fork, so the request runs on and still spends, and its answer is dropped when it arrives (that spend is on no row). `mismatch` is an answer refused by the `forkInput` check below, `threw` anything unexpected. Rows from 0.10.0 and earlier say `cold` where they now say `nothing-to-fork` |
 | `cost` | always | `{forkUsd, commitmentsUsd, commitmentsBasis, totalUsd, cacheReadWaivedUsd, basis, forkUsage, model, priced, pricesTaken}`, or `null`. Since 0.4.1 cache reads are stored in `forkUsage.cacheRead` and priced into `cacheReadWaivedUsd` at list, and never added to `forkUsd` or `totalUsd`, because on a subscription they cost nothing; `basis` says so. Rows from 0.4.0 and earlier charged them. `commitmentsBasis` is `measured: the usage the result reported` after 0.10.0, `estimate: chars/4, no cache` from 0.4.0 (and since, on a result that arrives with no usage), `none` when no commitments pass ran, `measured` on rows from 0.3.0 and earlier |
@@ -217,7 +217,7 @@ that matter for that second case:
 | `forkInput` | every row, `null` on the rows that never forked | what the fork was charged to read against what the session holds: `{sent, cacheRead, contextTokens, matchesContext}`. `sent` is input plus cache read plus cache write, which is the whole conversation for a warm fork and a prefix for a cold one; `matchesContext` is false when `sent` falls more than a fifth short of `contextTokens`, and that is the reading that refuses the fork's answer (`forkOutcome: "mismatch"`). Added in 0.6.0 |
 | `forkContext` | every row that forked | what the session looked like the instant before `$.model.fork`: `{context, model, messages, msSinceLastFork, subagentRanThisTurn}`, where `context` is the whole `$.session.usage().context` object (`tokens`, `window`, `percent`) and `msSinceLastFork` is `null` on a session's first fork |
 | `parts` | every `replaced` and `rehearsed` row | per-part sizes and timings; for the commitments pass, `commitmentsVia`, `commitmentsModel`, `commitmentsPromptChars`, `commitmentsReplyChars`, `commitmentsTokensEstimated` (null when the cost is measured), `commitmentsCostUsd`, `commitmentsCostBasis`, after 0.10.0 `commitmentsUnanswered` (the engine's `reason` when the call came back with no reply) and `commitmentsStatus` (the HTTP status on an `api-error`, null when no response arrived), and since 0.4.0 `commitmentsRows` (how many rows came back) with `commitmentsHitCap` and `commitmentsHitCapReason` (`length` or `truncated row`) saying whether the reply stopped at the 8192-token output cap |
-| `seam` | every row this plugin handled itself | `{subscribers, results}`, where each result is `{name, outcome, elapsedMs}` and `outcome` is `ok`, `threw` or `timedOut`; `{subscribers: 0}` alone when nothing subscribed. Absent on `passedThrough` rows, which never reach the seam, and on the historical `overBudget` rows of 0.10.0 and earlier |
+| `seam` | every row this plugin handled itself | `{subscribers, results}`, where each result is `{name, outcome, elapsedMs}` and `outcome` is `ok`, `threw` or `timedOut`; `{subscribers: 0}` alone when nothing subscribed. Absent on `passedThrough` and `skipped` rows, which never reach the seam, and on the historical `overBudget` rows of 0.10.0 and earlier |
 | `costUnknownReason` | when `cost` is `null` | why it could not be priced. A run is never priced at 0 because its usage was missing |
 | `costNote` | when nothing was spent | `no model call was made`. A pass-through costs a real zero, which is not the same as unknown |
 | `overCeiling` | always | the size guard could not fit the replacement, because the handoff itself is larger than the ceiling and is never trimmed |
@@ -693,6 +693,20 @@ None of the fourteen warm rows has such a partner.
 `SessionCompactInput.agentId` is declared as "the id of the loop compacting,
 for a subagent's **or a fork's** own transcript". `notes/design/compact-handoff-cold-forks.md` in the
 `claude-investigations` repo holds the measurement and what it could not show.
+
+The partner is the fork itself. On engine 2.1.283 `$.model.fork` runs the
+ordinary query loop over the main thread's transcript plus the fork prompt,
+and that loop is checked for auto-compaction like any other. A session that
+crossed its threshold by less than the size of the fork prompt has a fork loop
+over the threshold too, so the engine compacts the fork loop, and a plugin
+that passed it through as a subagent had its fork answer over the engine's
+summary. This plugin now answers that compaction with `{ skip }` (the row says
+`outcome: "ownFork"`, `disposition: "skipped"`), and the fork reads the whole
+conversation. It knows the loop by the fork prompt in the loop's transcript,
+which a genuine subagent's never holds, so a subagent compacting at the same
+moment still passes through. `python3 bench/coldfork.py --unfixed` reproduces a
+cold fork in a sandboxed session on Haiku for about $0.50; without `--unfixed`
+the same run comes back warm and `replaced`.
 
 ## What was verified live
 

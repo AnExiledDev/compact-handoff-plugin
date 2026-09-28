@@ -487,6 +487,21 @@ export const register = (on, pluginOptions) => {
             engine: ((await $.env.get("CLAUDE_CODE_VERSION")) ?? null) || null,
         };
 
+        // The fork this plugin is waiting on is itself a query loop, and the
+        // engine checks it for auto-compaction like any other. Passing it
+        // through lets the engine summarise it, and the fork then answers over
+        // that summary instead of this conversation: a cold fork. Declining it
+        // lets the fork read the real transcript.
+        if (isOwnForkLoop(e)) {
+            record.outcome = "ownFork";
+            record.detail = "the engine tried to compact this plugin's own handoff fork; declined so the fork reads the conversation";
+            record.elapsedMs = Date.now() - startedAt;
+
+            await finish($, record, "skipped");
+
+            return { skip: "compact-handoff's own handoff fork reads the conversation uncompacted" };
+        }
+
         // A subagent's compaction is a different conversation with a different
         // owner, and nothing here has been measured against one. Pass it
         // through with a row rather than reshape a transcript this plugin has
@@ -2623,6 +2638,18 @@ const safely = async ($, read) => {
 
 /** The bench tools, off unless this is the bench. */
 const isDev = async ($) => isOn(opt("dev") ?? (await $.env.get("COMPACT_HANDOFF_DEV")));
+
+/**
+ * Whether a compaction is of this plugin's own fork loop: not the main thread,
+ * and carrying the fork prompt as a user turn. A genuine subagent's transcript
+ * never holds it. Read off the event rather than an in-flight flag, because
+ * `$.store` is shared by every session and would mark another session's
+ * subagent too.
+ */
+const isOwnForkLoop = (e) =>
+    e.agentId !== null &&
+    e.agentId !== undefined &&
+    e.messages.some((message) => message.role === "user" && (message.text ?? "").trimStart().startsWith(FORK_PROMPT.trim()));
 
 /** Whether a subagent's own compaction is handled here rather than passed through. */
 const handlesSubagents = async ($) => isOn(opt("subagents") ?? (await $.env.get("COMPACT_HANDOFF_SUBAGENTS")));

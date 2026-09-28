@@ -1385,6 +1385,36 @@ describe("the ten turns after a compaction, watched in a transcript that holds e
         }
     });
 
+    // A watch was only ever written at the end of a turn, so a compaction
+    // that came before the first one ended replaced it unwritten: the
+    // quickest re-compaction, the one "compacted again" exists to count,
+    // left no record at all.
+    it("records a watch as compacted again when the next compaction comes before any turn ends", async () => {
+        const runtime = await registered();
+        const host = liveHost();
+
+        try {
+            host.as("A", before);
+            await runtime.dispatch("session.start", host.$, {});
+
+            const answer = await runtime.dispatch("session.compact", host.$, compaction({ messages: before }), compactNext());
+            const window = [...answer.messages, userTurn("Carry on.")];
+
+            host.as("A", [...before, ...window]);
+            await runtime.dispatch("session.compact", host.$, compaction({ messages: window }), compactNext());
+
+            const first = [...host.files.keys()].find((key) => /\/sessions\/A\/001-.*\.post\.json$/u.test(key));
+            const post = JSON.parse(host.files.get(first));
+
+            assert.equal(post.anchored, true);
+            assert.equal(post.compactedAgain, true);
+            assert.equal(post.done, true);
+            assert.equal(post.turnsObserved, 1);
+        } finally {
+            host.stopTimers();
+        }
+    });
+
     // The engine's own compaction is the baseline a handoff is judged against,
     // and until 0.11.5 nothing watched one.
     it("watches a compaction the engine did itself, as the baseline", async () => {

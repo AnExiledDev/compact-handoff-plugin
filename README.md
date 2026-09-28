@@ -12,6 +12,8 @@ promised and never finished.
 It also keeps the conversation it replaced, so anything the handoff left out can
 still be searched for afterwards.
 
+By the same author: [changelogs.core-directive.com](https://changelogs.core-directive.com), a changelog for every Claude Code release, written from what changed in the build.
+
 ## What a compaction hands up
 
 Six parts. Only the first is a model summarising a conversation.

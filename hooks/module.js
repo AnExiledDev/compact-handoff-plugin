@@ -885,13 +885,20 @@ const capOf = (value, fallback) => {
  * not count against the ten second dispatch budget: measured at 21768 ms from
  * `turn.complete`, not aborted.
  *
- * Null means no warm transcript (a cold session, or a headless one), which is
- * what the handoff on disk is kept for.
+ * The fork resolves `ModelForkResult`, the union engine 2.1.280 introduced.
+ * Engines before it resolved the reply or null, and that shape is not read any
+ * more: the plugin targets 2.1.280 and later, and a dual-shape shim would hide
+ * the next change the way the null check hid this one. An unanswered fork is a named
+ * outcome (`nothing-to-fork`, which is no warm transcript and what the handoff
+ * on disk is kept for, then `api-error`, `empty-reply` and `aborted`), and the
+ * caller falls back on it like any other.
  *
  * A reply is not proof that the fork read this conversation. Some forks come
  * back having been charged for a fraction of the session's context (#690), and
  * the reply reads like any other summary, so `record.forkInput` is compared
  * against the context and a short one is refused here rather than handed up.
+ *
+ * @param {import('claude-code').EngineInterface} $
  */
 const forkHandoff = async ($, e, record) => {
     const asked = typeof e.instructions === "string" && e.instructions.trim() !== ""
@@ -902,8 +909,14 @@ const forkHandoff = async ($, e, record) => {
 
     const reply = await $.model.fork({ prompt: asked });
 
-    if (reply === null) {
-        return { outcome: "cold", detail: "the fork found no warm main-thread transcript" };
+    if (!reply.isAnswered) {
+        // Every arm but `nothing-to-fork` made a request, and what it spent
+        // stays on the row after the fallback replaces its answer.
+        if (reply.reason !== "nothing-to-fork") {
+            record.usage = reply.usage;
+        }
+
+        return { outcome: reply.reason, detail: unansweredForkDetail(reply) };
     }
 
     record.forkInput = forkInputOf(reply.usage, record.forkContext?.context ?? null);
@@ -938,6 +951,38 @@ const forkHandoff = async ($, e, record) => {
         usage: reply.usage,
         detail: "",
     };
+};
+
+/**
+ * Why a fork came back without a reply, in the words the row keeps.
+ *
+ * @param {Exclude<import('claude-code').ModelForkResult, { isAnswered: true }>} reply
+ * @returns {string}
+ */
+const unansweredForkDetail = (reply) => {
+    switch (reply.reason) {
+        case "nothing-to-fork":
+            return "the fork found no warm main-thread transcript";
+        case "api-error":
+            return `the fork's request failed: ${reply.error}, status ${reply.status ?? "none, no response arrived"}`;
+        case "empty-reply":
+            return "the fork replied with no text";
+        case "aborted":
+            return "the fork was cut off by the turn's abort";
+        default:
+            return unreachable(reply);
+    }
+};
+
+/**
+ * A union arm no case above handles. The `never` makes a new arm in the
+ * engine's declarations a type error here rather than a silent fallthrough.
+ *
+ * @param {never} value
+ * @returns {never}
+ */
+const unreachable = (value) => {
+    throw new Error(`an arm nothing handles: ${JSON.stringify(value)}`);
 };
 
 /**
@@ -1122,7 +1167,16 @@ const attempt = async ($, notes, name, build) => {
     }
 };
 
-/** The promise, or a throw naming what ran long. Never a hung compaction. */
+/**
+ * The promise, or a throw naming what ran long. Never a hung compaction.
+ *
+ * @template T
+ * @param {import('claude-code').EngineInterface} $
+ * @param {Promise<T>} promise
+ * @param {number} ms
+ * @param {string} what
+ * @returns {Promise<T>}
+ */
 const withTimeout = ($, promise, ms, what) =>
     Promise.race([
         promise,
@@ -1242,11 +1296,20 @@ const readCommand = async ($, argv) => {
  * nobody is kept below under "A4" because the trap it describes is still real
  * for anyone spawning the CLI.
  *
- * The cost is an ESTIMATE. `$.model.complete` returns the text alone and
- * drops the usage the API sent back, and nothing it spends reaches
- * `$.session.usage().cost`, so the number recorded is the prompt and reply at
- * four characters a token, priced at the model's own rate with no cache terms,
- * and it is labelled as such on the row. It is never recorded as 0.
+ * The call resolves `ModelCompleteResult`, the union engine 2.1.280
+ * introduced. Engines before it resolved the reply as a bare string, and that
+ * shape is not read any more: every reply on 2.1.280 read as 0 characters
+ * because the string check never matched, so a dual-shape shim would only hide
+ * the next change the same way. An unanswered result renders no section and
+ * the row names its `reason`, with `status` on an `api-error`.
+ *
+ * The cost is priced from the `usage` the result carries, which every arm has.
+ * Nothing the call spends reaches `$.session.usage().cost`, so this is the only
+ * record of it. When a result arrives without `usage`, the prompt and reply are
+ * priced at four characters a token with no cache terms instead, and the row's
+ * basis says which one it was. It is never recorded as 0.
+ *
+ * @param {import('claude-code').EngineInterface} $
  */
 const commitmentsSection = async ($, messages, notes) => {
     const turns = assistantTurns(messages);
@@ -1271,13 +1334,18 @@ const commitmentsSection = async ($, messages, notes) => {
         COMMITMENTS_MS,
         "commitments",
     );
-    const text = typeof reply === "string" ? reply : "";
-    const priced = priceUsage(estimatedUsage(prompt.length, text.length), COMMITMENT_MODEL);
+    const text = reply.isAnswered ? reply.text : "";
+
+    if (!reply.isAnswered) {
+        notes.commitmentsUnanswered = reply.reason;
+
+        if (reply.reason === "api-error") {
+            notes.commitmentsStatus = reply.status;
+        }
+    }
 
     notes.commitmentsReplyChars = text.length;
-    notes.commitmentsTokensEstimated = priced.tokens ?? null;
-    notes.commitmentsCostUsd = priced.usd;
-    notes.commitmentsCostBasis = priced.usd === null ? `unpriced: ${priced.reason}` : "estimate: chars/4, no cache";
+    Object.assign(notes, commitmentsCost(reply.usage, prompt.length, text.length));
 
     // `$.model.complete` stops at its output cap without saying so; the row says.
     const outcome = commitmentsOutcome(text, COMMITMENT_MAX_TOKENS);
@@ -1287,6 +1355,26 @@ const commitmentsSection = async ($, messages, notes) => {
     notes.commitmentsHitCapReason = outcome.hitCapReason;
 
     return renderCommitments(commitmentsFrom(text));
+};
+
+/**
+ * What the commitments call cost, from the usage it reported or, failing that,
+ * from its size, and which of the two the row is reading.
+ *
+ * @param {import('claude-code').ModelUsage | undefined} usage
+ * @param {number} promptChars
+ * @param {number} replyChars
+ */
+const commitmentsCost = (usage, promptChars, replyChars) => {
+    const isMeasured = usage !== undefined && usage !== null;
+    const priced = priceUsage(isMeasured ? usage : estimatedUsage(promptChars, replyChars), COMMITMENT_MODEL);
+    const basis = isMeasured ? "measured: the usage the result reported" : "estimate: chars/4, no cache";
+
+    return {
+        commitmentsTokensEstimated: isMeasured ? null : (priced.tokens ?? null),
+        commitmentsCostUsd: priced.usd,
+        commitmentsCostBasis: priced.usd === null ? `unpriced: ${priced.reason}` : basis,
+    };
 };
 
 /**
@@ -1705,10 +1793,10 @@ const probeBudget = async ($, e, signal) => {
             const asked = typeof e.prompt === "string" && e.prompt.trim() !== "" ? e.prompt : FORK_PROMPT;
             const reply = await $.model.fork({ prompt: asked });
 
-            record.outcome = reply === null ? "null" : "answered";
-            record.forkChars = reply === null ? 0 : reply.text.length;
-            record.usage = reply === null ? null : reply.usage;
-            record.head = clip(reply === null ? "" : reply.text);
+            record.outcome = reply.isAnswered ? "answered" : reply.reason;
+            record.forkChars = reply.isAnswered ? reply.text.length : 0;
+            record.usage = "usage" in reply ? reply.usage : null;
+            record.head = clip(reply.isAnswered ? reply.text : "");
         } else {
             const seconds = typeof e.seconds === "number" && e.seconds > 0 ? Math.floor(e.seconds) : 30;
             const ran = await $.process.run(["sleep", String(seconds)], { timeoutMs: (seconds + 30) * 1000 });
@@ -1753,8 +1841,8 @@ const runVariant = async ($, { label, replicates }, signal) => {
         try {
             const reply = await $.model.fork({ prompt: asked });
 
-            if (reply === null) {
-                record.outcome = "cold";
+            if (!reply.isAnswered) {
+                record.outcome = reply.reason;
             } else {
                 const file = `${AB_OUT}/${label}-${stamp}-${n}.md`;
 

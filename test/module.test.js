@@ -2,8 +2,9 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
+import { priceUsage } from "../hooks/lib.js";
 import { PLUGIN_VERSION } from "../hooks/module.js";
-import { assistantTurn, fakeApi, fakeRuntime, passThrough, userTurn } from "./fixtures.js";
+import { answered, assistantTurn, fakeApi, fakeRuntime, noUsage, passThrough, userTurn } from "./fixtures.js";
 
 // `node --check` reads module.js as a script and never sees an `await` in a
 // non-async arrow; 0.2.0 shipped one and only `claude plugin validate` caught
@@ -382,7 +383,7 @@ describe("a subscriber on the seam", () => {
                 await withDeadline(seamIsRunning, "the seam");
                 forkSawTheSeam = true;
 
-                return { text: "A handoff.", usage: { input_tokens: 1 } };
+                return answered("A handoff.", { input_tokens: 1 });
             },
         };
 
@@ -543,7 +544,7 @@ describe("a fork charged for a fraction of the session's context", () => {
             env: { COMPACT_HANDOFF_LIVE: "1" },
             files: { "/plugin/.runs/latest.md": "THE HANDOFF ON DISK" },
             messages: [userTurn("go"), assistantTurn("done")],
-            model: { fork: async () => ({ text: "A SUMMARY OF SOME OTHER CONVERSATION", usage }) },
+            model: { fork: async () => answered("A SUMMARY OF SOME OTHER CONVERSATION", usage) },
             session: { usage: async () => ({ context: { tokens: 164_273, window: 200_000, percent: 82 } }) },
         });
 
@@ -611,6 +612,134 @@ describe("a fork charged for a fraction of the session's context", () => {
     });
 });
 
+/* ------------------------------------------------------------------ *
+ * The model calls, read as the result unions engine 2.1.280 resolves.
+ * ------------------------------------------------------------------ */
+
+/** A fork that read this conversation: charged for at least the 12k context the fixture reports. */
+const warmForkUsage = {
+    input_tokens: 10,
+    output_tokens: 400,
+    cache_read_input_tokens: 12_000,
+    cache_creation_input_tokens: 0,
+};
+
+/**
+ * The commitments pass has to see its reply, or the handoff ships without the
+ * one section a reading cannot produce. A string check read every result object
+ * as an empty reply, so the section vanished and nothing on the row said why.
+ */
+describe("the commitments pass, read as the result the engine resolves", () => {
+    const COMMITMENT = "UNKEPT | T2 | I will rerun the gate | no later run appears";
+
+    /** A live session whose fork answers, so the assembled handoff is handed up. */
+    const committingHost = (complete) =>
+        seamHost({
+            env: { COMPACT_HANDOFF_LIVE: "1" },
+            messages: [userTurn("go"), assistantTurn("I will rerun the gate.")],
+            model: { fork: async () => answered("THE FORK'S SUMMARY", warmForkUsage), complete },
+        });
+
+    it("carries an answered reply's commitments into the handoff, priced from the reply's own usage", async () => {
+        const runtime = await seamRegistered();
+        const passUsage = {
+            input_tokens: 1_000_000,
+            output_tokens: 1000,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        };
+        const host = committingHost(async () => answered(COMMITMENT, passUsage));
+
+        try {
+            const answer = await runtime.dispatch("session.compact", host.$, compaction(), compactNext());
+            const parts = lastRow(host).parts;
+            const handedUp = JSON.stringify(answer.messages);
+
+            assert.ok(handedUp.includes("I will rerun the gate"), "the commitment reached the handoff");
+            assert.equal(parts.commitmentsReplyChars, COMMITMENT.length);
+            assert.equal(parts.commitmentsRows, 1);
+            // A million input tokens is what the API counted; four characters a
+            // token over this prompt would price a few thousand.
+            assert.equal(parts.commitmentsCostUsd, priceUsage(passUsage, parts.commitmentsModel).usd);
+            assert.match(parts.commitmentsCostBasis, /^measured/u);
+        } finally {
+            host.stopTimers();
+        }
+    });
+
+    it("hands the handoff up without the section when the pass went unanswered, and says why", async () => {
+        const runtime = await seamRegistered();
+        const host = committingHost(async () => ({
+            isAnswered: false,
+            reason: "api-error",
+            status: 529,
+            error: "overloaded",
+            usage: noUsage(),
+        }));
+
+        try {
+            const answer = await runtime.dispatch("session.compact", host.$, compaction(), compactNext());
+            const row = lastRow(host);
+            const handedUp = JSON.stringify(answer.messages);
+
+            assert.equal(row.disposition, "replaced");
+            assert.ok(handedUp.includes("THE FORK'S SUMMARY"));
+            assert.ok(!handedUp.includes("Commitments and open questions"));
+            assert.equal(row.parts.commitmentsReplyChars, 0);
+            assert.equal(row.parts.commitmentsUnanswered, "api-error");
+            assert.equal(row.parts.commitmentsStatus, 529);
+        } finally {
+            host.stopTimers();
+        }
+    });
+});
+
+/**
+ * A fork resolves a named reason when it has no reply, never null. Each one is
+ * a fallback to the handoff on disk that the row names, and never a TypeError
+ * the row can only call `threw`.
+ */
+describe("a fork the engine left unanswered", () => {
+    const spent = { input_tokens: 90_000, output_tokens: 12, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
+    const arms = [
+        { isAnswered: false, reason: "nothing-to-fork" },
+        { isAnswered: false, reason: "api-error", status: 500, error: "server_error", usage: noUsage() },
+        { isAnswered: false, reason: "empty-reply", usage: spent },
+        { isAnswered: false, reason: "aborted", usage: noUsage() },
+    ];
+
+    for (const arm of arms) {
+        it(`records ${arm.reason} and falls back to the handoff on disk`, async () => {
+            const runtime = await registered();
+            const host = fakeApi({
+                env: { COMPACT_HANDOFF_LIVE: "1" },
+                files: { "/plugin/.runs/latest.md": "THE HANDOFF ON DISK" },
+                messages: [userTurn("go"), assistantTurn("done")],
+                model: { fork: async () => arm },
+            });
+
+            host.store.set("ready", { messages: 2, at: new Date().toISOString() });
+
+            const answer = await runtime.dispatch("session.compact", host.$, compaction(), passThrough());
+            const row = lastRow(host);
+
+            assert.equal(row.forkOutcome, arm.reason);
+            assert.equal(row.outcome, "handoff");
+            assert.ok(JSON.stringify(answer.messages).includes("THE HANDOFF ON DISK"));
+        });
+    }
+
+    // The request was made and paid for even though nothing came back.
+    it("keeps what an unanswered fork spent on the row", async () => {
+        const runtime = await registered();
+        const host = fakeApi({ model: { fork: async () => arms[2] } });
+
+        await runtime.dispatch("session.compact", host.$, compaction(), passThrough());
+
+        assert.equal(lastRow(host).usage.input_tokens, 90_000);
+    });
+});
+
 /**
  * A session's spend is not a reason to stop handing off. The sessions that
  * compact most are the long ones, which are the ones that most need a good
@@ -650,7 +779,7 @@ describe("a session that has already spent more than $10 on handoffs", () => {
 
                     // Read over the whole 12k-token context the fixture holds,
                     // so the answer is this conversation's and is handed up.
-                    return { text: "A handoff.", usage: { input_tokens: 10, cache_read_input_tokens: 12_000 } };
+                    return answered("A handoff.", { input_tokens: 10, cache_read_input_tokens: 12_000 });
                 },
             },
         });

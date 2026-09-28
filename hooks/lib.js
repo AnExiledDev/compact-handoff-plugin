@@ -871,9 +871,9 @@ export const forkInputOf = (usage, context) => {
 /**
  * A usage record made from character counts, at four characters a token.
  *
- * `$.model.complete` returns text alone and drops the usage the API sent back,
- * so the commitments pass can only be estimated. The estimate is labelled as
- * one wherever it is recorded, and it has no cache terms because nothing here
+ * The commitments pass prices from the `usage` its result carries, and falls
+ * back to this only when a result arrives without one. The estimate is labelled
+ * as one wherever it is recorded, and it has no cache terms because nothing here
  * can know whether the prompt was served from cache.
  */
 export const estimatedUsage = (promptChars, replyChars) => ({

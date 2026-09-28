@@ -122,6 +122,18 @@ const MAX_TOOL_TEXT_CHARS = 600;
 let options = {};
 
 /**
+ * Per-session watch state, keyed by session id: the compaction being watched,
+ * and each session's turn count for `window.jsonl`. Module memory rather than
+ * `$.store`, because the store is one file every session on the box shares:
+ * a counter kept there counted every session's turns as one, and a monitor
+ * kept there could be read and ended by whichever session ticked first. A hot
+ * reload forgets both; the post file keeps what it had and the next rows say
+ * `turn: null`.
+ */
+let watches = new Map();
+let windows = new Map();
+
+/**
  * One `userConfig` value as a non-empty string, or `undefined` so that `??`
  * falls through to the variable. Stringified, because every parser below takes
  * the text `$.env.get` returns and a declared number or boolean has to read
@@ -231,6 +243,8 @@ import {
     nameOf,
     monitorSeed,
     observePost,
+    openersIn,
+    originOf,
     pinSkipCounts,
     priorHandoffIn,
     sectionOf,
@@ -248,8 +262,12 @@ import {
 
 export const register = (on, pluginOptions) => {
     options = pluginOptions ?? {};
+    watches = new Map();
+    windows = new Map();
 
     on("session.start", async ($, e, next) => {
+        await safely($, () => startWindow($));
+
         await $.tool.register({
             name: "force_compact",
             description:
@@ -502,7 +520,7 @@ export const register = (on, pluginOptions) => {
             pinnable: e.messages.filter(isPinnable).length,
             pinnedSkipped: pinSkipCounts(e.messages),
             plugin: await pluginVersion($),
-            engine: ((await $.env.get("CLAUDE_CODE_VERSION")) ?? null) || null,
+            engine: await engineVersion($),
         };
 
         // The fork this plugin is waiting on is itself a query loop, and the
@@ -577,7 +595,12 @@ export const register = (on, pluginOptions) => {
 
             await finish($, record, "fellBack", { transcript: renderTranscript(e.messages) });
 
-            return next(e);
+            const ordinal = await openerOrdinal($, record);
+            const result = await next(e);
+
+            armStock(record, ordinal, e.messages, result);
+
+            return result;
         }
 
         // The model's summary is only the first of four parts. The rest are read
@@ -629,7 +652,12 @@ export const register = (on, pluginOptions) => {
 
             await finish($, record, "rehearsed", artifacts);
 
-            return next(e);
+            const ordinal = await openerOrdinal($, record);
+            const result = await next(e);
+
+            armStock(record, ordinal, e.messages, result);
+
+            return result;
         }
 
         // A dispatch the engine has already given up on cannot be trusted to
@@ -638,11 +666,22 @@ export const register = (on, pluginOptions) => {
         if (next.signal.aborted) {
             await finish($, record, "abortedFallback", artifacts);
 
-            return next(e);
+            const ordinal = await openerOrdinal($, record);
+            const result = await next(e);
+
+            armStock(record, ordinal, e.messages, result);
+
+            return result;
         }
 
+        const ordinal = await openerOrdinal($, record);
+
         await finish($, record, "replaced", artifacts);
-        await armMonitor($, record, e.messages, replacement.length);
+
+        if (ordinal !== null) {
+            armMonitor(record, { kind: "handoff", ordinal, from: replacement.length, before: e.messages });
+            restartWindow(record.sessionId);
+        }
 
         return { messages: replacement };
     });
@@ -677,7 +716,7 @@ export const register = (on, pluginOptions) => {
  * empty table, so nothing at the fold can read the manifest. `test/module.test.js`
  * asserts it against `.claude-plugin/plugin.json` so the two cannot drift.
  */
-export const PLUGIN_VERSION = "0.11.4";
+export const PLUGIN_VERSION = "0.11.5";
 
 /** How long one subscriber may run before the compaction goes on without it. */
 const DEFAULT_SEAM_TIMEOUT_MS = 90_000;
@@ -1213,6 +1252,15 @@ const COMMITMENT_MAX_TOKENS = 8192;
  * compactions of this conversation. Only this compaction's ledger is rendered;
  * the earlier ones stay on disk behind `handoff_lookup`.
  */
+/**
+ * Every handoff says how to report what it got wrong. Through 0.11.4 none did,
+ * and `handoff_feedback`, the only live reading of a handoff's quality, went
+ * unused in 739 compactions.
+ */
+const FEEDBACK_NOTE =
+    "If this handoff turns out to be missing something or wrong about something, record what with " +
+    "handoff_feedback (note=<what>). It is the only live measure of handoff quality.";
+
 const assembledHandoff = async ($, e, summary, context, depth) => {
     const startedAt = Date.now();
     const notes = {};
@@ -1224,7 +1272,7 @@ const assembledHandoff = async ($, e, summary, context, depth) => {
         attempt($, notes, "commitments", () => commitmentsSection($, e.messages, notes)),
     ]);
 
-    const parts = [context.lineage, context.earlierNote, summary, ledger, state, commitments].filter(
+    const parts = [context.lineage, context.earlierNote, FEEDBACK_NOTE, summary, ledger, state, commitments].filter(
         (part) => part !== "",
     );
 
@@ -2587,28 +2635,98 @@ const logged = async ($, tool, args, text) => {
  * D: what the session did with the handoff, for the ten turns after.
  * ------------------------------------------------------------------ */
 
-/** The compaction being watched, and the work the conversation had already done. */
-const MONITOR_KEY = "monitor";
-
-const armMonitor = async ($, record, before, from) => {
-    await $.store.set(MONITOR_KEY, {
-        ...monitorSeed({ session: record.sessionId, n: record.depth, at: record.at, from, messages: before }),
+/** Starts watching a compaction: where the new conversation begins, and the work the old one did. */
+const armMonitor = (record, { kind, ordinal, from, before }) => {
+    watches.set(record.sessionId, {
+        ...monitorSeed({ session: record.sessionId, n: record.depth, at: record.at, kind, ordinal, from, messages: before }),
         stem: stemOf(record),
         disposition: record.disposition,
     });
 };
 
 /**
- * One tick of the watch: no model call, nothing but counting.
- *
- * The file is rewritten every turn rather than at the end, so a session that
- * ends or compacts again mid-watch still leaves the turns it did observe.
+ * How many openers a main session's transcript holds before it compacts, or
+ * null for a subagent: its compaction is a different conversation, and
+ * arming it would replace the main session's watch.
  */
+const openerOrdinal = async ($, record) => {
+    if (record.agentId !== null) {
+        return null;
+    }
+
+    return safely($, async () => openersIn(await $.session.messages()).length);
+};
+
+/**
+ * Watches a compaction the engine did itself, as the baseline a handoff is
+ * compared against. The engine's result starts its new conversation with a
+ * continuation summary; one that carries none is left unwatched rather than
+ * anchored on a guess.
+ */
+const armStock = (record, ordinal, before, result) => {
+    if (ordinal === null) {
+        return;
+    }
+
+    const messages = Array.isArray(result?.messages) ? result.messages : [];
+    const opener = messages.findIndex((message) => message.role === "user" && originOf(message) === "continuation");
+
+    restartWindow(record.sessionId);
+
+    if (opener !== -1) {
+        armMonitor(record, { kind: "stock", ordinal, from: messages.length - opener, before });
+    }
+};
+
+/**
+ * The engine's version, as `claude --version` prints it. `CLAUDE_CODE_VERSION`
+ * is the fallback only: it is unset in an ordinary session, which left
+ * `engine` null on every row through 0.11.4.
+ */
+const engineVersion = async ($) =>
+    (await safely($, async () => (await $.session.version()).version)) ??
+    (((await safely($, () => $.env.get("CLAUDE_CODE_VERSION"))) ?? null) || null);
+
 /** One occupancy reading per turn, across every session, fresh or resumed. */
 const WINDOW_LOG = "window.jsonl";
 
-/** How many turns this session has completed, so turn 1 can be read as a floor. */
-const TURNS_KEY = "compact-handoff:turns";
+/** The last opener's position, which names the window a session is in. */
+const windowKeyOf = (messages) => openersIn(messages).at(-1)?.index ?? -1;
+
+/** A session starts counting at turn 1 in the window it opens in. */
+const startWindow = async ($) => {
+    const session = await $.session.id();
+    const messages = await safely($, () => $.session.messages());
+
+    windows.set(session, { key: messages === null ? null : windowKeyOf(messages), turn: 0 });
+};
+
+/** A compaction starts a new window; its key is adopted from the first reading after it. */
+const restartWindow = (session) => {
+    windows.set(session, { key: null, turn: 0 });
+};
+
+/**
+ * This session's turn in its current window, or null when that cannot be
+ * known: a hot reload forgot the count, or the window changed under a
+ * compaction this module never saw.
+ */
+const windowTurn = (session, messages) => {
+    const key = messages === null ? null : windowKeyOf(messages);
+    const state = windows.get(session) ?? { key, turn: null };
+
+    if (state.key === null) {
+        state.key = key;
+    } else if (key !== null && state.key !== key) {
+        state.key = key;
+        state.turn = null;
+    }
+
+    state.turn = state.turn === null ? null : state.turn + 1;
+    windows.set(session, state);
+
+    return state.turn;
+};
 
 /**
  * What carrying the handoff actually costs, logged every turn of every session.
@@ -2624,35 +2742,40 @@ const TURNS_KEY = "compact-handoff:turns";
  * row and nothing else.
  */
 const watchWindow = async ($) => {
-    const turn = ((await safely($, () => $.store.get(TURNS_KEY))) ?? 0) + 1;
-
-    await safely($, () => $.store.set(TURNS_KEY, turn));
-
+    const session = await safely($, () => $.session.id());
     const usage = await safely($, () => $.session.usage());
     // `TurnCompleteInput` carries no transcript: `answer`, `durationMs`,
     // `aborted`, `turnId`, `reason` and nothing else. Reading `e.messages` off
     // it threw a `TypeError` on every turn at 2.1.273 and the row was never
     // written. `$.session.messages()` is the declared way to ask, and like
-    // every other reading here it costs its own field when it fails.
+    // every other reading here it costs its own field when it fails. It is
+    // the whole session, every window since the first, so the window this
+    // turn is in is the one the last opener started.
     const messages = await safely($, () => $.session.messages());
-    const prior = messages === null ? null : priorHandoffIn(messages);
+    const opener = messages === null ? null : (openersIn(messages).at(-1) ?? null);
     const row = windowReading({
         at: new Date().toISOString(),
-        session: await safely($, () => $.session.id()),
-        turn,
+        session,
+        turn: windowTurn(session, messages),
         context: usage?.context ?? null,
         messages: messages === null ? null : messages.length,
-        handoff:
-            prior === null ? null : { n: prior.lineage.n, chars: (messages[prior.index].text ?? "").length },
+        opener,
     });
 
     await safely($, async () => appendLine($, `${await dataDir($)}/${WINDOW_LOG}`, JSON.stringify(row)));
 };
 
+/**
+ * One tick of the watch: no model call, nothing but counting.
+ *
+ * The file is rewritten every turn rather than at the end, so a session that
+ * ends or compacts again mid-watch still leaves the turns it did observe.
+ */
 const watchPost = async ($) => {
-    const monitor = await $.store.get(MONITOR_KEY);
+    const session = await $.session.id();
+    const monitor = watches.get(session);
 
-    if (monitor === undefined || monitor === null) {
+    if (monitor === undefined) {
         return;
     }
 
@@ -2662,7 +2785,7 @@ const watchPost = async ($) => {
     await $.fs.write(`${dir}/${monitor.stem}.post.json`, `${JSON.stringify(observed, null, 2)}\n`);
 
     if (observed.done) {
-        await $.store.delete(MONITOR_KEY);
+        watches.delete(session);
     }
 };
 

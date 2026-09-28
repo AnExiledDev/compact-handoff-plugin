@@ -10,7 +10,8 @@ what a person actually wants to know after a week of it running:
 
 How many compactions a day, what they cost per session and per day, which parts
 failed and how often, how deep the lineages went, whether the session after a
-compaction re-ran work it had already done, and every feedback note anyone left.
+compaction re-ran work it had already done (for this plugin's handoffs and the
+engine's own compactions side by side), and every feedback note anyone left.
 
 Nothing here calls a model and nothing here writes: the rows already carry every
 number, which is the point of recording them. Costs are the plugin's own priced
@@ -334,37 +335,45 @@ def print_depths(rows):
     print(f"  pinned turns {pinnable}; skipped {', '.join(f'{k} x{v}' for k, v in skipped.most_common()) or 'none'}")
 
 
-def print_post(rows):
-    print("\nWhat the session did with the handoff (first ten turns, no model call)")
+def observed_posts(rows):
+    """Every usable post-compaction record, and how many older ones were set aside.
 
+    A record without `anchored` was written before 0.11.5, when the watch read
+    the whole session as though it were the ten turns after the compaction; its
+    counts are the session's history, not what followed, so none of it is used.
+    """
     observed = [(row, post_json(row)) for row in rows]
     observed = [(row, post) for row, post in observed if post]
+    usable = [(row, post) for row, post in observed if post.get("anchored") is True]
+
+    return usable, len(observed) - len(usable)
+
+
+def print_post(rows):
+    print("\nWhat the session did after each compaction (first ten person turns, no model call)")
+
+    observed, set_aside = observed_posts(rows)
+
+    if set_aside:
+        print(f"  {set_aside} record(s) from before 0.11.5 set aside: that watch counted the whole session")
 
     if not observed:
         print("  no post-compaction observations recorded")
         return
 
-    print(f"  {'session':<20}{'n':>3}{'turns':>7}{'to tool':>9}{'re-ran':>8}{'re-read':>9}  handoff tools")
+    print(f"  {'session':<20}{'kind':<9}{'n':>3}{'turns':>7}{'to tool':>9}{'re-ran':>8}{'re-read':>9}  handoff tools")
 
     for row, post in observed:
         session = (row.get("sessionId") or "?")[:18]
         tools = ", ".join(post.get("handoffToolsCalled") or []) or "-"
         again = " (compacted again)" if post.get("compactedAgain") else ""
+        to_tool = post.get("turnsToFirstToolCall")
 
         print(
-            f"  {session:<20}{post.get('n', 0):>3}{post.get('turnsObserved', 0):>7}"
-            f"{str(post.get('turnsToFirstToolCall') or '-'):>9}"
+            f"  {session:<20}{post.get('kind', 'handoff'):<9}{post.get('n') or 0:>3}{post.get('turnsObserved', 0):>7}"
+            f"{'-' if to_tool is None else to_tool:>9}"
             f"{len(post.get('reRunCommands') or []):>8}{len(post.get('reReadFiles') or []):>9}  {tools}{again}"
         )
-
-    re_ran = sum(len(post.get("reRunCommands") or []) for _, post in observed)
-    re_read = sum(len(post.get("reReadFiles") or []) for _, post in observed)
-    used_tools = sum(1 for _, post in observed if post.get("handoffToolsCalled"))
-
-    print(
-        f"  totals: {re_ran} command(s) re-run, {re_read} file(s) re-read whole, "
-        f"{used_tools} of {len(observed)} sessions called a handoff tool"
-    )
 
     commands = Counter()
 
@@ -374,6 +383,57 @@ def print_post(rows):
 
     for command, count in commands.most_common(10):
         print(f"    {count} x {command}")
+
+
+def print_baseline(rows):
+    """This plugin's handoffs against the engine's own compactions, side by side.
+
+    The stock arm is every main-session compaction the engine did itself: a
+    rehearsal, a fallback, an aborted dispatch. Its watch is the same as a
+    handoff's, so the two columns are the same measurement. What neither can
+    say is which conversations landed in which arm: fallbacks are not a random
+    sample, so read a gap as a lead, not a result.
+    """
+    print("\nHandoff against the engine's own compaction (same watch, both arms)")
+
+    observed, _ = observed_posts(rows)
+    arms = defaultdict(list)
+
+    for _, post in observed:
+        arms[post.get("kind", "handoff")].append(post)
+
+    if not arms:
+        print("  nothing to compare yet")
+        return
+
+    def median_of(posts, key):
+        values = [post[key] for post in posts if isinstance(post.get(key), (int, float))]
+
+        return f"{statistics.median(values):.1f}" if values else "-"
+
+    def mean_len(posts, key):
+        return f"{statistics.fmean(len(post.get(key) or []) for post in posts):.2f}"
+
+    def rate(posts, test):
+        return f"{100 * sum(1 for post in posts if test(post)) / len(posts):.0f}%"
+
+    print(f"  {'arm':<9}{'watched':>8}{'median turns to tool':>22}{'re-ran':>8}{'re-read':>9}{'used handoff tool':>19}{'compacted again':>17}")
+
+    for kind in ("handoff", "stock"):
+        posts = arms.get(kind, [])
+
+        if not posts:
+            print(f"  {kind:<9}{0:>8}  no observations yet")
+            continue
+
+        print(
+            f"  {kind:<9}{len(posts):>8}{median_of(posts, 'turnsToFirstToolCall'):>22}"
+            f"{mean_len(posts, 'reRunCommands'):>8}{mean_len(posts, 'reReadFiles'):>9}"
+            f"{rate(posts, lambda post: post.get('handoffToolsCalled')):>19}"
+            f"{rate(posts, lambda post: post.get('compactedAgain')):>17}"
+        )
+
+    print("  re-ran and re-read are means per compaction; turns count what the person typed")
 
 
 def print_feedback(rows):
@@ -431,6 +491,7 @@ def main():
     print_dispositions(rows)
     print_depths(rows)
     print_post(rows)
+    print_baseline(rows)
     print_feedback(rows)
 
     return 0

@@ -22,6 +22,7 @@ import {
     monitorSeed,
     nameOf,
     observePost,
+    openersIn,
     originOf,
     outcomeOf,
     pinSkipCounts,
@@ -320,6 +321,19 @@ describe("lineage", () => {
     it("is null when the conversation carries no handoff", () => {
         assert.equal(priorHandoffIn([userTurn("hi"), assistantTurn("there")]), null);
     });
+
+    // A session that read its own history (handoff_lookup, a Read of a stored
+    // handoff, the README's example marker) carried an older marker after its
+    // real handoff, and the next compaction took its depth from the quote.
+    it("does not take a marker quoted in a tool result or in prose for a handoff", () => {
+        const messages = [
+            assistantTurn(`${lineageLine({ session: "s", n: 7, prev: 6 })}\nthe handoff`),
+            { ...toolResultTurn(), text: `${lineageLine({ session: "s", n: 3, prev: 2 })}\nhandoff 3, looked up` },
+            assistantTurn("The README says each handoff opens with <!-- compact-handoff: session=<id> n=003 prev=002 -->."),
+        ];
+
+        assert.equal(priorHandoffIn(messages).lineage.n, 7);
+    });
 });
 
 describe("the ledger carries only this compaction's rows", () => {
@@ -473,12 +487,53 @@ describe("a file written through the shell is a file write", () => {
         ["echo hi >> /w/log.txt", ["/w/log.txt"]],
         ['mv "$f" "$Q/$f"', []],
         ['git commit -m "x > y.md"', []],
+        // A live 0.11.4 handoff listed `Bash test/cli.test.ts` off a PR body:
+        // prose in a `cat` heredoc quoting the Python that wrote it.
+        ["{ intent mark 2 --source op:x; cat <<'EOF'\nFixed: `open('test/cli.test.ts','w')` in a string\nEOF\n} > /tmp/body.md", ["/tmp/body.md"]],
+        ["cat <<'EOF' | gh pr create --body-file -\nopen('test/cli.test.ts','w')\nEOF", []],
+        ["node <<'EOF'\nconst fs = require('fs'); open('/tmp/n2.txt','w')\nEOF", ["/tmp/n2.txt"]],
         ["ls /tmp 2>/dev/null && echo done 2>&1", []],
     ]) {
         it(`reads ${JSON.stringify(written)} off ${JSON.stringify(command.slice(0, 50))}`, () => {
             assert.deepEqual(shellWrites(command), written);
         });
     }
+});
+
+describe("a file named relatively by the shell and absolutely by an edit is one file", () => {
+    const ledgerOf = (commands, edits) =>
+        renderLedger(
+            ledgerRows([
+                assistantTurn("x", [
+                    ...edits.map((path) => use270("Edit", { file_path: path, old_string: "a", new_string: "b" }, { text: "ok" })),
+                    ...commands.map((command) => use270("Bash", { command }, { text: "" })),
+                ]),
+            ]),
+        );
+
+    // A live 0.11.4 handoff listed `Bash hooks/lib.js` and the absolute Edit
+    // path of the same file as two files written.
+    it("folds the relative path into its one absolute twin", () => {
+        const text = ledgerOf(["git show HEAD:hooks/lib.js > hooks/lib.js"], ["/w/repo/hooks/lib.js"]);
+
+        assert.match(text, /1 file written\./u);
+        assert.match(text, /^- Edit, Bash `\/w\/repo\/hooks\/lib\.js`$/mu);
+    });
+
+    it("keeps a relative path that has no twin, or more than one", () => {
+        const alone = ledgerOf(["sed -i 's/a/b/' notes/x.md"], ["/w/repo/hooks/lib.js"]);
+        const ambiguous = ledgerOf(["sed -i 's/a/b/' hooks/lib.js"], ["/w/a/hooks/lib.js", "/w/b/hooks/lib.js"]);
+
+        assert.match(alone, /2 files written\./u);
+        assert.match(ambiguous, /3 files written\./u);
+        assert.match(ambiguous, /^- Bash `hooks\/lib\.js`$/mu);
+    });
+
+    it("does not fold a path that only ends in the same letters", () => {
+        const text = ledgerOf(["sed -i 's/a/b/' lib.js"], ["/w/repo/hooks/mylib.js"]);
+
+        assert.match(text, /2 files written\./u);
+    });
 });
 
 describe("a command that only looked", () => {
@@ -828,64 +883,144 @@ describe("what the conversation had already done", () => {
     });
 });
 
-describe("watching what the session did with the handoff", () => {
+describe("watching what the session did after a compaction", () => {
+    const marker = (n) => lineageLine({ session: "s", n, prev: n === 1 ? null : n - 1 });
+    // Everything before the compaction: an earlier window's work, which
+    // `$.session.messages()` still returns.
     const before = [
         userTurn("Fix the build."),
-        assistantTurn("", [
-            use270("Bash", { command: "npm test" }),
-            use270("Read", { file_path: "/repo/a.ts" }),
-        ]),
+        assistantTurn("", [use270("Bash", { command: "npm test" }), use270("Read", { file_path: "/repo/a.ts" })]),
+        userTurn("And the docs."),
+        assistantTurn("", [use270("Bash", { command: "npm run docs" })]),
     ];
-    const seed = () => monitorSeed({ session: "s", n: 1, at: "2026-09-14T00:00:00.000Z", from: 2, messages: before });
+    // What a replaced compaction puts in: the handoff, then two pinned turns.
+    const replacement = [assistantTurn(`${marker(1)}\n\nThe handoff.`), userTurn("Fix the build."), userTurn("And the docs.")];
+    const seed = (extra = {}) =>
+        monitorSeed({
+            session: "s",
+            n: 1,
+            at: "2026-09-14T00:00:00.000Z",
+            kind: "handoff",
+            ordinal: 0,
+            from: replacement.length,
+            messages: before,
+            ...extra,
+        });
+    const whole = (...after) => [...before, ...replacement, ...after];
 
-    it("names the work the new conversation repeated", () => {
-        const after = [
-            ...before,
-            userTurn("Carry on."),
-            assistantTurn("", [
-                use270("Bash", { command: "npm test" }),
-                use270("Read", { file_path: "/repo/a.ts" }),
-                use270("Bash", { command: "npm run build" }),
-            ]),
-        ];
-        const observed = observePost(seed(), after);
+    // Through 0.11.4 the watch sliced the whole session from the replacement's
+    // length, so every earlier turn read as new work: 510 to 894 "turns",
+    // 32 to 63 re-run commands and an empty first message on every live file.
+    it("watches only what came after the replacement, in a transcript holding every window", () => {
+        const observed = observePost(
+            seed(),
+            whole(
+                userTurn("Carry on."),
+                assistantTurn("", [
+                    use270("Bash", { command: "npm test" }),
+                    use270("Read", { file_path: "/repo/a.ts" }),
+                    use270("Bash", { command: "npm run build" }),
+                ]),
+            ),
+        );
 
+        assert.equal(observed.anchored, true);
+        assert.equal(observed.turnsObserved, 1);
+        assert.equal(observed.firstUserMessage, "Carry on.");
         assert.deepEqual(observed.reRunCommands, ["npm test"]);
         assert.deepEqual(observed.reReadFiles, ["/repo/a.ts"]);
         assert.equal(observed.turnsToFirstToolCall, 1);
+        assert.equal(observed.done, false);
     });
 
-    it("keeps the person's first words and skips the harness's", () => {
-        const observed = observePost(seed(), [...before, crossSessionTurn(), userTurn("Carry on.")]);
+    it("counts turns the person typed, not tool results or the harness", () => {
+        const observed = observePost(
+            seed(),
+            whole(crossSessionTurn(), userTurn("Carry on."), assistantTurn("", [use270("Bash", { command: "ls" })]), toolResultTurn()),
+        );
 
         assert.equal(observed.firstUserMessage, "Carry on.");
-        assert.equal(observed.turnsToFirstToolCall, null);
+        assert.equal(observed.turnsObserved, 1);
     });
 
-    it("records which handoff tool the session reached for", () => {
-        const observed = observePost(seed(), [
-            ...before,
-            assistantTurn("", [use270("mcp__compact-handoff__handoff_lookup", { section: "ledger" })]),
-        ]);
+    it("says the session reached for a tool before anyone spoke", () => {
+        const observed = observePost(seed(), whole(assistantTurn("", [use270("Bash", { command: "git status" })])));
+
+        assert.equal(observed.turnsToFirstToolCall, 0);
+        assert.equal(observed.firstUserMessage, null);
+    });
+
+    it("records which handoff tool the session reached for, and keeps watching after it read one", () => {
+        const lookup = { ...toolResultTurn(), text: `${marker(1)}\n\nThe handoff, read back.` };
+        const observed = observePost(
+            seed(),
+            whole(assistantTurn("", [use270("mcp__compact-handoff__handoff_lookup", { section: "ledger" })]), lookup),
+        );
 
         assert.deepEqual(observed.handoffToolsCalled, ["mcp__compact-handoff__handoff_lookup"]);
+        assert.equal(observed.compactedAgain, false);
+        assert.equal(observed.done, false);
     });
 
     it("stops watching when the conversation compacts again", () => {
-        const observed = observePost(seed(), [
-            ...before,
-            userTurn("<!-- compact-handoff: session=s n=2 prev=1 -->\n\nThe next handoff."),
-        ]);
+        const observed = observePost(seed(), whole(userTurn("go"), assistantTurn(`${marker(2)}\n\nThe next handoff.`)));
 
         assert.equal(observed.compactedAgain, true);
         assert.equal(observed.done, true);
     });
 
-    it("stops watching after ten turns, and not before", () => {
-        const turns = (n) => [...before, ...Array.from({ length: n }, () => assistantTurn("thinking"))];
+    it("stops, unanchored, when the transcript does not hold the handoff it was armed for", () => {
+        const observed = observePost(seed(), [...before, userTurn("Carry on.")]);
+
+        assert.equal(observed.anchored, false);
+        assert.equal(observed.turnsObserved, 0);
+        assert.equal(observed.done, true);
+    });
+
+    it("stops watching after ten person turns, and not before", () => {
+        const turns = (n) => whole(...Array.from({ length: n }, (_, i) => userTurn(`turn ${i}`)));
 
         assert.equal(observePost(seed(), turns(9)).done, false);
         assert.equal(observePost(seed(), turns(10)).done, true);
+    });
+
+    // The engine's own compaction is the baseline: the same watch, anchored on
+    // its continuation summary rather than a handoff.
+    it("watches a stock compaction from its continuation summary", () => {
+        const stock = [continuationTurn(), userTurn("Fix the build.")];
+        const observed = observePost(seed({ kind: "stock", ordinal: 0, from: stock.length }), [
+            ...before,
+            ...stock,
+            userTurn("Carry on."),
+            assistantTurn("", [use270("Bash", { command: "npm run docs" })]),
+        ]);
+
+        assert.equal(observed.kind, "stock");
+        assert.equal(observed.anchored, true);
+        assert.equal(observed.turnsObserved, 1);
+        assert.deepEqual(observed.reRunCommands, ["npm run docs"]);
+    });
+
+    it("finds the window it watches past earlier compactions of either kind", () => {
+        const earlier = [assistantTurn(`${marker(1)}\n\nold`), continuationTurn()];
+        const observed = observePost(seed({ n: 2, ordinal: 2, from: 2 }), [
+            ...earlier,
+            ...before,
+            assistantTurn(`${marker(2)}\n\nThe handoff.`),
+            userTurn("pinned"),
+            userTurn("Carry on."),
+        ]);
+
+        assert.deepEqual(
+            openersIn([...earlier, assistantTurn(marker(2))]).map(({ kind, n }) => [kind, n]),
+            [
+                ["handoff", 1],
+                ["stock", 2],
+                ["handoff", 2],
+            ],
+        );
+        assert.equal(observed.anchored, true);
+        assert.equal(observed.firstUserMessage, "Carry on.");
     });
 });
 
@@ -1085,7 +1220,7 @@ describe("one window occupancy reading", () => {
     const context = { tokens: 60_000, window: 200_000, percent: 30 };
 
     it("calls a window with no handoff in it a fresh one", () => {
-        const row = windowReading({ at: "now", session: "s", turn: 1, context, messages: 4, handoff: null });
+        const row = windowReading({ at: "now", session: "s", turn: 1, context, messages: 4, opener: null });
 
         assert.equal(row.phase, "fresh");
         assert.equal(row.compaction, 0);
@@ -1102,7 +1237,7 @@ describe("one window occupancy reading", () => {
             turn: 3,
             context,
             messages: 9,
-            handoff: { n: 6, chars: 24_000 },
+            opener: { kind: "handoff", n: 6, chars: 24_000 },
         });
 
         assert.equal(row.phase, "post-compact");
@@ -1112,6 +1247,21 @@ describe("one window occupancy reading", () => {
         assert.equal(row.first, false);
     });
 
+    it("tells a window the engine compacted apart from one this plugin did", () => {
+        const row = windowReading({
+            at: "now",
+            session: "s",
+            turn: 1,
+            context,
+            messages: 9,
+            opener: { kind: "stock", n: 1, chars: 8_000 },
+        });
+
+        assert.equal(row.phase, "stock-compact");
+        assert.equal(row.handoffChars, 8_000);
+        assert.equal(row.first, true);
+    });
+
     it("reports a percent to one decimal rather than the engine's rounding", () => {
         const row = windowReading({
             at: "now",
@@ -1119,7 +1269,7 @@ describe("one window occupancy reading", () => {
             turn: 1,
             context: { tokens: 12_345, window: 200_000, percent: 6 },
             messages: 2,
-            handoff: null,
+            opener: null,
         });
 
         assert.equal(row.percent, 6.2);
@@ -1132,7 +1282,7 @@ describe("one window occupancy reading", () => {
             turn: 1,
             context: { percent: 41 },
             messages: 2,
-            handoff: null,
+            opener: null,
         });
 
         assert.equal(row.tokens, null);
@@ -1141,7 +1291,7 @@ describe("one window occupancy reading", () => {
     });
 
     it("reads nothing at all rather than throwing when usage is unavailable", () => {
-        const row = windowReading({ at: "now", session: "s", turn: 1, context: null, messages: 2, handoff: null });
+        const row = windowReading({ at: "now", session: "s", turn: 1, context: null, messages: 2, opener: null });
 
         assert.equal(row.percent, null);
         assert.equal(row.phase, "fresh");

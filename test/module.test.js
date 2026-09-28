@@ -4,7 +4,17 @@ import { readFileSync } from "node:fs";
 
 import { priceUsage } from "../hooks/lib.js";
 import { PLUGIN_VERSION } from "../hooks/module.js";
-import { answered, assistantTurn, fakeApi, fakeRuntime, noUsage, passThrough, use270, userTurn } from "./fixtures.js";
+import {
+    answered,
+    assistantTurn,
+    continuationTurn,
+    fakeApi,
+    fakeRuntime,
+    noUsage,
+    passThrough,
+    use270,
+    userTurn,
+} from "./fixtures.js";
 
 // `node --check` reads module.js as a script and never sees an `await` in a
 // non-async arrow; 0.2.0 shipped one and only `claude plugin validate` caught
@@ -41,6 +51,7 @@ describe("the turn.complete hook, against the input the engine really sends", ()
         const host = fakeApi({ messages: [userTurn("go"), assistantTurn("done")] });
         const next = passThrough();
 
+        await runtime.dispatch("session.start", host.$, {});
         await runtime.dispatch("turn.complete", host.$, turnComplete(), next);
 
         const rows = host.rowsIn("window.jsonl");
@@ -1195,5 +1206,365 @@ describe("handoff_lookup section=ledger", () => {
         });
 
         assert.match(answer.result, /\(10 of 40\)/u);
+    });
+});
+
+/* ------------------------------------------------------------------ *
+ * What each session did after a compaction, and each window's turns.
+ * ------------------------------------------------------------------ */
+
+/**
+ * A host several sessions share, as they share one `$.store` on a real box:
+ * `as(id, transcript)` switches whose turn it is, and `$.session.messages()`
+ * answers that session's whole history, every window since the first.
+ */
+const sharedHost = (overrides = {}) => {
+    const sessions = new Map();
+    let current = "A";
+    const host = seamHost({
+        ...overrides,
+        session: {
+            id: async () => current,
+            messages: async () => sessions.get(current) ?? [],
+            version: async () => ({ version: "2.1.283", base: "2.1.283" }),
+            ...overrides.session,
+        },
+    });
+
+    host.as = (id, transcript) => {
+        current = id;
+
+        if (transcript !== undefined) {
+            sessions.set(id, transcript);
+        }
+    };
+
+    return host;
+};
+
+/** `next` for a compaction the engine does itself, answering its own summary. */
+const stockNext = (messages) => {
+    const next = (input) => {
+        next.calls.push(input);
+
+        return { messages };
+    };
+
+    next.calls = [];
+    next.signal = new AbortController().signal;
+
+    return next;
+};
+
+const windowRows = (host) => host.rowsIn("window.jsonl").map(({ session, turn, first, phase }) => ({ session, turn, first, phase }));
+
+/** The post-compaction record the watch last wrote, parsed, or null. */
+const postFile = (host) => {
+    const path = [...host.files.keys()].filter((key) => key.endsWith(".post.json")).at(-1);
+
+    return path === undefined ? null : { path, ...JSON.parse(host.files.get(path)) };
+};
+
+const before = [
+    userTurn("Fix the build."),
+    assistantTurn("", [use270("Bash", { command: "npm test" }, { text: "ok" })]),
+];
+
+describe("each session's window turns, counted on their own", () => {
+    // Through 0.11.4 the count lived in `$.store`, one file every session on
+    // the box shares, so `first: true` fired once in 1,374 rows.
+    it("starts every session at turn 1, whoever else is ticking", async () => {
+        const runtime = await registered();
+        const host = sharedHost();
+
+        try {
+            host.as("A", before);
+            await runtime.dispatch("session.start", host.$, {});
+            await runtime.dispatch("turn.complete", host.$, turnComplete());
+            await runtime.dispatch("turn.complete", host.$, turnComplete());
+            host.as("B", [userTurn("hello")]);
+            await runtime.dispatch("session.start", host.$, {});
+            await runtime.dispatch("turn.complete", host.$, turnComplete());
+            host.as("A");
+            await runtime.dispatch("turn.complete", host.$, turnComplete());
+
+            assert.deepEqual(
+                windowRows(host).map(({ session, turn, first }) => [session, turn, first]),
+                [
+                    ["A", 1, true],
+                    ["A", 2, false],
+                    ["B", 1, true],
+                    ["A", 3, false],
+                ],
+            );
+        } finally {
+            host.stopTimers();
+        }
+    });
+
+    it("says it does not know the turn after a reload it never saw start", async () => {
+        const runtime = await registered();
+        const host = sharedHost();
+
+        try {
+            host.as("A", before);
+            await runtime.dispatch("turn.complete", host.$, turnComplete());
+
+            assert.deepEqual(windowRows(host), [{ session: "A", turn: null, first: false, phase: "fresh" }]);
+        } finally {
+            host.stopTimers();
+        }
+    });
+});
+
+describe("the ten turns after a compaction, watched in a transcript that holds every window", () => {
+    const liveHost = () =>
+        sharedHost({
+            env: { COMPACT_HANDOFF_LIVE: "1" },
+            model: { fork: async () => answered("THE FORK'S SUMMARY", warmForkUsage) },
+        });
+
+    it("watches what came after the handoff, and calls the next turn turn 1 of a post-compact window", async () => {
+        const runtime = await registered();
+        const host = liveHost();
+
+        try {
+            host.as("A", before);
+            await runtime.dispatch("session.start", host.$, {});
+            await runtime.dispatch("turn.complete", host.$, turnComplete());
+
+            const answer = await runtime.dispatch("session.compact", host.$, compaction({ messages: before }), compactNext());
+
+            host.as("A", [
+                ...before,
+                ...answer.messages,
+                userTurn("Carry on."),
+                assistantTurn("", [use270("Bash", { command: "npm test" }, { text: "ok" })]),
+            ]);
+            await runtime.dispatch("turn.complete", host.$, turnComplete());
+
+            const post = postFile(host);
+
+            assert.equal(lastRow(host).disposition, "replaced");
+            assert.deepEqual(windowRows(host).at(-1), { session: "A", turn: 1, first: true, phase: "post-compact" });
+            assert.match(post.path, /\/sessions\/A\/001-/u);
+            assert.equal(post.kind, "handoff");
+            assert.equal(post.anchored, true);
+            assert.equal(post.turnsObserved, 1);
+            assert.equal(post.firstUserMessage, "Carry on.");
+            assert.deepEqual(post.reRunCommands, ["npm test"]);
+        } finally {
+            host.stopTimers();
+        }
+    });
+
+    // The monitor lived in `$.store` too, so whichever session ticked first
+    // read it against its own transcript and could end it.
+    it("is not read or ended by another session's turn", async () => {
+        const runtime = await registered();
+        const host = liveHost();
+
+        try {
+            host.as("A", before);
+            await runtime.dispatch("session.start", host.$, {});
+
+            const answer = await runtime.dispatch("session.compact", host.$, compaction({ messages: before }), compactNext());
+
+            host.as("B", [userTurn("unrelated")]);
+            await runtime.dispatch("session.start", host.$, {});
+            await runtime.dispatch("turn.complete", host.$, turnComplete());
+
+            assert.equal(postFile(host), null);
+
+            host.as("A", [...before, ...answer.messages, userTurn("Carry on.")]);
+            await runtime.dispatch("turn.complete", host.$, turnComplete());
+
+            assert.equal(postFile(host).firstUserMessage, "Carry on.");
+        } finally {
+            host.stopTimers();
+        }
+    });
+
+    // The engine's own compaction is the baseline a handoff is judged against,
+    // and until 0.11.5 nothing watched one.
+    it("watches a compaction the engine did itself, as the baseline", async () => {
+        const runtime = await registered();
+        const host = sharedHost({ model: { fork: async () => answered("THE FORK'S SUMMARY", warmForkUsage) } });
+        const engineSummary = [continuationTurn(), userTurn("Fix the build.")];
+
+        try {
+            host.as("A", before);
+            await runtime.dispatch("session.start", host.$, {});
+
+            const answer = await runtime.dispatch(
+                "session.compact",
+                host.$,
+                compaction({ messages: before }),
+                stockNext(engineSummary),
+            );
+
+            host.as("A", [...before, ...answer.messages, userTurn("Carry on.")]);
+            await runtime.dispatch("turn.complete", host.$, turnComplete());
+
+            const post = postFile(host);
+
+            assert.equal(lastRow(host).disposition, "rehearsed");
+            assert.deepEqual(answer.messages, engineSummary);
+            assert.match(post.path, /\/rehearsals\/A\//u);
+            assert.equal(post.kind, "stock");
+            assert.equal(post.anchored, true);
+            assert.equal(post.firstUserMessage, "Carry on.");
+            assert.deepEqual(windowRows(host).at(-1), { session: "A", turn: 1, first: true, phase: "stock-compact" });
+        } finally {
+            host.stopTimers();
+        }
+    });
+
+    it("leaves a subagent's compaction unwatched", async () => {
+        const runtime = await registered();
+        const host = sharedHost({ env: { COMPACT_HANDOFF_SUBAGENTS: "1" } });
+
+        try {
+            host.as("A", before);
+            await runtime.dispatch(
+                "session.compact",
+                host.$,
+                compaction({ messages: before, agentId: "agent-1" }),
+                stockNext([continuationTurn()]),
+            );
+            host.as("A", [...before, continuationTurn(), userTurn("Carry on.")]);
+            await runtime.dispatch("turn.complete", host.$, turnComplete());
+
+            assert.equal(lastRow(host).agentId, "agent-1");
+            assert.equal(postFile(host), null);
+        } finally {
+            host.stopTimers();
+        }
+    });
+});
+
+describe("a subagent's handoff during the main session's watch", () => {
+    it("leaves the main session's watch in place", async () => {
+        const runtime = await registered();
+        const host = sharedHost({
+            env: { COMPACT_HANDOFF_LIVE: "1", COMPACT_HANDOFF_SUBAGENTS: "1" },
+            model: { fork: async () => answered("THE FORK'S SUMMARY", warmForkUsage) },
+        });
+
+        try {
+            host.as("A", before);
+            await runtime.dispatch("session.start", host.$, {});
+
+            const answer = await runtime.dispatch("session.compact", host.$, compaction({ messages: before }), compactNext());
+
+            host.as("A", [...before, ...answer.messages]);
+            await runtime.dispatch(
+                "session.compact",
+                host.$,
+                compaction({ messages: before, agentId: "agent-1" }),
+                compactNext(),
+            );
+            host.as("A", [...before, ...answer.messages, userTurn("Carry on.")]);
+            await runtime.dispatch("turn.complete", host.$, turnComplete());
+
+            assert.equal(lastRow(host).agentId, "agent-1");
+            assert.equal(lastRow(host).disposition, "replaced");
+            assert.equal(postFile(host).anchored, true);
+            assert.equal(postFile(host).firstUserMessage, "Carry on.");
+        } finally {
+            host.stopTimers();
+        }
+    });
+});
+
+describe("a subagent's handoff mid-window", () => {
+    it("does not restart the main session's turn count", async () => {
+        const runtime = await registered();
+        const host = sharedHost({
+            env: { COMPACT_HANDOFF_LIVE: "1", COMPACT_HANDOFF_SUBAGENTS: "1" },
+            model: { fork: async () => answered("THE FORK'S SUMMARY", warmForkUsage) },
+        });
+
+        try {
+            host.as("A", before);
+            await runtime.dispatch("session.start", host.$, {});
+            await runtime.dispatch("turn.complete", host.$, turnComplete());
+            await runtime.dispatch(
+                "session.compact",
+                host.$,
+                compaction({ messages: before, agentId: "agent-1" }),
+                compactNext(),
+            );
+            await runtime.dispatch("turn.complete", host.$, turnComplete());
+
+            assert.equal(lastRow(host).disposition, "replaced");
+            assert.deepEqual(
+                windowRows(host).map(({ turn, first }) => [turn, first]),
+                [
+                    [1, true],
+                    [2, false],
+                ],
+            );
+        } finally {
+            host.stopTimers();
+        }
+    });
+});
+
+describe("the engine version on a compaction row", () => {
+    const engineOf = async (session) => {
+        const runtime = await registered();
+        const host = sharedHost({ session });
+
+        try {
+            host.as("A", before);
+            await runtime.dispatch("session.compact", host.$, compaction({ messages: before }), compactNext());
+
+            return lastRow(host).engine;
+        } finally {
+            host.stopTimers();
+        }
+    };
+
+    // `CLAUDE_CODE_VERSION` is unset in an ordinary session: 774 of 775 rows
+    // said null, so no result could be split by release.
+    it("is read from the session, with no variable set", async () => {
+        assert.equal(await engineOf({}), "2.1.283");
+    });
+
+    it("is null, not a failed compaction, when the session cannot say", async () => {
+        assert.equal(
+            await engineOf({
+                version: async () => {
+                    throw new Error("no such op");
+                },
+            }),
+            null,
+        );
+    });
+});
+
+describe("a handoff that asks to be corrected", () => {
+    // `handoff_feedback` went unused in 739 compactions: no handoff ever said
+    // it existed, and it is the only live reading of a handoff's quality.
+    it("names handoff_feedback in the first compaction's handoff, where there is no earlier-compactions note", async () => {
+        const runtime = await registered();
+        const host = sharedHost({
+            env: { COMPACT_HANDOFF_LIVE: "1" },
+            model: { fork: async () => answered("THE FORK'S SUMMARY", warmForkUsage) },
+        });
+
+        try {
+            host.as("A", before);
+
+            const answer = await runtime.dispatch("session.compact", host.$, compaction({ messages: before }), compactNext());
+            const handoff = answer.messages.map((message) => message.text ?? "").join("\n");
+
+            assert.equal(lastRow(host).disposition, "replaced");
+            assert.match(handoff, /THE FORK'S SUMMARY/u);
+            assert.match(handoff, /handoff_feedback/u);
+        } finally {
+            host.stopTimers();
+        }
     });
 });

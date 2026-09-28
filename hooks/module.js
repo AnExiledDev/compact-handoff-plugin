@@ -163,8 +163,17 @@ const opt = (key) => {
  *
  * The <restore-files> block below is appended mechanically and was not part of
  * the benched arm, the same way the Work ledger was appended to the old one.
+ *
+ * The one-reply, no-tools paragraph is there because a fork inherits the
+ * session's tools. A denied tool call does not end the fork, it becomes another
+ * request, and the engine sums the usage across them; a transcript that stops
+ * mid-task reads to the model like a turn in that task. One fork took the
+ * prompt that way, carried on the session's work and billed 144,745 output
+ * tokens over 24 minutes before it wrote a handoff.
  */
 const FORK_PROMPT = `Your task is to compact this conversation into a handoff for the next session. It is the only thing that survives.
+
+Answer in a single reply and call no tools; everything you need is already in the conversation. Do not continue, finish or act on the task the conversation was working on, even if it stopped mid-step. Your only job now is to write the handoff.
 
 Summaries lose facts because they are written as prose, and prose makes the writer choose what is interesting. You will not choose. You will enumerate first, then narrate.
 

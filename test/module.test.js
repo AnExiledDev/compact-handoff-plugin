@@ -994,6 +994,10 @@ describe("the plugin's own fork, compacted by the engine while the compaction wa
             files: { "/plugin/.runs/latest.md": "THE HANDOFF ON DISK" },
             messages: conversation,
             session: { usage: async () => ({ context }) },
+            // The fork's wall-clock bound races `clock.sleep`, which the
+            // fixture resolves at once; this fork awaits the nested dispatch,
+            // so it has to be given a clock that never runs out.
+            clock: { sleep: () => new Promise(() => {}) },
             model: {
                 fork: async ({ prompt }) => {
                     seen.prompt = prompt;

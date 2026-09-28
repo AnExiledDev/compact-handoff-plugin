@@ -18,27 +18,7 @@ By the same author: [changelogs.core-directive.com](https://changelogs.core-dire
 
 Six parts. Only the first is a model summarising a conversation.
 
-1. **The summary**, written by a fork of the session itself. The fork is asked
-   to enumerate before it narrates: a tagged one-line-per-fact inventory of the
-   whole conversation first, the prose reading second. That is the whole trick.
-   Prose makes the writer choose what is interesting, and the fact nobody finds
-   interesting is the one the next session needed. Through 0.4.x the fork was
-   asked with Claude Code's own nine-section summariser instruction plus a Work
-   ledger section; against the same 82-fact answer key, graded blind, the
-   inventory prompt carries 70.0% where that one carried 63.0%, and it is the
-   only arm whose worst run beat the old prompt's best.
-   The fork is also asked to reason in `<analysis>` tags before it writes, and
-   **since 0.4.2 that block is dropped before the handoff is assembled**. It is
-   still asked for, because the arm that reasons first is the one the bench
-   picked and Round 3 measured that taking work away from this model backfires;
-   it is thrown away afterwards instead. Across the 31 handoffs stored on the
-   machine it was written on, it ran 14% of the summary's characters on average
-   and 46% at its worst, and it is deliberation rather than findings: it plans
-   the summary, and it corrects itself mid-paragraph, which the next window has
-   no way to read as discarded. The `<summary>` wrapper tags go with it.
-   `analysisChars` on the row says how much was dropped. A block the model never
-   closed is left alone unless a summary follows it, because a reply cut off
-   inside the scratchpad has nothing else in it.
+1. **The summary**, written by a fork of the session itself. The fork is asked to enumerate before it narrates: a tagged one-line-per-fact inventory of the whole conversation first, the prose reading second. That is the whole trick. Prose makes the writer choose what is interesting, and the fact nobody finds interesting is the one the next session needed. Through 0.4.x the fork was asked with Claude Code's own nine-section summariser instruction plus a Work ledger section; against the same 82-fact answer key, graded blind, the inventory prompt carries 70.0% where that one carried 63.0%, and it is the only arm whose worst run beat the old prompt's best. Through 0.10.0 the fork wrote that inventory twice, first in `<analysis>` tags that were dropped before the handoff was assembled, then again as the summary's first part. Now it writes it once, straight into the summary. Over the same answer key that carried 69.4% against 67.7%, which is inside the grader's noise, and it took about a third fewer output tokens (16,777 against 24,756) and 182 s per fork against 257 s. The fork is also told to answer in one reply, call no tools and leave the session's task alone, because it inherits the session's tools and a denied tool call doesn't end it, it turns into another request that gets billed too. One fork that kept working on the session's task billed 144,745 output tokens over 24 minutes. An `<analysis>` block a model writes anyway is still dropped, along with the `<summary>` wrapper tags, and `analysisChars` on the row says how much was dropped. A block the model never closed is left alone unless a summary follows it, because a reply cut off inside the scratchpad has nothing else in it.
 2. **The tool ledger**, read off the messages, not recalled: files written,
    every shell command in order, and the ones whose output reads as a failure.
    **Nothing here is an exit code**, because the transcript does not store one,

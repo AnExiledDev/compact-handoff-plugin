@@ -368,16 +368,14 @@ const SUMMARY_TAGS = /[ \t]*<\/?summary>[ \t]*\n?/gu;
 /**
  * The summary without the thinking that produced it.
  *
- * The fork is asked to reason in <analysis> tags before it writes, because the
- * arm that reasons first is the one the bench picked, and Round 3 showed that
- * taking work away from that model backfires. So the block is still asked for
- * and still written; it is dropped here instead, after the model has had the
- * benefit of writing it. Across the 31 handoffs stored on this box it was 14%
- * of the summary text on average and 46% at its worst, and it is first-person
- * deliberation rather than findings: it plans the summary, and it argues with
- * itself and corrects mid-paragraph, which the next window reads as prose.
- * Operator, 2026-09-15: "I think analysis just bloats it without much value
- * add."
+ * Through 0.10.0 the fork was asked to write its inventory in <analysis> tags
+ * first and then copy it into the summary, and the block was dropped here. The
+ * prompt no longer asks for it, so this strip is a defensive one now: a model
+ * that writes the block anyway still has it removed. When one does, it is
+ * first-person deliberation rather than findings: it plans the summary, and it
+ * argues with itself and corrects mid-paragraph, which the next window reads
+ * as prose. Operator, 2026-09-15: "I think analysis just bloats it without much
+ * value add."
  *
  * Two shapes are deliberate. A block the model never closed is left alone
  * unless a summary follows it, because a reply cut off inside the scratchpad

@@ -140,7 +140,7 @@ const opt = (key) => {
 };
 
 /**
- * The compaction instruction, and the bench's winner over four rounds.
+ * The compaction instruction, and the bench's winner over five rounds.
  *
  * Rounds 1 to 3 varied the wording of the engine's own summariser prompt, which
  * asks for nine numbered prose sections. Round 4 asked whether that inherited
@@ -157,9 +157,18 @@ const opt = (key) => {
  * against this one's 7.3. High variance is disqualifying for a prompt that gets
  * one attempt per compaction.
  *
- * It costs about 2,600 more output tokens than the prompt it replaces, roughly
- * 40% more, against a post-compaction floor measured at 54,600 to 66,058 tokens
- * in a real session. The handoff was never the expensive part of a restart.
+ * In round 4 it cost about 2,600 more output tokens than the prompt it
+ * replaced, roughly 40% more, against a post-compaction floor measured at
+ * 54,600 to 66,058 tokens in a real session.
+ *
+ * Round 5 took out the <analysis> block that round 4's version wrote the
+ * inventory in first. PART 1 was a copy of it, so every compaction wrote the
+ * inventory twice and paid for both. Written once, straight into the summary,
+ * over the same fixture and answer key, two forks per arm graded three times
+ * each: 69.4% recall (spread 5.5) against 67.7% (spread 6.8) for the two-copy
+ * prompt, inside the grader's 3.5-point noise, for 16,777 output tokens against
+ * 24,756 and 182 s against 257 s per fork. `withoutScratchpad` still strips the
+ * block if a model writes one anyway.
  *
  * The <restore-files> block below is appended mechanically and was not part of
  * the benched arm, the same way the Work ledger was appended to the old one.
@@ -177,11 +186,9 @@ Answer in a single reply and call no tools; everything you need is already in th
 
 Summaries lose facts because they are written as prose, and prose makes the writer choose what is interesting. You will not choose. You will enumerate first, then narrate.
 
-In <analysis> tags, sweep the conversation from the first message to the last, in order, and emit an inventory: one line per discrete fact, no grouping, no prose, no commentary. A discrete fact is anything a successor could be wrong about — a request, a constraint, a rejection, a decision, a reason, a file, a command run and its result, a number, an identifier, an error, a promise, an unfinished item, a correction. Aim for completeness over elegance; a hundred lines is normal and a short inventory means you skipped. Mark each line with one tag in brackets at the start: [ask] [constraint] [rejected] [decision] [file] [command] [identifier] [error] [promise] [pending] [state].
+In <summary> tags, produce the handoff in two parts:
 
-Then, in <summary> tags, produce the handoff in two parts:
-
-PART 1 — THE INVENTORY. Reproduce every line from your analysis, grouped by tag, tag order as listed above. Do not drop a line because it seems minor, and do not merge two lines into one. Quote the user verbatim on every [ask], [constraint] and [rejected] line.
+PART 1 — THE INVENTORY. Sweep the conversation from the first message to the last and emit an inventory: one line per discrete fact, no prose, no commentary. A discrete fact is anything a successor could be wrong about — a request, a constraint, a rejection, a decision, a reason, a file, a command run and its result, a number, an identifier, an error, a promise, an unfinished item, a correction. Aim for completeness over elegance; a hundred lines is normal and a short inventory means you skipped. Mark each line with one tag in brackets at the start: [ask] [constraint] [rejected] [decision] [file] [command] [identifier] [error] [promise] [pending] [state]. Group the lines by tag, in that tag order, keeping conversation order within each group. Do not drop a line because it seems minor, and do not merge two lines into one. Quote the user verbatim on every [ask], [constraint] and [rejected] line.
 
 PART 2 — THE READING. Now, and only now, write the prose a successor needs to make sense of Part 1: what the work is, what has been done, what is being done right now, and what the next step is with a verbatim quote of the user's most recent request. Keep this short. It explains the inventory; it does not replace it.
 

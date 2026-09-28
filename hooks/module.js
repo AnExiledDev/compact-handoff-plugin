@@ -912,7 +912,7 @@ const capOf = (value, fallback) => {
 /**
  * The handoff, written inside the event by a fork of this very session.
  *
- * `$.model.fork` runs one tool-less completion over the main thread's own
+ * `$.model.fork` runs one completion over the main thread's own
  * cache-safe transcript snapshot, which is how the engine's own compaction
  * reads a conversation, so nothing has to be marshalled in and the prompt
  * cache is already warm. It is a host op, and a host op's time in flight does
@@ -1988,7 +1988,9 @@ const readRuns = async ($, e) => {
         agent: (await safely($, () => $.store.get(HANDOFF_AGENT_KEY))) ?? null,
         lookups: await lookupTotals($),
         restores: restoreTotals(rows),
-        last: rows[rows.length - 1] ?? null,
+        // A fork loop the engine keeps checking can be declined after the
+        // compaction it belongs to has written its row.
+        last: rows.findLast((row) => row.outcome !== "ownFork") ?? null,
         runs: rows.slice(-limit),
         diagnostics: (await isDev($)) ? (await diagnosticLines($)).slice(-limit).map(parseRun) : undefined,
     };
@@ -2301,6 +2303,12 @@ const finish = async ($, record, disposition, artifacts = {}) => {
         record.files = await storeRun($, record, disposition, artifacts);
     } catch (error) {
         record.storeFailed = String(error).slice(0, 300);
+    }
+
+    // A declined fork loop is bookkeeping inside a compaction still running;
+    // a toast for it reads as that compaction having been skipped.
+    if (record.outcome === "ownFork") {
+        return;
     }
 
     $.ui.toast(`compaction ${disposition} in ${Math.round((record.elapsedMs ?? 0) / 1000)}s (${record.outcome})`, {

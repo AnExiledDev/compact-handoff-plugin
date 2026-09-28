@@ -253,6 +253,9 @@ export const fakeApi = (overrides = {}) => {
             ...overrides.model,
         },
         ui: { toast: (text, options) => void toasts.push({ text, options }), log: () => {} },
+        // sleep resolves at once, so anything racing it (the fork's time bound)
+        // loses unless it settles synchronously; override it for a fork fake
+        // that awaits real work.
         clock: { now: () => Promise.resolve(Date.now()), sleep: async () => {}, ...overrides.clock },
     };
 

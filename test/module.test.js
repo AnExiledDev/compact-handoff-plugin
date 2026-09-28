@@ -1072,6 +1072,45 @@ describe("the plugin's own fork, compacted by the engine while the compaction wa
         assert.equal(subagent.disposition, "passedThrough");
     });
 
+    it("declines the fork loop's compaction when the person gave /compact instructions too", async () => {
+        const runtime = await registered();
+        const { host, seen } = nestingHost(runtime);
+        const instructed = { ...autoCompaction(), trigger: "manual", instructions: "keep the migration plan" };
+
+        await runtime.dispatch("session.compact", host.$, instructed, passThrough());
+
+        assert.ok(seen.prompt.endsWith("keep the migration plan"), "the instructions ride on the fork prompt");
+        assert.equal(typeof seen.own?.skip, "string");
+        assert.equal(rowOf(host, "fork-loop").outcome, "ownFork");
+    });
+
+    it("tells the person only about the real compaction, never the declined fork loop", async () => {
+        const runtime = await registered();
+        const { host } = nestingHost(runtime);
+
+        await runtime.dispatch("session.compact", host.$, autoCompaction(), passThrough());
+
+        assert.equal(host.toasts.length, 1);
+        assert.match(host.toasts[0].text, /replaced/);
+    });
+
+    it("reports the real compaction as the last one even when the fork loop is declined after it", async () => {
+        const runtime = await registered();
+        // The fixture's exec does not append, so the session's log is seeded
+        // the way a fork loop still over the threshold leaves it.
+        const runs = [
+            { at: "2026-09-28T03:00:00.000Z", agentId: null, outcome: "handoff", disposition: "replaced", depth: 1 },
+            { at: "2026-09-28T03:00:01.000Z", agentId: "fork-loop", outcome: "ownFork", disposition: "skipped", depth: 1 },
+        ];
+        const sessionLog = "/home/nobody/.claude/compact-handoff/sessions/session-under-test/runs.jsonl";
+        const host = fakeApi({ files: { [sessionLog]: runs.map((row) => JSON.stringify(row)).join("\n") } });
+
+        const answer = await runtime.dispatch("tool.call", host.$, { tool: "mcp__compact-handoff__handoff_status" });
+        const status = JSON.parse(answer.result);
+
+        assert.equal(status.last.disposition, "replaced");
+    });
+
     it("never declines a main-thread compaction whose transcript quotes the fork prompt", async () => {
         const runtime = await registered();
         const first = nestingHost(runtime);

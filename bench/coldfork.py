@@ -398,9 +398,10 @@ def spawn(scratch, plugin, model):
 
     argv = [
         "--setting-sources", "",
-        # The manifest's `live` default of false reaches the module as a set
-        # value and outranks COMPACT_HANDOFF_LIVE, so live goes in as the
-        # plugin option too. Flag settings load even with no setting sources.
+        # Before 0.11.0 the manifest's `live` default of false reached the
+        # module as a set value and outranked COMPACT_HANDOFF_LIVE, so an
+        # --unfixed run needs live as the plugin option too. Flag settings
+        # load even with no setting sources.
         "--settings", json.dumps(LIVE_OPTION),
         "--plugin-dir", plugin,
         "--plugin-dir", scratch.probe_dir,
@@ -553,11 +554,14 @@ def verdict(summary, unfixed):
 
         return cold, f"forkOutcome={row.get('forkOutcome')}, matchesContext={matches}, partners={len(summary['partners'])}"
 
-    warm = matches is True and row.get("disposition") == "replaced" and not waved
+    # Warm alone proves nothing unless the fork loop really crossed the
+    # threshold and was declined; a run that never got there is no evidence.
+    declined = any(p.get("outcome") == "ownFork" for p in summary["partners"])
+    warm = matches is True and row.get("disposition") == "replaced" and not waved and declined
 
     return warm, (
         f"disposition={row.get('disposition')}, matchesContext={matches}, "
-        f"fork loop passed through to the engine: {len(waved)}"
+        f"fork loop passed through to the engine: {len(waved)}, declined: {declined}"
     )
 
 

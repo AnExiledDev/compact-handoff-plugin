@@ -482,26 +482,6 @@ describe("a subscriber on the seam", () => {
             host.stopTimers();
         }
     });
-
-    it("is not raised once the session is over its budget", async () => {
-        const runtime = await seamRegistered();
-        const host = seamHost({ env: { COMPACT_HANDOFF_MAX_USD_PER_SESSION: "0" } });
-        const noun = await seamNoun(runtime, host.$);
-
-        await noun.beforeCompact({ tool: SEAM_TOOL, name: "memory-handoff" });
-
-        try {
-            await runtime.dispatch("session.compact", host.$, compaction(), compactNext());
-
-            const row = lastRow(host);
-
-            assert.equal(row.disposition, "overBudget");
-            assert.equal(row.seam, undefined);
-            assert.equal(seamRaises(host).length, 0);
-        } finally {
-            host.stopTimers();
-        }
-    });
 });
 
 /* ------------------------------------------------------------------ *
@@ -628,5 +608,89 @@ describe("a fork charged for a fraction of the session's context", () => {
         );
 
         assert.equal(host.rowsIn("index.jsonl").at(-1).forkInput, null);
+    });
+});
+
+/**
+ * A session's spend is not a reason to stop handing off. The sessions that
+ * compact most are the long ones, which are the ones that most need a good
+ * handoff, and a sum across compactions cut them off exactly there.
+ */
+describe("a session that has already spent more than $10 on handoffs", () => {
+    const sessionLog = "/home/nobody/.claude/compact-handoff/sessions/session-under-test/runs.jsonl";
+
+    /** Earlier rows summing to $13.50, the last one refused as overBudget by an older plugin. */
+    const expensiveHistory = () =>
+        [
+            { depth: 1, disposition: "replaced", cost: { totalUsd: 4.5 } },
+            { depth: 2, disposition: "replaced", cost: { totalUsd: 4.5 } },
+            { depth: 3, disposition: "replaced", cost: { totalUsd: 4.5 } },
+            {
+                depth: 4,
+                disposition: "overBudget",
+                outcome: "overBudget",
+                spentUsd: 13.5,
+                ceilingUsd: 10,
+                cost: { totalUsd: 0 },
+                fallbackReason: "overBudget: $13.50 spent this session against a $10.00 ceiling",
+            },
+        ]
+            .map((row) => JSON.stringify(row))
+            .join("\n");
+
+    it("still forks on the next compaction", async () => {
+        const runtime = await registered();
+        let forks = 0;
+        const host = seamHost({
+            files: { [sessionLog]: expensiveHistory() },
+            messages: [userTurn("go"), assistantTurn("done")],
+            model: {
+                fork: async () => {
+                    forks += 1;
+
+                    // Read over the whole 12k-token context the fixture holds,
+                    // so the answer is this conversation's and is handed up.
+                    return { text: "A handoff.", usage: { input_tokens: 10, cache_read_input_tokens: 12_000 } };
+                },
+            },
+        });
+
+        try {
+            await runtime.dispatch("session.compact", host.$, compaction(), compactNext());
+
+            const row = lastRow(host);
+
+            assert.equal(forks, 1);
+            assert.notEqual(row.disposition, "overBudget");
+            assert.equal(row.outcome, "handoff");
+        } finally {
+            host.stopTimers();
+        }
+    });
+
+    it("reads back through handoff_status, old overBudget row and all, with no ceiling in it", async () => {
+        const runtime = await registered();
+        const host = fakeApi({ files: { [sessionLog]: expensiveHistory() } });
+
+        const answer = await runtime.dispatch("tool.call", host.$, { tool: "mcp__compact-handoff__handoff_status" });
+        const status = JSON.parse(answer.result);
+
+        assert.equal(status.spentUsd, 13.5);
+        assert.equal(status.last.disposition, "overBudget");
+        assert.equal(status.runs.length, 4);
+        assert.equal("ceilingUsd" in status, false);
+    });
+
+    it("lists the old overBudget row through handoff_list", async () => {
+        const runtime = await registered();
+        const host = fakeApi({ files: { [sessionLog]: expensiveHistory() } });
+
+        const answer = await runtime.dispatch("tool.call", host.$, { tool: "mcp__compact-handoff__handoff_list" });
+        const listed = JSON.parse(answer.result);
+
+        assert.deepEqual(
+            listed.map((row) => row.disposition),
+            ["replaced", "replaced", "replaced", "overBudget"],
+        );
     });
 });

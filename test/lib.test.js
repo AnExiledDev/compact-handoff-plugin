@@ -664,13 +664,6 @@ describe("why a compaction was not replaced", () => {
         assert.match(reason, /COMPACT_HANDOFF_SUBAGENTS/u);
     });
 
-    it("carries both numbers when the session ran out of budget", () => {
-        assert.equal(
-            fallbackReasonFor({ spentUsd: 10.5, ceilingUsd: 10 }, "overBudget"),
-            "overBudget: $10.50 spent this session against a $10.00 ceiling",
-        );
-    });
-
     it("distinguishes a rehearsal from a real fallback", () => {
         assert.match(fallbackReasonFor({}, "rehearsed"), /^rehearsal:.*COMPACT_HANDOFF_LIVE/u);
     });

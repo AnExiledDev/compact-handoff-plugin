@@ -63,12 +63,6 @@
       "description": "The most all restored files may add together, in characters. 0 uses 100000.",
       "default": 0
     },
-    "maxUsdPerSession": {
-      "type": "string",
-      "title": "Session budget (USD)",
-      "description": "Past this, compactions fall back to the engine and record overBudget. Empty uses 10.",
-      "default": ""
-    },
     "seamTimeoutMs": {
       "type": "number",
       "title": "Seam timeout (ms)",

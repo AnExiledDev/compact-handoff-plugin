@@ -209,16 +209,16 @@ that matter for that second case:
 
 | field | when | what it says |
 |---|---|---|
-| `disposition` | always | `replaced`, `rehearsed`, `fellBack`, `passedThrough`, `overBudget`, `abortedFallback` |
+| `disposition` | always | `replaced`, `rehearsed`, `fellBack`, `passedThrough`, `abortedFallback`. Historical rows only: `overBudget`, written by 0.10.0 and earlier when a session had spent past its USD ceiling. That ceiling is gone, and those rows still read back through every tool |
 | `fallbackReason` | every disposition but `replaced` | one line naming why, e.g. `noHandoff: no handoff has been written yet (fork cold: the fork found no warm main-thread transcript)` |
 | `cost` | always | `{forkUsd, commitmentsUsd, commitmentsBasis, totalUsd, cacheReadWaivedUsd, basis, forkUsage, model, priced, pricesTaken}`, or `null`. Since 0.4.1 cache reads are stored in `forkUsage.cacheRead` and priced into `cacheReadWaivedUsd` at list, and never added to `forkUsd` or `totalUsd`, because on a subscription they cost nothing; `basis` says so. Rows from 0.4.0 and earlier charged them. `commitmentsBasis` is `estimate: chars/4, no cache` since 0.4.0, `none` when no commitments pass ran, `measured` on rows from 0.3.0 and earlier |
 | `maxHandoff` | every `replaced` and `rehearsed` row | the handoff ceiling the size guard used and how it was arrived at: `{window, fraction, capTokens, chars, decider}`, where `decider` is `fraction`, `cap`, `default: window unknown` or `override`; an override past the safe cap adds `overSafeCapChars` and `overSafeCapTokens` saying by how much |
 | `forkInput` | every row, `null` on the rows that never forked | what the fork was charged to read against what the session holds: `{sent, cacheRead, contextTokens, matchesContext}`. `sent` is input plus cache read plus cache write, which is the whole conversation for a warm fork and a prefix for a cold one; `matchesContext` is false when `sent` falls more than a fifth short of `contextTokens`, and that is the reading that refuses the fork's answer (`forkOutcome: "mismatch"`). Added in 0.6.0 |
 | `forkContext` | every row that forked | what the session looked like the instant before `$.model.fork`: `{context, model, messages, msSinceLastFork, subagentRanThisTurn}`, where `context` is the whole `$.session.usage().context` object (`tokens`, `window`, `percent`) and `msSinceLastFork` is `null` on a session's first fork |
 | `parts` | every `replaced` and `rehearsed` row | per-part sizes and timings; for the commitments pass, `commitmentsVia`, `commitmentsModel`, `commitmentsPromptChars`, `commitmentsReplyChars`, `commitmentsTokensEstimated`, `commitmentsCostUsd`, `commitmentsCostBasis`, and since 0.4.0 `commitmentsRows` (how many rows came back) with `commitmentsHitCap` and `commitmentsHitCapReason` (`length` or `truncated row`) saying whether the reply stopped at the 8192-token output cap |
-| `seam` | every row this plugin handled itself | `{subscribers, results}`, where each result is `{name, outcome, elapsedMs}` and `outcome` is `ok`, `threw` or `timedOut`; `{subscribers: 0}` alone when nothing subscribed. Absent on `passedThrough` and `overBudget` rows, which never reach the seam |
+| `seam` | every row this plugin handled itself | `{subscribers, results}`, where each result is `{name, outcome, elapsedMs}` and `outcome` is `ok`, `threw` or `timedOut`; `{subscribers: 0}` alone when nothing subscribed. Absent on `passedThrough` rows, which never reach the seam, and on the historical `overBudget` rows of 0.10.0 and earlier |
 | `costUnknownReason` | when `cost` is `null` | why it could not be priced. A run is never priced at 0 because its usage was missing |
-| `costNote` | when nothing was spent | `no model call was made`. A pass-through and a refusal over budget cost a real zero, which is not the same as unknown |
+| `costNote` | when nothing was spent | `no model call was made`. A pass-through costs a real zero, which is not the same as unknown |
 | `overCeiling` | always | the size guard could not fit the replacement, because the handoff itself is larger than the ceiling and is never trimmed |
 | `restore` | every `replaced` and `rehearsed` row | `{source, requested, restored, rejected, files, chars, approxTokens, caps, ms}`; `source` is `model`, `recency` or `none`, and each file's `source` is `fresh`, `stored`, `failed` or `dropped` |
 
@@ -499,10 +499,7 @@ What the seam will and will not do to you:
 - A raise still pending after `COMPACT_HANDOFF_SEAM_TIMEOUT_MS` (default
   `90000`) is abandoned. Nothing here can cancel one, so it is left running, its
   answer is ignored and the compaction goes on.
-- Nothing is raised on a compaction this plugin only passes through. A
-  subagent's compaction and a session already over its budget are handed back to
-  the engine before the seam is reached, and those rows carry no `seam` field at
-  all.
+- Nothing is raised on a compaction this plugin only passes through. A subagent's compaction is handed back to the engine before the seam is reached, and its row carries no `seam` field at all.
 - With nobody subscribed the seam is one array copy and the row says
   `seam: { subscribers: 0 }`. No environment read, no timer, no cost.
 
@@ -598,13 +595,9 @@ refused — and the live check above covers the third.
 
 ## Settings
 
-Every one of these is also a row in `/plugin`, under this plugin's
-configuration: `live`, `dataDir`, `model`, `maxChars`, `maxFraction`,
-`maxTokens`, `restoreFiles`, `restoreFileChars`, `restoreTotalChars`,
-`maxUsdPerSession`, `seamTimeoutMs`, `subagents`, `dev`, `refresh` and
-`refreshMs`. A row set there wins over the matching variable; left empty (or
-`0`, for a number), the variable is read as it always was, which is what a
-cron line or a one-off shell invocation already sets.
+Every one of these is also a row in `/plugin`, under this plugin's configuration: `live`, `dataDir`, `model`, `maxChars`, `maxFraction`, `maxTokens`, `restoreFiles`, `restoreFileChars`, `restoreTotalChars`, `seamTimeoutMs`, `subagents`, `dev`, `refresh` and `refreshMs`. A row set there wins over the matching variable; left empty (or `0`, for a number), the variable is read as it always was, which is what a cron line or a one-off shell invocation already sets.
+
+There is no spend ceiling. Every main-thread compaction goes to the fork whatever the session has already spent. Up to 0.10.0 a session that crossed $10 fell back to the engine for every later compaction; `maxUsdPerSession` and `COMPACT_HANDOFF_MAX_USD_PER_SESSION` were how that ceiling was set, and both are now ignored, so an old config naming either one does nothing.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
@@ -617,7 +610,6 @@ cron line or a one-off shell invocation already sets.
 | `COMPACT_HANDOFF_RESTORE_FILES` | `5` | How many files the summariser may have restored after the handoff. |
 | `COMPACT_HANDOFF_RESTORE_FILE_CHARS` | `20000` | The most of one restored file that comes back; the rest is clipped with a note saying how much. |
 | `COMPACT_HANDOFF_RESTORE_TOTAL_CHARS` | `100000` | The most all restored files may add together, and never more than the ceiling above leaves free after the handoff. |
-| `COMPACT_HANDOFF_MAX_USD_PER_SESSION` | `10` | Past this, compactions fall back to the engine and record `disposition: "overBudget"`. |
 | `COMPACT_HANDOFF_SEAM_TIMEOUT_MS` | `90000` | How long one raised seam tool may run before the compaction goes on without it. Read only when something is subscribed. |
 | `COMPACT_HANDOFF_SUBAGENTS` | off | Off, a subagent's compaction is passed through with a row saying so. On, it is answered like any other. |
 | `COMPACT_HANDOFF_DEV` | off | Registers the four measurement tools. |

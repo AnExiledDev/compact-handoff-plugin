@@ -915,8 +915,8 @@ export const costOf = ({ forkUsage, forkModel, commitmentsUsd, commitmentsBasis 
  * A run that made no model call still has a cost, and that cost is zero.
  *
  * Distinct from an unpriceable run, which records `null` and a reason. A
- * subagent pass-through and a run refused over budget both spend nothing and
- * both know it, so summing a session's rows must not have to guess which.
+ * subagent pass-through spends nothing and knows it, so summing a session's
+ * rows must not have to guess.
  */
 export const costOfNothing = (model, note) => ({
     cost: {
@@ -946,13 +946,6 @@ export const fallbackReasonFor = (record, disposition) => {
 
     if (disposition === "passedThrough") {
         return "subagent: a subagent's own compaction, and COMPACT_HANDOFF_SUBAGENTS is unset";
-    }
-
-    if (disposition === "overBudget") {
-        const spent = typeof record.spentUsd === "number" ? record.spentUsd.toFixed(2) : "?";
-        const ceiling = typeof record.ceilingUsd === "number" ? record.ceilingUsd.toFixed(2) : "?";
-
-        return `overBudget: $${spent} spent this session against a $${ceiling} ceiling`;
     }
 
     if (disposition === "rehearsed") {

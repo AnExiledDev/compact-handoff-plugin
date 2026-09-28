@@ -497,20 +497,6 @@ export const register = (on, pluginOptions) => {
             return next(e);
         }
 
-        const spent = await spentThisSession($);
-        const ceiling = await budgetCeiling($);
-
-        if (spent >= ceiling) {
-            record.outcome = "overBudget";
-            record.spentUsd = spent;
-            record.ceilingUsd = ceiling;
-            record.elapsedMs = Date.now() - startedAt;
-
-            await finish($, record, "overBudget");
-
-            return next(e);
-        }
-
         // Another plugin's work starts here, before anything is awaited, so it
         // runs beside this plugin's fork over the same pre-compaction
         // transcript and both read one warm cache. With nobody subscribed this
@@ -1836,7 +1822,6 @@ const readRuns = async ($, e) => {
         dataDir: await dataDir($),
         depth: rows.reduce((deepest, row) => Math.max(deepest, row.depth ?? 0), 0),
         spentUsd: Number((await spentThisSession($)).toFixed(4)),
-        ceilingUsd: await budgetCeiling($),
         handoff: await handoffState($),
         // Whether `$.agent.register` took this session. A false reading is not a
         // failure: the spawn falls back to general-purpose with the standing
@@ -2169,7 +2154,7 @@ const finish = async ($, record, disposition, artifacts = {}) => {
  * model's summary on its own, the conversation as it stood *before* the
  * compaction, the row as data, and the row appended to two logs.
  *
- * The per-session log is what `handoff_status` and the budget read; the global
+ * The per-session log is what `handoff_status` reads; the global
  * one is what the bench reads. Both are append-only.
  */
 const storeRun = async ($, record, disposition, artifacts) => {
@@ -2238,17 +2223,8 @@ const runLines = async ($, sessionId) => {
 };
 
 /* ------------------------------------------------------------------ *
- * What a compaction is allowed to cost, and what it did cost.
+ * What a compaction did cost.
  * ------------------------------------------------------------------ */
-
-/** What one session may spend on handoffs before the engine gets its compactions back. */
-const DEFAULT_MAX_USD = 10;
-
-const budgetCeiling = async ($) => {
-    const raw = Number.parseFloat(opt("maxUsdPerSession") ?? (await $.env.get("COMPACT_HANDOFF_MAX_USD_PER_SESSION")) ?? "");
-
-    return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_MAX_USD;
-};
 
 /** What this plugin has spent on this session, summed off its own rows. */
 const spentThisSession = async ($) => {

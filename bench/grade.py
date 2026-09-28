@@ -111,9 +111,13 @@ def handoffs_from(labels, min_context):
 
 def ask(prompt, model, timeout):
     """One headless grading call. Run from a neutral cwd so no project's
-    CLAUDE.md is loaded into the grader and no MCP server is started."""
+    CLAUDE.md is loaded into the grader and no MCP server is started, and with
+    no setting sources so the box's own hooks and rules stay out of it too:
+    they made the grader non-neutral, cost about ten times what a bare call
+    does, and let a prompt-capture hook record the grading prompt as if a
+    person had typed it."""
     result = subprocess.run(
-        ["claude", "-p", "--model", model, "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}'],
+        ["claude", "-p", "--setting-sources", "", "--model", model, "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}'],
         input=prompt,
         capture_output=True,
         text=True,

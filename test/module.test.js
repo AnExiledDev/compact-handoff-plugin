@@ -740,6 +740,84 @@ describe("a fork the engine left unanswered", () => {
     });
 });
 
+/* ------------------------------------------------------------------ *
+ * The settings, as the engine hands them to `register`.
+ * ------------------------------------------------------------------ */
+
+const manifestSettings = () =>
+    JSON.parse(readFileSync(new URL("../.claude-plugin/plugin.json", import.meta.url), "utf8")).userConfig;
+
+/**
+ * `register`'s options the way the engine builds them: what the person stored
+ * for each declared field, else that field's declared default, and no key at
+ * all for a field with neither.
+ */
+const engineOptions = (stored = {}) => {
+    const options = {};
+
+    for (const [key, field] of Object.entries(manifestSettings())) {
+        const value = stored[key] ?? field.default;
+
+        if (value !== undefined) {
+            options[key] = value;
+        }
+    }
+
+    return options;
+};
+
+/**
+ * Every setting was an environment variable first, and a setting nobody touched
+ * has to leave the variable in charge. A declared default the module reads as
+ * set silently overrides the variable for everyone who never opened the menu.
+ */
+describe("a setting nobody touched leaves its environment variable in charge", () => {
+    const registeredWith = async (options) => {
+        const runtime = fakeRuntime();
+
+        (await import("../hooks/module.js")).register(runtime.on, options);
+
+        return runtime;
+    };
+
+    const dispositionOf = async (options, env) => {
+        const runtime = await registeredWith(options);
+        const host = seamHost({
+            env,
+            messages: [userTurn("go"), assistantTurn("done")],
+            model: { fork: async () => answered("THE FORK'S SUMMARY", warmForkUsage) },
+        });
+
+        try {
+            await runtime.dispatch("session.compact", host.$, compaction(), compactNext());
+
+            return lastRow(host).disposition;
+        } finally {
+            host.stopTimers();
+        }
+    };
+
+    it("answers the compaction when live is unset and COMPACT_HANDOFF_LIVE is on", async () => {
+        assert.equal(await dispositionOf(engineOptions(), { COMPACT_HANDOFF_LIVE: "1" }), "replaced");
+    });
+
+    it("rehearses when live is set off, whatever the variable says", async () => {
+        assert.equal(await dispositionOf(engineOptions({ live: false }), { COMPACT_HANDOFF_LIVE: "1" }), "rehearsed");
+    });
+
+    it("answers the compaction when live is set on and no variable is", async () => {
+        assert.equal(await dispositionOf(engineOptions({ live: true }), {}), "replaced");
+    });
+
+    it("declares no default the module would read as a setting", () => {
+        const masking = Object.entries(manifestSettings())
+            .filter(([, field]) => "default" in field && field.default !== "" && field.default !== 0)
+            .map(([key]) => key);
+
+        assert.deepEqual(masking, []);
+    });
+});
+
 /**
  * A session's spend is not a reason to stop handing off. The sessions that
  * compact most are the long ones, which are the ones that most need a good

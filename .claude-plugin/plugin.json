@@ -12,8 +12,7 @@
     "live": {
       "type": "boolean",
       "title": "Live",
-      "description": "Off, it rehearses and the engine still compacts. On, it answers the event and the engine's summariser never runs.",
-      "default": false
+      "description": "Off, it rehearses and the engine still compacts. On, it answers the event and the engine's summariser never runs."
     },
     "dataDir": {
       "type": "string",
@@ -72,20 +71,17 @@
     "subagents": {
       "type": "boolean",
       "title": "Answer subagent compactions",
-      "description": "Off, a subagent's compaction is passed through with a row saying so. On, it is answered like any other.",
-      "default": false
+      "description": "Off, a subagent's compaction is passed through with a row saying so. On, it is answered like any other."
     },
     "dev": {
       "type": "boolean",
       "title": "Measurement tools",
-      "description": "Registers the four measurement tools.",
-      "default": false
+      "description": "Registers the four measurement tools."
     },
     "refresh": {
       "type": "boolean",
       "title": "Fallback handoff",
-      "description": "Keeps a fallback handoff on disk for sessions a fork cannot serve (headless).",
-      "default": false
+      "description": "Keeps a fallback handoff on disk for sessions a fork cannot serve (headless)."
     },
     "refreshMs": {
       "type": "number",

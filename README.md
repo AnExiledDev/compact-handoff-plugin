@@ -596,7 +596,7 @@ refused — and the live check above covers the third.
 
 ## Settings
 
-Every one of these is also a row in `/plugin`, under this plugin's configuration: `live`, `dataDir`, `model`, `maxChars`, `maxFraction`, `maxTokens`, `restoreFiles`, `restoreFileChars`, `restoreTotalChars`, `seamTimeoutMs`, `subagents`, `dev`, `refresh` and `refreshMs`. A row set there wins over the matching variable; left empty (or `0`, for a number), the variable is read as it always was, which is what a cron line or a one-off shell invocation already sets.
+Every one of these is also a row in `/plugin`, under this plugin's configuration: `live`, `dataDir`, `model`, `maxChars`, `maxFraction`, `maxTokens`, `restoreFiles`, `restoreFileChars`, `restoreTotalChars`, `seamTimeoutMs`, `subagents`, `dev`, `refresh` and `refreshMs`. A row set there wins over the matching variable; left empty (or `0`, for a number), the variable is read as it always was, which is what a cron line or a one-off shell invocation already sets. The four on/off rows (`live`, `subagents`, `dev`, `refresh`) declare no default, so a row nobody touched stays unset and the variable decides, while a row switched off is a setting and stays off whatever the variable says. Through 0.10.0 they declared `false`, which the engine filled in as though it had been set, and `COMPACT_HANDOFF_LIVE=1` was never read.
 
 There is no spend ceiling. Every main-thread compaction goes to the fork whatever the session has already spent. Up to 0.10.0 a session that crossed $10 fell back to the engine for every later compaction; `maxUsdPerSession` and `COMPACT_HANDOFF_MAX_USD_PER_SESSION` were how that ceiling was set, and both are now ignored, so an old config naming either one does nothing.
 

@@ -127,6 +127,9 @@ let options = {};
  * the text `$.env.get` returns and a declared number or boolean has to read
  * the same way to them. A number row left at `0` counts as unset, which is why
  * each numeric default is `0` and the real default lives in the constant.
+ * A boolean row declares no default at all: the engine fills a declared default
+ * in as though the person had set it, and `false` is a setting, so a declared
+ * `false` would keep the variable from ever being read.
  */
 const opt = (key) => {
     const value = options[key];

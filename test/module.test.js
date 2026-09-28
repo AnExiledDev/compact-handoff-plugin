@@ -1149,3 +1149,51 @@ describe("the transcript the handoff writer reads", () => {
         }
     });
 });
+
+// The handoff carries a trimmed shell list and a count line pointing here, so
+// the lookup has to rebuild every row from the compaction's JSON rather than
+// hand back the same trimmed section out of the stored handoff.
+describe("handoff_lookup section=ledger", () => {
+    const dir = "/home/nobody/.claude/compact-handoff/sessions/session-under-test";
+    const rows = Array.from({ length: 40 }, (_, index) => ({
+        name: "Bash",
+        target: `ls /tmp/probe-${index}`,
+        outcome: "ok",
+        detail: "",
+        writes: [],
+        readOnly: true,
+    }));
+    const stored = (files) => ({
+        [`${dir}/runs.jsonl`]: JSON.stringify({ at: "2026-09-28T07:00:00.000Z", disposition: "replaced", depth: 3, files }),
+        [`${dir}/003.md`]: "## Tool ledger\n\n### Shell commands, in order (10 of 40)\n\n- 30 older commands omitted (30 read-only)\n",
+        [`${dir}/003.json`]: JSON.stringify({ rows }),
+    });
+
+    it("lists every command from the stored rows", async () => {
+        const runtime = await registered();
+        const host = fakeApi({ files: stored({ ".md": `${dir}/003.md`, ".json": `${dir}/003.json` }) });
+
+        const answer = await runtime.dispatch("tool.call", host.$, {
+            tool: "mcp__compact-handoff__handoff_lookup",
+            n: 3,
+            section: "ledger",
+        });
+
+        assert.match(answer.result, /### Every shell command, in order \(40\)/u);
+        assert.match(answer.result, /probe-0`/u);
+        assert.doesNotMatch(answer.result, /omitted/u);
+    });
+
+    it("falls back to the handoff's own section when no JSON was kept", async () => {
+        const runtime = await registered();
+        const host = fakeApi({ files: stored({ ".md": `${dir}/003.md` }) });
+
+        const answer = await runtime.dispatch("tool.call", host.$, {
+            tool: "mcp__compact-handoff__handoff_lookup",
+            n: 3,
+            section: "ledger",
+        });
+
+        assert.match(answer.result, /\(10 of 40\)/u);
+    });
+});

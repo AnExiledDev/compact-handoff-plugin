@@ -17,6 +17,18 @@
 /** Longest tool argument kept in the ledger; enough for a real command line. */
 export const LEDGER_ARG_CHARS = 300;
 
+/** Longest shell command the trimmed ledger shows; the full one keeps LEDGER_ARG_CHARS. */
+export const LEDGER_SHELL_CHARS = 150;
+
+/** The newest shell commands the trimmed ledger always shows, read-only or not. */
+export const LEDGER_RECENT_COMMANDS = 10;
+
+/** The newest failures the trimmed ledger shows. */
+export const LEDGER_FAILURES = 20;
+
+/** Budget for the trimmed ledger's body; older commands that changed something drop first. */
+export const LEDGER_CHARS = 6000;
+
 /** Longest error line quoted back. */
 export const LEDGER_ERROR_CHARS = 200;
 
@@ -286,7 +298,17 @@ export const ledgerRows = (messages) => {
         for (const use of message.toolUses ?? []) {
             const { outcome, detail } = outcomeOf(use);
 
-            rows.push({ name: nameOf(use), target: targetOf(use), outcome, detail });
+            const name = nameOf(use);
+            const command = name === "Bash" && typeof use.input?.command === "string" ? use.input.command : "";
+
+            rows.push({
+                name,
+                target: targetOf(use),
+                outcome,
+                detail,
+                writes: shellWrites(command),
+                readOnly: command !== "" && isReadOnlyCommand(command),
+            });
         }
     }
 
@@ -302,13 +324,21 @@ export const ledgerRows = (messages) => {
  * 82k-character handoff (measured 2026-09-15). The earlier rows are still on
  * disk in each compaction's own JSON; `handoff_lookup` reads them back, and
  * the note above the summary says so.
+ *
+ * Within one compaction the shell list is trimmed too: a window of 90 commands
+ * rendered 21k characters, most of it read-only probes and the long bodies of
+ * commands that are also in the summary's inventory. The trimmed list keeps the
+ * newest LEDGER_RECENT_COMMANDS whatever they were, then every older command
+ * that changed something while LEDGER_CHARS lasts, and counts the rest. `full`
+ * renders every row, for `handoff_lookup section=ledger`, which reads the rows
+ * back from the compaction's JSON.
  */
-export const renderLedger = (rows) => {
+export const renderLedger = (rows, { full = false, n = null } = {}) => {
     if (rows.length === 0) {
         return "";
     }
 
-    return ["## Tool ledger", "", ...ledgerBody(rows)].join("\n").trimEnd();
+    return ["## Tool ledger", "", ...ledgerBody(rows, { full, n })].join("\n").trimEnd();
 };
 
 /**
@@ -420,44 +450,110 @@ export const lookupRecord = ({ at, sessionId, tool, args, text }) => ({
     approxTokens: approxTokens(text),
 });
 
-/** The three subsections a set of rows renders to, at the given heading depth. */
-const ledgerBody = (rows, depth = 3) => {
-    const hash = "#".repeat(depth);
-    const written = rows.filter((row) => ["Write", "Edit", "NotebookEdit"].includes(row.name));
+/** The subsections a set of rows renders to: files written, failures, shell commands. */
+const ledgerBody = (rows, { full, n }) => {
+    const toolWrites = rows.filter((row) => WRITE_TOOLS.has(row.name));
+    const shellWritten = rows.flatMap((row) => (row.writes ?? []).map((path) => `- Bash \`${path}\``));
     const shells = rows.filter((row) => row.name === "Bash");
     const failed = rows.filter((row) => row.outcome !== "ok" && row.outcome !== "no result in transcript");
-
+    const writeCount = toolWrites.length + shellWritten.length;
     const out = [
-        `${count(rows.length, "tool call")}: ${count(written.length, "file write")}, ${count(shells.length, "shell command")}.`,
+        `${count(rows.length, "tool call")}: ${count(writeCount, "file write")}, ${count(shells.length, "shell command")}.`,
         "Read off the transcript rather than recalled. **The transcript stores no exit",
         "code**, so the outcome of a command is what its output supports and no more.",
         "",
     ];
 
-    if (written.length > 0) {
-        out.push(`${hash} Files written (${count(written.length, "call")})`, "");
-        out.push(...unique(written.map((row) => `- ${row.name} \`${row.target}\``)));
+    if (writeCount > 0) {
+        out.push(`### Files written (${count(writeCount, "call")})`, "");
+        out.push(...unique([...toolWrites.map((row) => `- ${row.name} \`${row.target}\``), ...shellWritten]));
         out.push("");
     }
 
-    if (failed.length > 0) {
-        out.push(`${hash} Output that reads as a failure (${failed.length})`, "");
+    out.push(...failureLines(failed, full));
 
-        for (const row of failed) {
-            out.push(`- ${callLabel(row)}`);
-            out.push(`  - ${row.outcome}${row.detail === "" ? "" : `: ${row.detail}`}`);
-        }
-
-        out.push("");
-    }
+    const fixed = out.join("\n").length;
 
     if (shells.length > 0) {
-        out.push(`${hash} Every shell command, in order (${shells.length})`, "");
-        out.push(...shells.map((row) => `- \`${row.target}\`${row.outcome === "ok" ? "" : ` — ${row.outcome}`}`));
-        out.push("");
+        const budget = Math.max(0, LEDGER_CHARS - fixed - SHELL_LIST_FRAME);
+
+        out.push(...(full ? everyShellLine(shells) : trimmedShellLines(shells, budget, n)));
     }
 
     return out;
+};
+
+const WRITE_TOOLS = new Set(["Write", "Edit", "NotebookEdit"]);
+
+/** Room kept for the ledger's own heading, the list's heading and the count line. */
+const SHELL_LIST_FRAME = 200;
+
+const failureLines = (failed, full) => {
+    if (failed.length === 0) {
+        return [];
+    }
+
+    const shown = full ? failed : failed.slice(-LEDGER_FAILURES);
+    const limit = full ? LEDGER_ARG_CHARS : LEDGER_SHELL_CHARS;
+    const out = [`### Output that reads as a failure (${failed.length})`, ""];
+
+    if (shown.length < failed.length) {
+        out.push(`- ${failed.length - shown.length} older failures omitted`);
+    }
+
+    for (const row of shown) {
+        out.push(`- ${callLabel({ ...row, target: clipTo(row.target, limit) })}`);
+        out.push(`  - ${row.outcome}${row.detail === "" ? "" : `: ${row.detail}`}`);
+    }
+
+    return [...out, ""];
+};
+
+const shellLine = (row, limit) => `- \`${clipTo(row.target, limit)}\`${row.outcome === "ok" ? "" : ` — ${row.outcome}`}`;
+
+const everyShellLine = (shells) => [
+    `### Every shell command, in order (${shells.length})`,
+    "",
+    ...shells.map((row) => shellLine(row, LEDGER_ARG_CHARS)),
+    "",
+];
+
+/**
+ * The newest commands always, then older ones that changed something, newest
+ * first, while the budget lasts; shown in the order they ran.
+ */
+const trimmedShellLines = (shells, budget, n) => {
+    const recentFrom = Math.max(0, shells.length - LEDGER_RECENT_COMMANDS);
+    const kept = new Set();
+    let used = 0;
+
+    for (let index = shells.length - 1; index >= 0; index -= 1) {
+        const size = shellLine(shells[index], LEDGER_SHELL_CHARS).length + 1;
+        const isRecent = index >= recentFrom;
+
+        if (isRecent || (!shells[index].readOnly && used + size <= budget)) {
+            kept.add(index);
+            used += size;
+        }
+    }
+
+    const omitted = shells.filter((_, index) => !kept.has(index));
+    const out = [
+        kept.size === shells.length
+            ? `### Every shell command, in order (${shells.length})`
+            : `### Shell commands, in order (${kept.size} of ${shells.length})`,
+        "",
+        ...shells.flatMap((row, index) => (kept.has(index) ? [shellLine(row, LEDGER_SHELL_CHARS)] : [])),
+    ];
+
+    if (omitted.length > 0) {
+        const readOnly = omitted.filter((row) => row.readOnly).length;
+        const where = `handoff_lookup ${n === null ? "" : `n=${n} `}section=ledger`;
+
+        out.push(`- ${count(omitted.length, "older command")} omitted (${readOnly} read-only); ${where} lists every one.`);
+    }
+
+    return [...out, ""];
 };
 
 /**
@@ -545,6 +641,103 @@ export const targetOf = (use) => {
 
     return "";
 };
+
+/* ------------------------------------------------------------------ *
+ * What a shell command did, read off its text.
+ * ------------------------------------------------------------------ */
+
+/** Has a directory separator, or ends in an extension. */
+export const PATH_SHAPED = /\/|\.[A-Za-z0-9]+$/u;
+
+/** Anything the shell would have rewritten before the file was opened. */
+export const SHELL_EXPANDED = /[$*?{}~]/u;
+
+/** Where one command in a compound ends: a newline, `&&`, `||`, `;` or a pipe. */
+const SEGMENT_BREAK = /\n|&&|\|\||;|\|/u;
+
+/** Prefixes that run the command after them unchanged. */
+const RUNS_THE_REST = /^(?:\w+=\S*\s+|sudo\s+(?:-\S+\s+)*(?:-u\s+\S+\s+)?|timeout\s+\S+\s+|time\s+|then\s+|do\s+|else\s+)+/u;
+
+/** Verbs that only look. Anything not here counts as having changed something. */
+const READ_ONLY =
+    /^(?:cd|ls|cat|head|tail|wc|grep|rg|find|echo|printf|pwd|stat|readlink|realpath|file|which|type|date|env|ps|pgrep|du|df|tree|sort|uniq|cut|awk|diff|jq|test|true|\[|sed|python3?\s+-c|git\s+(?:-C\s+\S+\s+)?(?:status|log|diff|show|rev-parse|fetch|ls-files|worktree\s+list|remote(?:\s+-v)?|branch\s+--show-current|config\s+--get)|gh\s+(?:pr|issue|run)\s+(?:view|list|checks|diff)|gh\s+api(?!.*-X\s*(?:POST|PATCH|PUT|DELETE)))(?:\s|$)/u;
+
+/** A redirect into a file: `>`, `>>`, `2>`, never `2>&1` or a `=>` arrow. */
+const REDIRECT = /(?:^|[^<>&=\-\d])\d?>>?[ \t]*([^\s;&|<>()'"`]+)/gu;
+
+/** `open("x", "w")` in an inline script. */
+const OPEN_FOR_WRITE = /open\(\s*(['"])([^'"]+)\1\s*,\s*(['"])[wax]/gu;
+
+/** A redirect that is only plumbing: the bit bucket, or a gate's own log. */
+const NOT_WORK = /^\/dev\/|\.log$/u;
+
+/** `sed -i`, which writes even when its target is a variable this cannot read. */
+const IN_PLACE = /^sed\s(?:.*\s)?-i/u;
+
+/** One-line quoted strings emptied, so a `|` or `>` inside one is not read as the shell's. */
+const blankQuotes = (command) => command.replace(/'[^'\n]*'|"[^"\n]*"/gu, "''");
+
+/** Every command in a compound, with the prefixes that just run it stripped. */
+const segmentsOf = (command) =>
+    blankQuotes(command)
+        .split(SEGMENT_BREAK)
+        .map((segment) => segment.trim().replace(RUNS_THE_REST, ""))
+        .filter((segment) => segment !== "");
+
+/** The unquoted, path-shaped words of one command after its verb. */
+const pathWords = (segment) =>
+    segment
+        .split(/\s+/u)
+        .slice(1)
+        .filter((word) => word !== "" && !word.startsWith("-") && PATH_SHAPED.test(word) && !SHELL_EXPANDED.test(word));
+
+/**
+ * The files a shell command wrote, as far as its text says: redirects, `tee`,
+ * `sed -i`, the destination of `mv` and `cp`, and `open(..., "w")` in an inline
+ * script. A path built from a variable cannot be read off the text and is left
+ * out, so this can miss a write but should not invent one.
+ */
+export const shellWrites = (command) => {
+    if (command === "") {
+        return [];
+    }
+
+    const found = [];
+
+    for (const match of blankQuotes(command).matchAll(REDIRECT)) {
+        found.push(match[1]);
+    }
+
+    for (const match of command.matchAll(OPEN_FOR_WRITE)) {
+        found.push(match[2]);
+    }
+
+    for (const segment of segmentsOf(command)) {
+        const words = pathWords(segment);
+
+        if (/^tee\s/u.test(segment) || IN_PLACE.test(segment)) {
+            found.push(...words);
+        } else if (/^(?:mv|cp)\s/u.test(segment) && words.length >= 2) {
+            found.push(words[words.length - 1]);
+        }
+    }
+
+    return unique(found.filter((path) => PATH_SHAPED.test(path) && !SHELL_EXPANDED.test(path) && !NOT_WORK.test(path)));
+};
+
+/** Whether every command in a compound only looked, and none of them wrote. */
+export const isReadOnlyCommand = (command) => {
+    const redirects = blankQuotes(command).replace(HARMLESS_REDIRECT, "");
+
+    if (shellWrites(command).length > 0 || />/u.test(redirects)) {
+        return false;
+    }
+
+    return segmentsOf(command).every((segment) => READ_ONLY.test(segment) && !IN_PLACE.test(segment));
+};
+
+/** `2>&1` and `>/dev/null`, which send output nowhere that lasts. */
+const HARMLESS_REDIRECT = /\d?>&\d|\d?>\s*\/dev\/null/gu;
 
 /* ------------------------------------------------------------------ *
  * The commitments pass: what goes in, and what comes back out.

@@ -583,7 +583,7 @@ export const register = (on, pluginOptions) => {
         // The model's summary is only the first of four parts. The rest are read
         // or gathered rather than recalled, and each one is allowed to fail: a
         // summary on its own is still the arm that scored 67.3%.
-        const assembled = await assembledHandoff($, e, handoff.text, context);
+        const assembled = await assembledHandoff($, e, handoff.text, context, record.depth ?? null);
         const maxHandoff = await handoffCeilingFor($);
         const guarded = applySizeGuard(replacementFor(e.messages, assembled.text), {
             maxChars: maxHandoff.chars,
@@ -677,7 +677,7 @@ export const register = (on, pluginOptions) => {
  * empty table, so nothing at the fold can read the manifest. `test/module.test.js`
  * asserts it against `.claude-plugin/plugin.json` so the two cannot drift.
  */
-export const PLUGIN_VERSION = "0.11.2";
+export const PLUGIN_VERSION = "0.11.3";
 
 /** How long one subscriber may run before the compaction goes on without it. */
 const DEFAULT_SEAM_TIMEOUT_MS = 90_000;
@@ -1213,13 +1213,13 @@ const COMMITMENT_MAX_TOKENS = 8192;
  * compactions of this conversation. Only this compaction's ledger is rendered;
  * the earlier ones stay on disk behind `handoff_lookup`.
  */
-const assembledHandoff = async ($, e, summary, context) => {
+const assembledHandoff = async ($, e, summary, context, depth) => {
     const startedAt = Date.now();
     const notes = {};
     const rows = ledgerRows(e.messages);
 
     const [ledger, state, commitments] = await Promise.all([
-        attempt($, notes, "ledger", () => renderLedger(rows)),
+        attempt($, notes, "ledger", () => renderLedger(rows, { n: depth })),
         attempt($, notes, "state", () => liveState($)),
         attempt($, notes, "commitments", () => commitmentsSection($, e.messages, notes)),
     ]);
@@ -2165,9 +2165,36 @@ const sectionText = async ($, row, section) => {
         return whole(".transcript.md");
     }
 
+    if (section === "ledger") {
+        const every = await everyLedgerRow($, files[".json"]);
+
+        if (every !== null) {
+            return every;
+        }
+    }
+
     const handoff = await whole(".md");
 
     return handoff === null ? null : sectionOf(handoff, section);
+};
+
+/**
+ * The untrimmed ledger, rebuilt from the rows the compaction's JSON kept. The
+ * handoff itself carries a trimmed one, so reading the section back out of it
+ * would hand back the same omission the pointer promised to fill.
+ */
+const everyLedgerRow = async ($, path) => {
+    if (path === undefined) {
+        return null;
+    }
+
+    try {
+        const rows = JSON.parse(await $.fs.read(path)).rows;
+
+        return Array.isArray(rows) && rows.length > 0 ? renderLedger(rows, { full: true }) : null;
+    } catch {
+        return null;
+    }
 };
 
 /**

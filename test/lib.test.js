@@ -13,6 +13,9 @@ import {
     forkInputOf,
     handoffCeiling,
     isPinnable,
+    isReadOnlyCommand,
+    LEDGER_CHARS,
+    LEDGER_RECENT_COMMANDS,
     ledgerRows,
     lineageLine,
     lineageOf,
@@ -31,6 +34,7 @@ import {
     lookupRecord,
     replacementFor,
     sectionOf,
+    shellWrites,
     subagentRanThisTurn,
     summarisePrs,
     targetOf,
@@ -339,6 +343,136 @@ describe("the ledger carries only this compaction's rows", () => {
         assert.equal(renderLedger([]), "");
         assert.equal(renderLedger(ledgerRows([])), "");
     });
+});
+
+/** One assistant turn running each command, every one answering `done`. */
+const shellWindow = (commands) =>
+    ledgerRows([assistantTurn("x", commands.map((command) => use270("Bash", { command }, { text: "done" })))]);
+
+// Operator, 2026-09-28: "I think we should limit the shell-command list length,
+// or trim it of unimportant commands, something needs to be done there, it
+// concerns me on long multi-compact sessions". The largest windows ran 87-95
+// commands and rendered 15-21k characters of list.
+describe("a long shell window is trimmed, and the trim says where the rest is", () => {
+    it("keeps the newest commands in order whatever they were, and counts the rest", () => {
+        const commands = Array.from({ length: 40 }, (_, index) => `ls /tmp/probe-${index}`);
+        const text = renderLedger(shellWindow(commands), { n: 4 });
+
+        assert.match(text, /### Shell commands, in order \(10 of 40\)/u);
+        assert.match(text, /- 30 older commands omitted \(30 read-only\); handoff_lookup n=4 section=ledger lists every one\./u);
+        assert.doesNotMatch(text, /probe-29`/u);
+        assert.ok(text.indexOf("probe-30`") < text.indexOf("probe-39`"));
+        assert.equal(LEDGER_RECENT_COMMANDS, 10);
+    });
+
+    it("drops read-only probes before any older command that changed something", () => {
+        const commands = Array.from({ length: 30 }, (_, index) =>
+            index % 2 === 0 ? `grep -n thing src/file-${index}.ts` : `touch /w/made-${index}`,
+        );
+        const text = renderLedger(shellWindow(commands), { n: 2 });
+
+        for (let index = 1; index < 20; index += 2) {
+            assert.match(text, new RegExp(`made-${index}\``, "u"));
+        }
+
+        assert.doesNotMatch(text, /file-0\.ts/u);
+        assert.match(text, /- 10 older commands omitted \(10 read-only\)/u);
+    });
+
+    it("fits the worst measured window inside LEDGER_CHARS", () => {
+        const commands = Array.from({ length: 95 }, (_, index) => `sed -i 's/old/new/' /w/src/module-${index}.ts && ${"x".repeat(260)}`);
+        const text = renderLedger(shellWindow(commands), { n: 3 });
+
+        assert.ok(text.length <= LEDGER_CHARS, `ledger is ${text.length} characters`);
+        assert.match(text, /older commands omitted/u);
+    });
+
+    it("clips a kept command to about half a line", () => {
+        const text = renderLedger(shellWindow([`echo ${"y".repeat(400)}`]));
+
+        assert.doesNotMatch(text, /y{200}/u);
+    });
+
+    it("renders every command at full length for handoff_lookup", () => {
+        const commands = Array.from({ length: 40 }, (_, index) => `ls /tmp/probe-${index} ${"z".repeat(200)}`);
+        const text = renderLedger(shellWindow(commands), { full: true });
+
+        assert.match(text, /### Every shell command, in order \(40\)/u);
+        assert.match(text, /probe-0 z{200}/u);
+        assert.doesNotMatch(text, /omitted/u);
+    });
+
+    it("shows the newest twenty failures and counts the older ones", () => {
+        const rows = ledgerRows([
+            assistantTurn(
+                "x",
+                Array.from({ length: 25 }, (_, index) => use270("Bash", { command: `false ${index}` }, { text: "exit 1", isError: true })),
+            ),
+        ]);
+        const text = renderLedger(rows);
+
+        assert.match(text, /### Output that reads as a failure \(25\)/u);
+        assert.match(text, /- 5 older failures omitted/u);
+        assert.doesNotMatch(text.split(/### (?:Every shell command|Shell commands)/u)[0], /`false 4`/u);
+        assert.match(text, /`false 5`/u);
+    });
+});
+
+// Operator, 2026-09-28: "sometimes work is done through shell commands that
+// should be preserved."
+describe("a file written through the shell is a file write", () => {
+    it("is listed under Files written and counted in the header", () => {
+        const text = renderLedger(shellWindow(["sed -i 's/a/b/' src/x.ts", "ls"]));
+
+        assert.match(text, /2 tool calls: 1 file write, 2 shell commands\./u);
+        assert.match(text, /### Files written \(1 call\)/u);
+        assert.match(text, /^- Bash `src\/x\.ts`$/mu);
+    });
+
+    for (const [command, written] of [
+        ["sed -i 's/x/y/' hooks/module.js && bun test > /tmp/ch.log 2>&1", ["hooks/module.js"]],
+        ["cat > /tmp/hookprobe/dump.sh <<EOF\necho hi\nEOF", ["/tmp/hookprobe/dump.sh"]],
+        ["cp hooks/restore.js /tmp/restore.bak && sed -i 's/a/b/' hooks/restore.js", ["/tmp/restore.bak", "hooks/restore.js"]],
+        ["python3 - <<'EOF'\nopen('test/cli.test.ts','w').write(s)\nEOF", ["test/cli.test.ts"]],
+        ["echo hi | tee notes/out.md", ["notes/out.md"]],
+        ["echo hi >> /w/log.txt", ["/w/log.txt"]],
+        ['mv "$f" "$Q/$f"', []],
+        ['git commit -m "x > y.md"', []],
+        ["ls /tmp 2>/dev/null && echo done 2>&1", []],
+    ]) {
+        it(`reads ${JSON.stringify(written)} off ${JSON.stringify(command.slice(0, 50))}`, () => {
+            assert.deepEqual(shellWrites(command), written);
+        });
+    }
+});
+
+describe("a command that only looked", () => {
+    for (const command of [
+        "git -C /w fetch -q; git diff --stat",
+        "sed 's/a/b/' /tmp/x.log | grep -E '(pass|fail)'",
+        "ls /tmp && echo hi 2>/dev/null",
+        'echo "PWD=$(pwd) BRANCH=$(git rev-parse --abbrev-ref HEAD)"',
+        "gh pr view 20 --json state",
+        "cd /w && sed -n 1,20p hooks/lib.js",
+    ]) {
+        it(`is read-only: ${command.slice(0, 50)}`, () => {
+            assert.equal(isReadOnlyCommand(command), true);
+        });
+    }
+
+    for (const command of [
+        "sed -i 's/a/b/' hooks/lib.js",
+        "gh api -X DELETE repos/o/r/git/refs/heads/b",
+        'mv "$f" "$Q/$f"',
+        'git commit -m "x > y.md"',
+        "bun test > /tmp/x.out",
+        "git push origin fix",
+        "rm -rf /w/old",
+    ]) {
+        it(`changed something: ${command.slice(0, 50)}`, () => {
+            assert.equal(isReadOnlyCommand(command), false);
+        });
+    }
 });
 
 describe("a history read is logged against its session", () => {

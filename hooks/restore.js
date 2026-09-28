@@ -21,7 +21,7 @@
  * Nothing in this file touches the host; the reads happen in `module.js`.
  */
 
-import { nameOf } from "./lib.js";
+import { PATH_SHAPED, SHELL_EXPANDED, nameOf } from "./lib.js";
 
 /** How many files may come back; Claude Code's own restore stops at five. */
 export const RESTORE_MAX_FILES = 5;
@@ -157,10 +157,6 @@ export const shellMentions = (messages) => {
 };
 
 const SHELL_WORD_BREAK = /[\s"'`;|&()<>,]+/u;
-/** Has a directory separator, or ends in an extension. */
-const PATH_SHAPED = /\/|\.[A-Za-z0-9]+$/u;
-/** Anything the shell would have rewritten before the file was opened. */
-const SHELL_EXPANDED = /[$*?{}~]/u;
 
 /** The file a shell command named, if any word it used ends the requested path. */
 const shellCandidateFor = (path, mentions) => {

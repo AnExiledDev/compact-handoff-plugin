@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 
 import { priceUsage } from "../hooks/lib.js";
 import { PLUGIN_VERSION } from "../hooks/module.js";
-import { answered, assistantTurn, fakeApi, fakeRuntime, noUsage, passThrough, userTurn } from "./fixtures.js";
+import { answered, assistantTurn, fakeApi, fakeRuntime, noUsage, passThrough, use270, userTurn } from "./fixtures.js";
 
 // `node --check` reads module.js as a script and never sees an `await` in a
 // non-async arrow; 0.2.0 shipped one and only `claude plugin validate` caught
@@ -1126,5 +1126,26 @@ describe("the plugin's own fork, compacted by the engine while the compaction wa
         assert.equal(typeof first.seen.prompt, "string");
         assert.notEqual(lastRow(host).outcome, "ownFork");
         assert.equal(answer?.skip, undefined);
+    });
+});
+
+describe("the transcript the handoff writer reads", () => {
+    // Engine 2.1.270 names a tool in `tool`, not `name`, and every call in a
+    // live 0.11.0 transcript rendered as `undefined({...})`.
+    it("names each tool call by the tool it was", async () => {
+        const runtime = await seamRegistered();
+        const host = seamHost();
+        const messages = [userTurn("go"), assistantTurn("listing", [use270("Bash", { command: "ls /repo" }, { text: "a.ts" })])];
+
+        try {
+            await runtime.dispatch("session.compact", host.$, compaction({ messages }), compactNext());
+
+            const transcript = [...host.files.entries()].find(([path]) => path.endsWith(".transcript.md"))?.[1] ?? "";
+
+            assert.match(transcript, /- Bash\(\{"command":"ls \/repo"\}\)/u);
+            assert.doesNotMatch(transcript, /undefined\(/u);
+        } finally {
+            host.stopTimers();
+        }
     });
 });

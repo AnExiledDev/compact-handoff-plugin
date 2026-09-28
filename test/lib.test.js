@@ -381,6 +381,35 @@ describe("the commitments pass", () => {
         assert.equal(row.quote, "I will check X");
     });
 
+    // A live 0.11.0 handoff listed one question to the user twice, once as an
+    // unkept promise and once as unanswered, so a reader counted four owed
+    // items where there were two.
+    it("reports one finding once, under the most specific kind", () => {
+        const found = commitmentsFrom(
+            [
+                'UNKEPT | T84 | "Should I quarantine them, delete them, or leave them?" | decision still owed',
+                'UNANSWERED | T84 | "Should I quarantine them, delete them, or leave them?" | never chosen',
+                'UNKEPT | T90 | "I will read the newest row" | not read yet',
+            ].join("\n"),
+        );
+
+        assert.deepEqual(
+            found.map((row) => [row.kind, row.quote]),
+            [
+                ["unanswered", "Should I quarantine them, delete them, or leave them?"],
+                ["unkept", "I will read the newest row"],
+            ],
+        );
+    });
+
+    it("treats quotes that differ only in case, spacing or trailing punctuation as one", () => {
+        const found = commitmentsFrom(
+            ["UNKEPT | T1 | I will check X. | a", "UNKEPT | T2 | i will  check x | b"].join("\n"),
+        );
+
+        assert.equal(found.length, 1);
+    });
+
     it("returns nothing for an empty or absent reply", () => {
         assert.deepEqual(commitmentsFrom(""), []);
         assert.deepEqual(commitmentsFrom(undefined), []);
@@ -519,9 +548,30 @@ describe("cost", () => {
 
 describe("summarisePrs", () => {
     it("marks the PR on this branch", () => {
-        const text = summarisePrs(JSON.stringify([{ number: 647, headRefName: "wt" }, { number: 12, headRefName: "other" }]), "wt");
+        const text = summarisePrs(
+            JSON.stringify([
+                { number: 647, headRefName: "wt", title: "mine" },
+                { number: 12, headRefName: "other", title: "theirs" },
+            ]),
+            "wt",
+        );
 
-        assert.equal(text, "#647 (this branch), #12");
+        assert.equal(text, "#647 mine (this branch); #12 theirs");
+    });
+
+    // A handoff listed "#992" with no title; the next session read it as its own PR.
+    it("names each PR by its title so one from another session is recognisable", () => {
+        const text = summarisePrs(JSON.stringify([{ number: 992, headRefName: "issue-984", title: "changelog-cd: page big releases" }]), "main");
+
+        assert.equal(text, "#992 changelog-cd: page big releases");
+    });
+
+    it("keeps a title from breaking the table it sits in", () => {
+        const long = `a | b ${"x".repeat(200)}`;
+        const text = summarisePrs(JSON.stringify([{ number: 1, headRefName: "h", title: long }]), "main");
+
+        assert.ok(!text.includes("|"));
+        assert.ok(text.length < 100);
     });
 
     it("says so when nothing is open", () => {

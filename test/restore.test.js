@@ -75,22 +75,22 @@ describe("restoreCandidates", () => {
 describe("chooseRestores", () => {
     const candidates = restoreCandidates(conversation());
 
-    it("keeps what the model asked for when the session touched it", () => {
-        const chosen = chooseRestores({ requests: [{ path: "/w/b.ts", from: 1, to: 9, reason: "edited" }], candidates });
+    it("keeps what the model asked for when the session touched it", async () => {
+        const chosen = await chooseRestores({ requests: [{ path: "/w/b.ts", from: 1, to: 9, reason: "edited" }], candidates });
 
         assert.equal(chosen.source, "model");
         assert.deepEqual(chosen.files, [{ path: "/w/b.ts", from: 1, to: 9, reason: "edited", stored: null }]);
         assert.deepEqual(chosen.rejected, []);
     });
 
-    it("refuses a file the session never touched, a memory file, a duplicate and the overflow", () => {
+    it("refuses a file the session never touched, a memory file, a duplicate and the overflow", async () => {
         const requests = [
             { path: "/w/never.ts", from: null, to: null, reason: "" },
             { path: "/w/AGENTS.md", from: null, to: null, reason: "" },
             { path: "/w/a.ts", from: null, to: null, reason: "" },
             { path: "a.ts", from: null, to: null, reason: "relative twin" },
         ];
-        const chosen = chooseRestores({ requests, candidates, maxFiles: 1 });
+        const chosen = await chooseRestores({ requests, candidates, maxFiles: 1 });
 
         assert.equal(chosen.source, "model");
         assert.deepEqual(chosen.files.map((file) => file.path), ["/w/a.ts"]);
@@ -101,27 +101,57 @@ describe("chooseRestores", () => {
         ]);
     });
 
-    it("caps the model's list at maxFiles", () => {
+    it("caps the model's list at maxFiles", async () => {
         const requests = ["/w/a.ts", "/w/b.ts"].map((path) => ({ path, from: null, to: null, reason: "" }));
-        const chosen = chooseRestores({ requests, candidates, maxFiles: 1 });
+        const chosen = await chooseRestores({ requests, candidates, maxFiles: 1 });
 
         assert.deepEqual(chosen.files.map((file) => file.path), ["/w/a.ts"]);
         assert.deepEqual(chosen.rejected, [{ path: "/w/b.ts", why: "over the cap of 1 files" }]);
     });
 
-    it("falls back to recency, skipping memory files, when nothing usable was named", () => {
-        const chosen = chooseRestores({ requests: [{ path: "/nope", from: null, to: null, reason: "" }], candidates, maxFiles: 2 });
+    it("falls back to recency, skipping memory files, when nothing usable was named", async () => {
+        const chosen = await chooseRestores({ requests: [{ path: "/nope", from: null, to: null, reason: "" }], candidates, maxFiles: 2 });
 
         assert.equal(chosen.source, "recency");
         assert.deepEqual(chosen.files.map((file) => file.path), ["/w/missing.ts", "/w/a.ts"]);
         assert.equal(chosen.rejected.length, 1);
     });
 
-    it("says none when the session touched no file at all", () => {
-        assert.deepEqual(chooseRestores({ requests: [], candidates: [] }), { files: [], source: "none", rejected: [] });
+    it("says none when the session touched no file at all", async () => {
+        assert.deepEqual(await chooseRestores({ requests: [], candidates: [] }), { files: [], source: "none", rejected: [] });
     });
 
-    it("defaults the cap to the engine's own five", () => {
+    // A worktree removed after its files were edited left the recency fallback
+    // restoring a path that no longer existed, so the window got nothing back.
+    const onDisk = (...gone) => async (path) => !gone.includes(path);
+
+    it("refuses a file the model named that no longer exists on disk", async () => {
+        const requests = [
+            { path: "/w/a.ts", from: null, to: null, reason: "deleted since" },
+            { path: "/w/b.ts", from: null, to: null, reason: "still here" },
+        ];
+        const chosen = await chooseRestores({ requests, candidates, exists: onDisk("/w/a.ts") });
+
+        assert.equal(chosen.source, "model");
+        assert.deepEqual(chosen.files.map((file) => file.path), ["/w/b.ts"]);
+        assert.deepEqual(chosen.rejected, [{ path: "/w/a.ts", why: "no longer exists on disk" }]);
+    });
+
+    it("skips files that no longer exist when falling back to recency", async () => {
+        const chosen = await chooseRestores({ requests: [], candidates, maxFiles: 2, exists: onDisk("/w/missing.ts") });
+
+        assert.equal(chosen.source, "recency");
+        assert.deepEqual(chosen.files.map((file) => file.path), ["/w/a.ts", "/w/b.ts"]);
+    });
+
+    it("says none when every file the session touched is gone", async () => {
+        const chosen = await chooseRestores({ requests: [], candidates, exists: async () => false });
+
+        assert.equal(chosen.source, "none");
+        assert.deepEqual(chosen.files, []);
+    });
+
+    it("defaults the cap to the engine's own five", async () => {
         assert.equal(RESTORE_MAX_FILES, 5);
     });
 });

@@ -123,6 +123,62 @@ export const restoreCandidates = (messages) => {
     return [...seen.values()].sort((left, right) => right.at - left.at);
 };
 
+/**
+ * Every path-shaped word a shell command named, newest command first.
+ *
+ * A file read with `cat` or rewritten by a script was touched as surely as one
+ * that went through Read or Edit, so the model may ask for it back. These are
+ * words, not resolved paths: a relative one only ever matches the tail of an
+ * absolute path the model names, and none of them feeds the recency fallback,
+ * which would otherwise restore whatever log a command last redirected into.
+ */
+export const shellMentions = (messages) => {
+    const mentions = [];
+
+    messages.forEach((message, index) => {
+        for (const use of message.toolUses ?? []) {
+            const command = use.input?.command;
+
+            if (nameOf(use) !== "Bash" || typeof command !== "string") {
+                continue;
+            }
+
+            for (const word of command.split(SHELL_WORD_BREAK)) {
+                const token = word.slice(word.lastIndexOf("=") + 1).replace(/^\.\//u, "");
+
+                if (PATH_SHAPED.test(token) && !SHELL_EXPANDED.test(token)) {
+                    mentions.push({ token, at: index });
+                }
+            }
+        }
+    });
+
+    return mentions.sort((left, right) => right.at - left.at);
+};
+
+const SHELL_WORD_BREAK = /[\s"'`;|&()<>,]+/u;
+/** Has a directory separator, or ends in an extension. */
+const PATH_SHAPED = /\/|\.[A-Za-z0-9]+$/u;
+/** Anything the shell would have rewritten before the file was opened. */
+const SHELL_EXPANDED = /[$*?{}~]/u;
+
+/** The file a shell command named, if any word it used ends the requested path. */
+const shellCandidateFor = (path, mentions) => {
+    const wanted = path.replace(/^\.\//u, "");
+
+    for (const { token, at } of mentions) {
+        if (token.startsWith("/") && (token === wanted || token.endsWith(`/${wanted}`))) {
+            return { path: token, at, stored: null };
+        }
+
+        if (wanted.startsWith("/") && wanted.endsWith(`/${token}`)) {
+            return { path: wanted, at, stored: null };
+        }
+    }
+
+    return null;
+};
+
 const pathOf = (use) => {
     const input = use.input ?? {};
     const path = input.file_path ?? input.notebook_path;
@@ -133,8 +189,9 @@ const pathOf = (use) => {
 /**
  * Which files go back, and why each one the model asked for did not.
  *
- * The model chooses; the code only refuses. A path the session never touched
- * is refused because the model cannot have read it, a memory file because the
+ * The model chooses; the code only refuses. A path the session never touched,
+ * through a file tool or by a shell command naming it, is refused because the
+ * model cannot have read it, a memory file because the
  * engine re-emits those itself, and anything past the cap because the cap is
  * the operator's. A file that is gone from disk is refused too: a worktree
  * removed after its files were edited once left the fallback restoring nothing.
@@ -145,15 +202,16 @@ const pathOf = (use) => {
  * @param {object} options
  * @param {Array<{ path: string, from: number | null, to: number | null, reason: string }>} options.requests
  * @param {Array<{ path: string, at: number, stored: string | null }>} options.candidates
+ * @param {Array<{ token: string, at: number }>} [options.shellMentions] what shell commands named; see `shellMentions`
  * @param {number} [options.maxFiles]
  * @param {(path: string) => Promise<boolean>} [options.exists]
  */
-export const chooseRestores = async ({ requests, candidates, maxFiles = RESTORE_MAX_FILES, exists = async () => true }) => {
+export const chooseRestores = async ({ requests, candidates, shellMentions: mentions = [], maxFiles = RESTORE_MAX_FILES, exists = async () => true }) => {
     const files = [];
     const rejected = [];
 
     for (const request of requests) {
-        const candidate = candidateFor(request.path, candidates);
+        const candidate = candidateFor(request.path, candidates) ?? shellCandidateFor(request.path, mentions);
         const why = refusal(request.path, candidate, files, maxFiles) ?? (await goneFromDisk(candidate, exists));
 
         if (why !== null) {

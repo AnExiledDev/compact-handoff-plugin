@@ -96,6 +96,24 @@ describe("the two tool-use shapes", () => {
         });
     }
 
+    // The third live compaction on 0.11.1 listed an EnterWorktree error as
+    // "- ``" because only a command or a path fills the label.
+    it("names the tool of a failed call that is not a shell command", () => {
+        const rows = ledgerRows([
+            assistantTurn("x", [
+                use270("EnterWorktree", { name: "ch-ptr" }, { text: "Could not read the repository git config", isError: true }),
+                use270("Edit", { file_path: "/w/a.ts" }, { text: "String not found", isError: true }),
+                use270("Bash", { command: "false" }, { text: "exit 1", isError: true }),
+            ]),
+        ]);
+        const text = renderLedger(rows);
+
+        assert.doesNotMatch(text, /^- ``$/mu);
+        assert.match(text, /^- EnterWorktree$/mu);
+        assert.match(text, /^- Edit `\/w\/a\.ts`$/mu);
+        assert.match(text, /^- `false`$/mu);
+    });
+
     it("is the regression the first live compaction shipped", () => {
         // Before nameOf read `tool`, the 2.1.270 shape rendered every row as "?"
         // and the summary line read "0 file writes, 0 shell commands".

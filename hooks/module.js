@@ -891,10 +891,11 @@ const capOf = (value, fallback) => {
  * The fork resolves `ModelForkResult`, the union engine 2.1.280 introduced.
  * Engines before it resolved the reply or null, and that shape is not read any
  * more: the plugin targets 2.1.280 and later, and a dual-shape shim would hide
- * the next change the way the null check hid this one. An unanswered fork is a named
- * outcome (`nothing-to-fork`, which is no warm transcript and what the handoff
- * on disk is kept for, then `api-error`, `empty-reply` and `aborted`), and the
- * caller falls back on it like any other.
+ * the next change the way the null check hid this one. An unanswered fork is a
+ * named outcome (`nothing-to-fork`, which is no warm transcript and what the
+ * handoff on disk is kept for, then `api-error`, `empty-reply` and `aborted`),
+ * and the caller falls back on it like any other. So is a fork that runs past
+ * `FORK_TIMEOUT_MS`, as `timeout`.
  *
  * A reply is not proof that the fork read this conversation. Some forks come
  * back having been charged for a fraction of the session's context (#690), and
@@ -910,7 +911,17 @@ const forkHandoff = async ($, e, record) => {
 
     record.forkContext = await forkContext($, e);
 
-    const reply = await $.model.fork({ prompt: asked });
+    let reply;
+
+    try {
+        reply = await withTimeout($, $.model.fork({ prompt: asked }), FORK_TIMEOUT_MS, "the fork");
+    } catch (error) {
+        if (error instanceof TimeoutError) {
+            return { outcome: "timeout", detail: error.message };
+        }
+
+        throw error;
+    }
 
     if (!reply.isAnswered) {
         // Every arm but `nothing-to-fork` made a request, and what it spent
@@ -955,6 +966,25 @@ const forkHandoff = async ($, e, record) => {
         detail: "",
     };
 };
+
+/**
+ * How long a compaction waits on its fork before it falls back to the handoff
+ * on disk.
+ *
+ * Five minutes, from the index this plugin writes: across 58 warm forks since
+ * 0.6.0 the median took about two minutes, the 95th percentile under four, and
+ * one alone ran past five (about 25 minutes, with the person waiting on it the
+ * whole time). A fork that is still going at five minutes is far more likely
+ * to be the stuck one than a slow good one, and the forks this bound cuts most
+ * often are the short ones the `forkInput` check refuses anyway.
+ *
+ * The bound gives the person their session back. It does not stop the spend:
+ * `$.model.fork` takes a `prompt` and nothing else (no signal, no `timeoutMs`,
+ * unlike `$.model.complete`), and its `aborted` arm fires only when the turn's
+ * own dispatch is aborted, so there is no way to cancel the request from here.
+ * The abandoned fork runs to its end, and whatever it answers is dropped.
+ */
+const FORK_TIMEOUT_MS = 300_000;
 
 /**
  * Why a fork came back without a reply, in the words the row keeps.
@@ -1184,9 +1214,16 @@ const withTimeout = ($, promise, ms, what) =>
     Promise.race([
         promise,
         $.clock.sleep(ms).then(() => {
-            throw new Error(`${what} timed out after ${ms}ms`);
+            throw new TimeoutError(`${what} timed out after ${ms}ms`);
         }),
     ]);
+
+/**
+ * What `withTimeout` throws, so a caller can tell a bound that expired from a
+ * call that failed. Its name stays `Error`, so the text every existing row
+ * records for a timeout reads exactly as it did.
+ */
+class TimeoutError extends Error {}
 
 /**
  * Session state, read from git and `gh` right now rather than recalled.

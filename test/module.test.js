@@ -740,6 +740,60 @@ describe("a fork the engine left unanswered", () => {
     });
 });
 
+/**
+ * A fork that never comes back must not hold the person's compaction for as
+ * long as the request runs. Past its bound the compaction falls back to the
+ * handoff on disk, and whatever the fork answers afterwards is dropped.
+ */
+describe("a fork that runs past its bound", () => {
+    // `clock.sleep` resolves at once here, so the bound expires the moment the
+    // fork is raised; the real clock is left to the fork alone.
+    const fallbackHost = (fork) => {
+        const host = fakeApi({
+            env: { COMPACT_HANDOFF_LIVE: "1" },
+            files: { "/plugin/.runs/latest.md": "THE HANDOFF ON DISK" },
+            messages: [userTurn("go"), assistantTurn("done")],
+            model: { fork },
+        });
+
+        host.store.set("ready", { messages: 2, at: new Date().toISOString() });
+
+        return host;
+    };
+
+    it("falls back to the handoff on disk and records a timeout", async () => {
+        const runtime = await registered();
+        const host = fallbackHost(() => new Promise(() => {}));
+
+        const answer = await withDeadline(
+            runtime.dispatch("session.compact", host.$, compaction(), passThrough()),
+            "the compaction",
+        );
+        const row = lastRow(host);
+
+        assert.equal(row.forkOutcome, "timeout");
+        assert.equal(row.outcome, "handoff");
+        assert.ok(JSON.stringify(answer.messages).includes("THE HANDOFF ON DISK"));
+    });
+
+    it("drops what the fork answers after the bound", async () => {
+        const runtime = await registered();
+        const lateReply = answered("THE LATE FORK", warmForkUsage);
+        const host = fallbackHost(() => new Promise((resolve) => void setTimeout(() => resolve(lateReply), 30)));
+
+        const answer = await runtime.dispatch("session.compact", host.$, compaction(), passThrough());
+
+        await new Promise((resolve) => void setTimeout(resolve, 90));
+
+        const written = [...host.files.values(), ...host.appends.map((entry) => entry.line)].join("\n");
+
+        assert.equal(host.rowsIn("index.jsonl").length, 1);
+        assert.equal(lastRow(host).forkOutcome, "timeout");
+        assert.ok(!JSON.stringify(answer.messages).includes("THE LATE FORK"));
+        assert.ok(!written.includes("THE LATE FORK"), "nothing the late fork said was written");
+    });
+});
+
 /* ------------------------------------------------------------------ *
  * The settings, as the engine hands them to `register`.
  * ------------------------------------------------------------------ */

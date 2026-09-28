@@ -188,9 +188,9 @@ Summaries lose facts because they are written as prose, and prose makes the writ
 
 In <summary> tags, produce the handoff in two parts:
 
-PART 1 — THE INVENTORY. Sweep the conversation from the first message to the last and emit an inventory: one line per discrete fact, no prose, no commentary. A discrete fact is anything a successor could be wrong about — a request, a constraint, a rejection, a decision, a reason, a file, a command run and its result, a number, an identifier, an error, a promise, an unfinished item, a correction. Aim for completeness over elegance; a hundred lines is normal and a short inventory means you skipped. Mark each line with one tag in brackets at the start: [ask] [constraint] [rejected] [decision] [file] [command] [identifier] [error] [promise] [pending] [state]. Group the lines by tag, in that tag order, keeping conversation order within each group. Do not drop a line because it seems minor, and do not merge two lines into one. Quote the user verbatim on every [ask], [constraint] and [rejected] line.
+PART 1 — THE INVENTORY. Sweep the conversation from the first message to the last and emit an inventory: one line per discrete fact, no prose, no commentary. A discrete fact is anything a successor could be wrong about — a request, a constraint, a rejection, a decision, a reason, a file, a command run and its result, a number, an identifier, an error, a promise, an unfinished item, a correction. Aim for completeness over elegance; a hundred lines is normal and a short inventory means you skipped. Mark each line with one tag in brackets at the start: [ask] [constraint] [rejected] [decision] [file] [command] [identifier] [error] [promise] [pending] [state]. Group the lines by tag, in that tag order, keeping conversation order within each group. Do not drop a line because it seems minor, and do not merge two lines into one. Every message the user typed comes back word for word right after this handoff, so do not copy one onto an [ask] line: name the ask in a dozen words or fewer, then its status and any op id. An ask that appears only inside an earlier handoff, never as a message the user typed, does not come back; keep its line as it stands. On a [constraint] or [rejected] line quote the user verbatim, the sentence that sets the rule and not the whole message.
 
-PART 2 — THE READING. Now, and only now, write the prose a successor needs to make sense of Part 1: what the work is, what has been done, what is being done right now, and what the next step is with a verbatim quote of the user's most recent request. Keep this short. It explains the inventory; it does not replace it.
+PART 2 — THE READING. Now, and only now, write the prose a successor needs to make sense of Part 1: what the work is, what has been done, what is being done right now, and what the next step is, naming the user's most recent request without quoting it. Keep this short. It explains the inventory; it does not replace it.
 
 Two rules that override any instinct toward brevity. Never write "various", "several", "etc.", "and similar", or any phrase that stands in for items you could have named. Never state a fact the conversation did not establish — if you do not know the branch, the file or the number, write "not established", because a plausible invention is worse to a successor than a gap.
 
@@ -677,7 +677,7 @@ export const register = (on, pluginOptions) => {
  * empty table, so nothing at the fold can read the manifest. `test/module.test.js`
  * asserts it against `.claude-plugin/plugin.json` so the two cannot drift.
  */
-export const PLUGIN_VERSION = "0.11.3";
+export const PLUGIN_VERSION = "0.11.4";
 
 /** How long one subscriber may run before the compaction goes on without it. */
 const DEFAULT_SEAM_TIMEOUT_MS = 90_000;

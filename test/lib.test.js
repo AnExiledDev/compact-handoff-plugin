@@ -3,6 +3,9 @@ import { describe, it } from "node:test";
 
 import {
     abArmFor,
+    abChainAfter,
+    abDesignOf,
+    abPriorOf,
     applySizeGuard,
     assistantTurns,
     commitmentsFrom,
@@ -1430,51 +1433,140 @@ describe("what a fork was charged to read, against the session it forked from", 
 });
 
 /**
- * The A/B split is by session, not by compaction: a session that alternated
- * would hand a handoff the engine's summary to build on, and the arm a
- * compaction sat in would stop being the only thing that differed.
+ * The A/B split runs two designs at once. Half the sessions are one arm for
+ * their whole life, so a handoff chain stays intact; the other half flip a coin
+ * per compaction, so one session's work is seen under both arms. Every row
+ * says which design it ran under and what it was decided on.
  */
-describe("which arm of the A/B split a session is in", () => {
+describe("which arm of the A/B split a compaction is in", () => {
     const ids = Array.from({ length: 2000 }, (_, i) => `session-${i}-${(i * 7919) % 1000}`);
+    const bySession = ids.filter((id) => abDesignOf(id).design === "session");
+    const byCompaction = ids.filter((id) => abDesignOf(id).design === "compaction");
+    const ats = Array.from({ length: 400 }, (_, i) => new Date(Date.UTC(2026, 9, 5, 0, 0, i)).toISOString());
 
     it("is off when no share is set, or the share is not a fraction", () => {
         for (const share of [undefined, null, "", "0", "abc", "-0.5", "1.5", "NaN"]) {
-            assert.equal(abArmFor("session-1", share), null, `share ${share}`);
+            assert.equal(abArmFor("session-1", share, ats[0]), null, `share ${share}`);
         }
     });
 
-    it("keeps a session in one arm on every compaction", () => {
-        const first = abArmFor("5f1c2d9e-aaaa-bbbb-cccc-0123456789ab", "0.5");
+    it("puts about half the sessions under each design", () => {
+        const share = byCompaction.length / ids.length;
 
-        for (let i = 0; i < 5; i += 1) {
-            assert.deepEqual(abArmFor("5f1c2d9e-aaaa-bbbb-cccc-0123456789ab", "0.5"), first);
+        assert.ok(share > 0.45 && share < 0.55, `compaction-design share ${share}`);
+    });
+
+    // The design hash is salted, so which design a session runs under says
+    // nothing about its arm: both designs see the stock share of sessions.
+    it("draws the design independently of the session's arm", () => {
+        for (const group of [bySession, byCompaction]) {
+            const stock = group.filter((id) => abArmFor(id, "0.5").bucket < 0.5).length / group.length;
+
+            assert.ok(stock > 0.44 && stock < 0.56, `stock bucket share ${stock}`);
         }
     });
 
-    it("leaves every session to the engine at a share of 1", () => {
-        assert.ok(ids.every((id) => abArmFor(id, "1").arm === "stock"));
+    it("keeps a session-design session in one arm on every compaction", () => {
+        for (const id of bySession.slice(0, 50)) {
+            const arms = new Set(ats.slice(0, 20).map((at) => abArmFor(id, "0.5", at).arm));
+
+            assert.equal(arms.size, 1, id);
+            assert.equal(abArmFor(id, "0.5", ats[0]).coin, null);
+        }
     });
 
-    it("leaves close to the share of sessions to the engine", () => {
-        const stock = ids.filter((id) => abArmFor(id, "0.3").arm === "stock").length / ids.length;
+    it("flips a coin per compaction in a compaction-design session", () => {
+        const id = byCompaction[0];
+        const stock = ats.filter((at) => abArmFor(id, "0.5", at).arm === "stock").length / ats.length;
+
+        assert.ok(stock > 0.42 && stock < 0.58, `stock share across one session's compactions ${stock}`);
+    });
+
+    // Seeded from the timestamp the row carries, so the assignment can be
+    // recomputed from the row alone; never from depth, which restarts on resume.
+    it("gives the same compaction the same coin every time it is asked", () => {
+        const id = byCompaction[0];
+        const first = abArmFor(id, "0.5", ats[7]);
+
+        assert.deepEqual(abArmFor(id, "0.5", ats[7]), first);
+        assert.equal(first.arm, first.coin < 0.5 ? "stock" : "handoff");
+    });
+
+    it("leaves every compaction to the engine at a share of 1, under both designs", () => {
+        assert.ok(ids.every((id) => abArmFor(id, "1", ats[3]).arm === "stock"));
+    });
+
+    it("leaves close to the share of sessions to the engine under the session design", () => {
+        const stock = bySession.filter((id) => abArmFor(id, "0.3", ats[0]).arm === "stock").length / bySession.length;
 
         assert.ok(stock > 0.25 && stock < 0.35, `stock share ${stock}`);
     });
 
-    // Raising the share moves sessions from handoff to stock and never back,
-    // so widening the experiment does not reshuffle the sessions already in it.
-    it("keeps a stock session stock when the share grows", () => {
-        const atLow = ids.filter((id) => abArmFor(id, "0.2").arm === "stock");
+    // Raising the share moves sessions and compactions from handoff to stock
+    // and never back, so widening the experiment does not reshuffle it.
+    it("keeps a stock assignment stock when the share grows", () => {
+        const atLow = ids.filter((id) => abArmFor(id, "0.2", ats[5]).arm === "stock");
 
         assert.ok(atLow.length > 0);
-        assert.ok(atLow.every((id) => abArmFor(id, "0.5").arm === "stock"));
+        assert.ok(atLow.every((id) => abArmFor(id, "0.5", ats[5]).arm === "stock"));
     });
 
     it("says what it was decided on", () => {
-        const arm = abArmFor("session-1", "0.25");
+        const session = abArmFor(bySession[0], "0.25", ats[0]);
+        const compaction = abArmFor(byCompaction[0], "0.25", ats[0]);
 
-        assert.equal(arm.share, 0.25);
-        assert.ok(arm.bucket >= 0 && arm.bucket < 1);
-        assert.equal(arm.arm, arm.bucket < 0.25 ? "stock" : "handoff");
+        assert.equal(session.design, "session");
+        assert.equal(session.share, 0.25);
+        assert.ok(session.designBucket < 0.5);
+        assert.equal(session.arm, session.bucket < 0.25 ? "stock" : "handoff");
+        assert.equal(compaction.design, "compaction");
+        assert.ok(compaction.designBucket >= 0.5);
+        assert.equal(compaction.arm, compaction.coin < 0.25 ? "stock" : "handoff");
+    });
+});
+
+/**
+ * What the compaction before this one left behind, so a handoff that built on
+ * the engine's summary (or a long chain of handoffs) can be told apart in the
+ * analysis.
+ */
+describe("what the previous compaction left in the conversation", () => {
+    const opened = (...kinds) => kinds.map((kind) => ({ kind }));
+
+    it("is none, with no run, before the first compaction", () => {
+        assert.deepEqual(abPriorOf([], undefined), { priorArm: "none", handoffRun: 0, runFrom: "transcript" });
+    });
+
+    it("counts the handoffs in a row the transcript still shows", () => {
+        assert.deepEqual(abPriorOf(opened("handoff", "stock", "handoff", "handoff"), null), {
+            priorArm: "handoff",
+            handoffRun: 2,
+            runFrom: "transcript",
+        });
+        assert.deepEqual(abPriorOf(opened("handoff", "stock"), null), { priorArm: "stock", handoffRun: 0, runFrom: "transcript" });
+    });
+
+    // A resumed transcript starts at its last opener, so only the store still
+    // knows how long the chain behind it was.
+    it("takes the run from the store when the store agrees with the transcript", () => {
+        assert.deepEqual(abPriorOf(opened("handoff"), { last: "handoff", run: 4 }), {
+            priorArm: "handoff",
+            handoffRun: 4,
+            runFrom: "store",
+        });
+    });
+
+    it("trusts the transcript over a store that disagrees with it", () => {
+        assert.deepEqual(abPriorOf(opened("stock", "handoff"), { last: "stock", run: 0 }), {
+            priorArm: "handoff",
+            handoffRun: 1,
+            runFrom: "transcript",
+        });
+        assert.deepEqual(abPriorOf(opened("handoff"), { last: "handoff", run: "lots" }).runFrom, "transcript");
+    });
+
+    it("extends the chain on a handoff and ends it on a stock compaction", () => {
+        assert.deepEqual(abChainAfter("handoff", 2), { last: "handoff", run: 3 });
+        assert.deepEqual(abChainAfter("stock", 5), { last: "stock", run: 0 });
     });
 });

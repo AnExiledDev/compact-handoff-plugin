@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
-import { priceUsage } from "../hooks/lib.js";
+import { abArmFor, priceUsage } from "../hooks/lib.js";
 import { PLUGIN_VERSION } from "../hooks/module.js";
 import {
     answered,
@@ -1762,6 +1762,72 @@ describe("a session the A/B split leaves to the engine", () => {
                 [
                     [1, null],
                     [2, 1],
+                ],
+            );
+        } finally {
+            host.stopTimers();
+        }
+    });
+
+    // Session "E" falls in the per-compaction design (a hash, so fixed).
+    it("logs a compaction-design row with the coin it flipped, and leaves the window rows' arm to the join", async () => {
+        const runtime = await registered();
+        const host = abHost({ COMPACT_HANDOFF_LIVE: "1", COMPACT_HANDOFF_AB_STOCK_SHARE: "1" }, []);
+
+        try {
+            host.as("E", before);
+            await runtime.dispatch("session.start", host.$, {});
+            await runtime.dispatch("turn.complete", host.$, turnComplete());
+
+            const answer = await runtime.dispatch("session.compact", host.$, compaction({ messages: before }), engineNext());
+
+            host.as("E", [...before, ...answer.messages, userTurn("Carry on.")]);
+            await runtime.dispatch("turn.complete", host.$, turnComplete());
+
+            const row = lastRow(host);
+
+            assert.equal(row.ab.design, "compaction");
+            assert.equal(row.ab.arm, "stock");
+            assert.equal(row.ab.coin, abArmFor("E", "1", row.at).coin);
+            assert.equal(row.ab.priorArm, "none");
+            assert.equal(postFile(host).design, "compaction");
+            assert.deepEqual(
+                host.rowsIn("window.jsonl").map(({ arm, design }) => [arm, design]),
+                [
+                    [null, "compaction"],
+                    [null, "compaction"],
+                ],
+            );
+        } finally {
+            host.stopTimers();
+        }
+    });
+
+    // A resumed transcript starts at its last opener, which is where the
+    // recorded depth restarts; the run of handoffs must not restart with it.
+    it("records what the previous compaction left and the handoffs in a row, across a resume", async () => {
+        const runtime = await registered();
+        const host = abHost({ COMPACT_HANDOFF_LIVE: "1", COMPACT_HANDOFF_AB_STOCK_SHARE: "0.000001" }, []);
+
+        try {
+            host.as("A", before);
+            await runtime.dispatch("session.start", host.$, {});
+
+            const first = await runtime.dispatch("session.compact", host.$, compaction({ messages: before }), compactNext());
+
+            host.as("A", [...before, ...first.messages, userTurn("Carry on.")]);
+
+            const second = await runtime.dispatch("session.compact", host.$, compaction({ messages: first.messages }), compactNext());
+
+            host.as("A", [...second.messages, userTurn("Resumed.")]);
+            await runtime.dispatch("session.compact", host.$, compaction({ messages: second.messages }), compactNext());
+
+            assert.deepEqual(
+                host.rowsIn("index.jsonl").map(({ disposition, ab }) => [disposition, ab.design, ab.priorArm, ab.handoffRun, ab.runFrom]),
+                [
+                    ["replaced", "session", "none", 0, "transcript"],
+                    ["replaced", "session", "handoff", 1, "store"],
+                    ["replaced", "session", "handoff", 2, "store"],
                 ],
             );
         } finally {

@@ -56,6 +56,14 @@ const READY_KEY = "ready";
 /** When this session last forked for a handoff, wall clock ms, for the fork's context row. */
 const LAST_FORK_KEY = "lastForkAt";
 
+/**
+ * What the last A/B compaction of a session left in its conversation and the
+ * handoffs in a row it ended, under `abChain:<session>`. One small key per
+ * session that ever compacted under the split; a resume reads it back, because
+ * a resumed transcript only holds its last opener.
+ */
+const abChainKey = (session) => `abChain:${session}`;
+
 /** The agent type this plugin defines for the handoff writer, `<plugin>:<name>`. */
 const HANDOFF_AGENT = "compact-handoff:handoff";
 
@@ -228,6 +236,8 @@ import {
 } from "./restore.js";
 import {
     abArmFor,
+    abChainAfter,
+    abPriorOf,
     applySizeGuard,
     assistantTurns,
     closedByCompaction,
@@ -524,10 +534,11 @@ export const register = (on, pluginOptions) => {
             pinnedSkipped: pinSkipCounts(e.messages),
             plugin: await pluginVersion($),
             engine: await engineVersion($),
-            // The arm of the live A/B split this session is in, or null when
-            // the split is off. Set below, once the compaction is known to be
-            // the main conversation's own.
-            ab: /** @type {{ arm: "handoff" | "stock", share: number, bucket: number } | null} */ (null),
+            // The arm of the live A/B split this compaction is in, the design
+            // that picked it and what it was decided on, or null when the
+            // split is off. Set below, once the compaction is known to be the
+            // main conversation's own.
+            ab: /** @type {AbRow | null} */ (null),
         };
 
         // The fork this plugin is waiting on is itself a query loop, and the
@@ -558,7 +569,7 @@ export const register = (on, pluginOptions) => {
             return next(e);
         }
 
-        record.ab = await assignedArm($, record.sessionId);
+        record.ab = await abRowFor($, record);
 
         // A subagent's compaction is another conversation; the main session's
         // watch is not ended by it.
@@ -735,7 +746,7 @@ export const register = (on, pluginOptions) => {
  * empty table, so nothing at the fold can read the manifest. `test/module.test.js`
  * asserts it against `.claude-plugin/plugin.json` so the two cannot drift.
  */
-export const PLUGIN_VERSION = "0.12.1";
+export const PLUGIN_VERSION = "0.13.0";
 
 /** How long one subscriber may run before the compaction goes on without it. */
 const DEFAULT_SEAM_TIMEOUT_MS = 90_000;
@@ -2431,6 +2442,8 @@ const finish = async ($, record, disposition, artifacts = {}) => {
         record.storeFailed = String(error).slice(0, 300);
     }
 
+    await safely($, () => keepAbChain($, record, disposition));
+
     // A declined fork loop is bookkeeping inside a compaction still running;
     // a toast for it reads as that compaction having been skipped.
     if (record.outcome === "ownFork") {
@@ -2663,6 +2676,7 @@ const armMonitor = (record, { kind, ordinal, from, before }) => {
             at: record.at,
             kind,
             arm: record.ab?.arm ?? null,
+            design: record.ab?.design ?? null,
             ordinal,
             from,
             messages: before,
@@ -2716,7 +2730,62 @@ const abShare = async ($) => opt("abStockShare") ?? (await $.env.get("COMPACT_HA
  * This session's arm of the split, or null. A rehearsal already leaves every
  * compaction to the engine, so the split only exists while live is on.
  */
-const assignedArm = async ($, sessionId) => ((await isLive($)) ? abArmFor(sessionId, await abShare($)) : null);
+const assignedArm = async ($, sessionId, at) => ((await isLive($)) ? abArmFor(sessionId, await abShare($), at) : null);
+
+/**
+ * @typedef {import("./lib.js").AbAssignment & {
+ *   priorArm: "handoff" | "stock" | "none" | null,
+ *   handoffRun: number | null,
+ *   runFrom: "store" | "transcript" | null,
+ * }} AbRow
+ */
+
+/**
+ * The A/B fields a compaction's row carries: its assignment, and what the
+ * compaction before it left behind. A subagent's conversation is not the one
+ * `$.session.messages()` answers, so its prior fields stay null.
+ *
+ * @returns {Promise<AbRow | null>}
+ */
+const abRowFor = async ($, record) => {
+    const assigned = await assignedArm($, record.sessionId, record.at);
+
+    if (assigned === null) {
+        return null;
+    }
+
+    if (record.agentId !== null) {
+        return { ...assigned, priorArm: null, handoffRun: null, runFrom: null };
+    }
+
+    const messages = await safely($, () => $.session.messages());
+    const stored = await safely($, () => $.store.get(abChainKey(record.sessionId)));
+
+    if (messages === null) {
+        return { ...assigned, priorArm: null, handoffRun: null, runFrom: null };
+    }
+
+    return { ...assigned, ...abPriorOf(openersIn(messages), stored) };
+};
+
+/**
+ * Keeps what this compaction left in the conversation, for the next one's
+ * `priorArm` and `handoffRun`. A stock compaction the engine threw on opened
+ * nothing, so it leaves the chain as it was.
+ */
+const keepAbChain = async ($, record, disposition) => {
+    if (record.ab === null || record.ab === undefined || record.ab.handoffRun === null) {
+        return;
+    }
+
+    if (disposition === "abStock" && record.outcome === "threw") {
+        return;
+    }
+
+    const applied = disposition === "replaced" ? "handoff" : "stock";
+
+    await $.store.set(abChainKey(record.sessionId), abChainAfter(applied, record.ab.handoffRun));
+};
 
 /**
  * A compaction the A/B split leaves to the engine: no fork, the engine's own
@@ -2855,10 +2924,27 @@ const watchWindow = async ($) => {
         context: usage?.context ?? null,
         messages: messages === null ? null : messages.length,
         opener,
-        arm: (await safely($, () => assignedArm($, session)))?.arm ?? null,
+        ...(await safely($, () => windowArm($, session))),
     });
 
     await safely($, async () => appendLine($, `${await dataDir($)}/${WINDOW_LOG}`, JSON.stringify(row)));
+};
+
+/**
+ * The arm and design a turn's reading is filed under. Under the `session`
+ * design every turn, before the first compaction too, is the session's arm.
+ * Under `compaction` a turn has no arm of its own: the window it is in belongs
+ * to the compaction that opened it, which the index row records, so the
+ * reading carries the design and leaves the arm to that join.
+ */
+const windowArm = async ($, session) => {
+    const assigned = await assignedArm($, session, null);
+
+    if (assigned === null) {
+        return { arm: null, design: null };
+    }
+
+    return { arm: assigned.design === "session" ? assigned.arm : null, design: assigned.design };
 };
 
 /**

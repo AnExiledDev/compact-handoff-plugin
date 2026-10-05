@@ -459,36 +459,77 @@ def read_window(root):
     return readings
 
 
-def window_spans(readings):
-    """Each window a session lived in, keyed (session, compaction n).
+# Every disposition that left the session compacted. A skipped own-fork row and
+# a passed-through subagent row did not end the main conversation's window.
+COMPACTED = {"replaced", "fellBack", "abStock", "rehearsed", "abortedFallback"}
 
-    A window is every reading between one compaction and the next. `closed`
-    says a later compaction ended it, so its turn count is the whole window's
-    and not just the part seen so far.
+
+def boundary_key(row):
+    """Orders a session's compactions by time. Two rows with the same `at` (one
+    clock tick) fall back to their file stem, which carries a sequence number."""
+    stem = os.path.basename(((row.get("files") or {}).get(".json")) or "")
+
+    return (row.get("at") or "", stem)
+
+
+def window_spans(rows, readings):
+    """Each window a compaction opened, keyed by the row's boundary key.
+
+    Joined by time, never by `(session, depth)`: `depth` restarts when a session
+    is resumed in a new process, so two different windows can share it. A
+    reading belongs to the latest compaction of its session at or before it.
+    Readings before a session's first compaction belong to no window. `closed`
+    says a later compaction of the same session ended the window, so its turn
+    count is the whole window's and not just the part seen so far.
     """
+    boundaries = {}
+
+    for row in rows:
+        if row.get("agentId") or row.get("disposition") not in COMPACTED or not row.get("sessionId"):
+            continue
+
+        boundaries.setdefault(row["sessionId"], []).append(boundary_key(row))
+
+    for keys in boundaries.values():
+        keys.sort()
+
     spans = {}
-    latest = {}
+
+    for session, keys in boundaries.items():
+        for i, key in enumerate(keys):
+            spans[(session, key)] = {"turns": 0, "first": None, "closed": i + 1 < len(keys)}
 
     for reading in readings:
-        session, n = reading.get("session"), reading.get("compaction") or 0
-        span = spans.setdefault((session, n), {"arm": reading.get("arm"), "phase": reading.get("phase"), "turns": 0, "first": None, "closed": False})
+        session, at = reading.get("session"), reading.get("at") or ""
+        keys = boundaries.get(session)
 
+        if not keys:
+            continue
+
+        # The latest boundary whose time is at or before the reading.
+        owner = None
+
+        for key in keys:
+            if key[0] <= at:
+                owner = key
+            else:
+                break
+
+        if owner is None:
+            continue
+
+        span = spans[(session, owner)]
         span["turns"] += 1
 
         if span["first"] is None and reading.get("turn") == 1:
             span["first"] = reading.get("tokens")
-
-        latest[session] = max(latest.get(session, 0), n)
-
-    for (session, n), span in spans.items():
-        span["closed"] = latest[session] > n
 
     return spans
 
 
 def ab_rows(rows, root):
     """One joined record per A/B compaction: the row, its watch, its window."""
-    spans = window_spans(read_window(root))
+    spans = window_spans(rows, read_window(root))
     joined = []
 
     for row in rows:
@@ -499,14 +540,21 @@ def ab_rows(rows, root):
 
         post = post_json(row) or {}
         anchored = post.get("anchored") is True
-        span = spans.get((row.get("sessionId"), row.get("depth") or 0), {})
+        span = spans.get((row.get("sessionId"), boundary_key(row)), {})
 
         joined.append(
             {
                 "at": row.get("at"),
                 "session": row.get("sessionId"),
+                # Rows from before 0.13.0 carry no design: they were all per-session.
+                "design": ab.get("design") or "session",
                 "arm": ab.get("arm"),
                 "share": ab.get("share"),
+                "bucket": ab.get("bucket"),
+                "coin": ab.get("coin"),
+                "priorArm": ab.get("priorArm"),
+                "handoffRun": ab.get("handoffRun"),
+                "runFrom": ab.get("runFrom"),
                 "disposition": row.get("disposition"),
                 "applied": "handoff" if row.get("disposition") == "replaced" else "stock",
                 "trigger": row.get("trigger"),
@@ -535,14 +583,19 @@ def ab_rows(rows, root):
 
 
 def print_ab(rows, root):
-    """The live A/B split: sessions assigned by hash, compared arm by arm.
+    """The live A/B split, compared arm by arm, overall and within each design.
+
+    Under the `session` design a session is one arm throughout; under
+    `compaction` each compaction flips its own coin, so arms alternate inside a
+    session. The columns are split by design so the two are never pooled
+    without it being visible.
 
     Grouped by the arm a session was assigned, not the compaction it got: a
     handoff that fell back is still a handoff-arm compaction, because dropping
     it would flatter the handoff arm with only the runs that worked. The
     `applied` column says how many got what they were assigned.
     """
-    print("\nLive A/B split (assigned by session; COMPACT_HANDOFF_AB_STOCK_SHARE)")
+    print("\nLive A/B split (COMPACT_HANDOFF_AB_STOCK_SHARE; design: per session or per compaction)")
 
     joined = ab_rows(rows, root)
 
@@ -586,19 +639,62 @@ def print_ab(rows, root):
         ("used a handoff tool", lambda records: rate(records, "usedHandoffTool")),
         ("compacted again in ten turns", lambda records: rate(records, "compactedAgain")),
     ]
-    arms = {arm: [record for record in joined if record["arm"] == arm] for arm in ("handoff", "stock")}
+    columns = [
+        ("all", "handoff"),
+        ("all", "stock"),
+        ("session", "handoff"),
+        ("session", "stock"),
+        ("compaction", "handoff"),
+        ("compaction", "stock"),
+    ]
+    groups = {
+        (design, arm): [record for record in joined if record["arm"] == arm and design in ("all", record["design"])]
+        for design, arm in columns
+    }
 
-    print(f"  {'':<34}{'handoff':>12}{'stock':>12}")
+    print(f"  {'':<34}" + "".join(f"{design[:4] + ':' + arm:>14}" for design, arm in columns))
 
     for label, measure in table:
-        print(f"  {label:<34}" + "".join(f"{measure(arms[arm]) if arms[arm] else '-':>12}" for arm in ("handoff", "stock")))
+        print(f"  {label:<34}" + "".join(f"{measure(groups[column]) if groups[column] else '-':>14}" for column in columns))
 
     print("  lower is better for re-ran, re-read, turns to first tool and context after; higher for turns to next compaction.")
 
+    print_ab_chain([record for record in joined if record["design"] == "compaction"])
+
+    arms = {arm: groups[("all", arm)] for arm in ("handoff", "stock")}
     fewest = min(len({record["session"] for record in records}) for records in arms.values())
 
     if fewest < 30:
         print(f"  {fewest} session(s) in the smaller arm: read any gap as noise until both arms pass about 30.")
+
+
+def print_ab_chain(records):
+    """The compaction design, by what the compaction before each one left.
+
+    A handoff that builds on the engine's summary is not the handoff the
+    session design measures, so this is where the two are told apart.
+    """
+    if not records:
+        return
+
+    print("\n  compaction design, by what the previous compaction left (priorArm)")
+    print(f"  {'arm':<9}{'after':<10}{'compactions':>12}{'closed':>8}{'median turns':>14}{'compacted again':>17}")
+
+    for arm in ("handoff", "stock"):
+        for prior in ("none", "handoff", "stock", None):
+            group = [record for record in records if record["arm"] == arm and record.get("priorArm") == prior]
+
+            if not group:
+                continue
+
+            closed = [record["turnsInWindow"] for record in group if record["windowClosed"] and isinstance(record.get("turnsInWindow"), int)]
+            again = [record["compactedAgain"] for record in group if isinstance(record.get("compactedAgain"), bool)]
+
+            print(
+                f"  {arm:<9}{prior or 'unknown':<10}{len(group):>12}{len(closed):>8}"
+                f"{(f'{statistics.median(closed):.0f}' if closed else '-'):>14}"
+                f"{(f'{100 * sum(again) / len(again):.0f}%' if again else '-'):>17}"
+            )
 
 
 def export_ab(rows, root, path):

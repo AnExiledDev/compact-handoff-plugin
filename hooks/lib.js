@@ -412,7 +412,7 @@ export const approxTokens = (text) => Math.ceil(text.length / 4);
  * which reports whole numbers; the engine's own figure is the fallback for a
  * reading that carries no window to divide by.
  */
-export const windowReading = ({ at, session, turn, context, messages, opener, arm = null }) => {
+export const windowReading = ({ at, session, turn, context, messages, opener, arm = null, design = null }) => {
     const tokens = context?.tokens ?? null;
     const window = context?.window ?? null;
     const share = (of) => (of === null || window === null || window === 0 ? null : Math.round((of / window) * 1000) / 10);
@@ -427,6 +427,7 @@ export const windowReading = ({ at, session, turn, context, messages, opener, ar
         first: turn === 1,
         phase: PHASE_OF[opener?.kind ?? "none"],
         arm,
+        design,
         compaction: opener?.n ?? 0,
         tokens,
         window,
@@ -1489,12 +1490,13 @@ export const workDone = (messages) => {
  * the new conversation starts in a transcript that also holds every window
  * before it.
  */
-export const monitorSeed = ({ session, n, at, kind, arm = null, ordinal, from, messages }) => ({
+export const monitorSeed = ({ session, n, at, kind, arm = null, design = null, ordinal, from, messages }) => ({
     session,
     n,
     at,
     kind,
     arm,
+    design,
     ordinal,
     from,
     ...workDone(messages),
@@ -1520,32 +1522,134 @@ export const stockSummaryOf = (messages) => {
 };
 
 /**
- * Which arm of the live A/B split a session is in, or null when the split is
- * off: no share set, or one outside (0, 1].
+ * Which arm of the live A/B split a compaction is in, or null when the split
+ * is off: no share set, or one outside (0, 1].
  *
- * Assigned per session, never per compaction. A session that alternated would
- * hand its next handoff the engine's summary to build on (or the reverse), so
- * the arm would stop being the only thing that differed. The bucket is a hash
- * of the session id rather than a coin kept on disk: it survives a reload and
- * a restart with nothing stored, and a session below a share is below every
- * larger one, so widening the split never moves a session back to the handoff.
- */
-/**
+ * Two designs run side by side, and a second hash of the session id picks one
+ * per session, half and half:
+ *
+ * - `session`: the whole session is one arm, from a hash of its id. The
+ *   handoff chain stays intact, so a handoff always builds on a handoff, and
+ *   the arm is the only thing that differs between two sessions.
+ * - `compaction`: a coin per compaction, from a hash of the session id and the
+ *   compaction's own timestamp. Arms alternate inside one session, so the
+ *   same work is seen under both, at the price that a handoff may build on the
+ *   engine's summary or the reverse; `priorArm` on the row says which.
+ *
+ * Both are hashes rather than coins kept on disk: each survives a reload and a
+ * restart with nothing stored, and every row carries the value it was decided
+ * on, so the assignment can be recomputed from the row alone. The coin is never
+ * seeded from `depth`, which restarts when a session is resumed. Within one
+ * design a value below a share is below every larger one, so widening the
+ * split never moves a session or a compaction back to the handoff.
+ *
  * @param {string | null | undefined} sessionId
  * @param {string | number | null | undefined} share
- * @returns {{ arm: "handoff" | "stock", share: number, bucket: number } | null}
+ * @param {string | null | undefined} [at] the compaction's ISO timestamp; only
+ *   the `compaction` design reads it
+ * @returns {AbAssignment | null}
  */
-export const abArmFor = (sessionId, share) => {
-    const fraction = Number.parseFloat(String(share ?? ""));
+export const abArmFor = (sessionId, share, at) => {
+    const fraction = abFraction(share);
 
-    if (!Number.isFinite(fraction) || fraction <= 0 || fraction > 1) {
+    if (fraction === null) {
         return null;
     }
 
-    const bucket = fnv1a(String(sessionId ?? "")) / 2 ** 32;
+    const { design, designBucket } = abDesignOf(sessionId);
+    const bucket = unit(fnv1a(String(sessionId ?? "")));
+    const coin = design === "compaction" ? unit(fnv1a(`${String(sessionId ?? "")}:${String(at ?? "")}`)) : null;
+    const decidedOn = coin ?? bucket;
 
-    return { arm: bucket < fraction ? "stock" : "handoff", share: fraction, bucket: Math.round(bucket * 1e6) / 1e6 };
+    return { design, arm: decidedOn < fraction ? "stock" : "handoff", share: fraction, bucket, designBucket, coin };
 };
+
+/**
+ * @typedef {{
+ *   design: "session" | "compaction",
+ *   arm: "handoff" | "stock",
+ *   share: number,
+ *   bucket: number,
+ *   designBucket: number,
+ *   coin: number | null,
+ * }} AbAssignment
+ */
+
+/** The share as a fraction in (0, 1], or null for no split. */
+const abFraction = (share) => {
+    const fraction = Number.parseFloat(String(share ?? ""));
+
+    return Number.isFinite(fraction) && fraction > 0 && fraction <= 1 ? fraction : null;
+};
+
+/**
+ * The A/B design a session runs under. Salted, so it is independent of the
+ * session's own arm bucket: a session's design says nothing about its arm.
+ *
+ * @param {string | null | undefined} sessionId
+ * @returns {{ design: "session" | "compaction", designBucket: number }}
+ */
+export const abDesignOf = (sessionId) => {
+    const designBucket = unit(fnv1a(`${String(sessionId ?? "")}:design`));
+
+    return { design: designBucket < 0.5 ? "session" : "compaction", designBucket };
+};
+
+/** A 32-bit hash as a fraction in [0, 1), to six places so a row reads it back exactly. */
+const unit = (hash) => Math.round((hash / 2 ** 32) * 1e6) / 1e6;
+
+/**
+ * What the compaction before this one left in the conversation, and how many
+ * handoffs in a row led up to it.
+ *
+ * `priorArm` is read off the transcript: the last opener it holds is what this
+ * compaction's summary builds on, and a resumed session still shows it. The
+ * run is the part a resume loses, because a resumed transcript starts at its
+ * last opener, so it comes from `stored` (written after every compaction) when
+ * that agrees with the transcript, and from the openers the transcript still
+ * holds when it does not. `runFrom` says which, so an undercount is visible.
+ *
+ * @param {Array<{ kind: "handoff" | "stock" }>} openers oldest first
+ * @param {unknown} stored the chain kept after the last compaction
+ * @returns {{ priorArm: "handoff" | "stock" | "none", handoffRun: number, runFrom: "store" | "transcript" }}
+ */
+export const abPriorOf = (openers, stored) => {
+    const priorArm = openers.at(-1)?.kind ?? "none";
+
+    if (isAbChain(stored) && stored.last === priorArm) {
+        return { priorArm, handoffRun: priorArm === "handoff" ? stored.run : 0, runFrom: "store" };
+    }
+
+    let handoffRun = 0;
+
+    for (let index = openers.length - 1; index >= 0 && openers[index].kind === "handoff"; index -= 1) {
+        handoffRun += 1;
+    }
+
+    return { priorArm, handoffRun, runFrom: "transcript" };
+};
+
+/**
+ * The chain to keep after a compaction: what it left in the conversation and
+ * the handoffs in a row that now ends with it.
+ *
+ * @param {"handoff" | "stock"} applied
+ * @param {number} handoffRun the run that led up to this compaction
+ */
+export const abChainAfter = (applied, handoffRun) => ({
+    last: applied,
+    run: applied === "handoff" ? handoffRun + 1 : 0,
+});
+
+/** @returns {value is { last: "handoff" | "stock", run: number }} */
+const isAbChain = (value) =>
+    typeof value === "object" &&
+    value !== null &&
+    "last" in value &&
+    "run" in value &&
+    (value.last === "handoff" || value.last === "stock") &&
+    Number.isInteger(value.run) &&
+    value.run >= 0;
 
 /**
  * 32-bit FNV-1a: spreads UUIDs evenly, and needs nothing the runtime might lack.
@@ -1636,6 +1740,7 @@ export const observePost = (monitor, messages) => {
         at: monitor.at,
         kind: monitor.kind ?? "handoff",
         arm: monitor.arm ?? null,
+        design: monitor.design ?? null,
         anchored,
         turnsObserved: turns,
         firstUserMessage,
